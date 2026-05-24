@@ -1,7 +1,7 @@
 # ◈ Siftool
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/FFloriani/siftool/master/siftool.ico" width="96" height="96" alt="Siftool Logo">
+  <img src="./siftool_logo.png" width="96" height="96" alt="Siftool Logo">
   <h3>Lossless Image Metadata & Content Credentials (C2PA) Cleaner</h3>
   <p>A premium, offline, byte-level privacy utility for Windows</p>
 
@@ -21,7 +21,7 @@ Every image processed is mathematically re-verified post-clean to guarantee zero
 
 <div align="center">
   <a href="https://buymeacoffee.com/1b9hbqniv1">
-    <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=1b9hbqniv1&button_color=7c3aed&font_color=ffffff&coffee_color=FFDD00" alt="Buy Me A Coffee Button">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee Button">
   </a>
 </div>
 
@@ -168,7 +168,7 @@ If Siftool helped you protect your privacy or streamline your developer workflow
 
 <div align="center">
   <a href="https://buymeacoffee.com/1b9hbqniv1">
-    <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=1b9hbqniv1&button_color=7c3aed&font_color=ffffff&coffee_color=FFDD00" alt="Buy Me A Coffee">
+    <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee">
   </a>
 </div>
 
