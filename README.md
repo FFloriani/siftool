@@ -1,75 +1,102 @@
 # ◈ Siftool
 
-[![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)](https://www.microsoft.com/windows)
+<div align="center">
+  <img src="https://raw.githubusercontent.com/FFloriani/siftool/master/siftool.ico" width="96" height="96" alt="Siftool Logo">
+  <h3>Lossless Image Metadata & Content Credentials (C2PA) Cleaner</h3>
+  <p>A premium, offline, byte-level privacy utility for Windows</p>
 
-**Siftool** is a premium, offline, lossless image metadata cleaner designed for maximum privacy and zero quality degradation. It strips EXIF, GPS coordinates, ICC profiles, XMP, IPTC, and **Content Credentials (C2PA)** from images without re-encoding the actual pixel data.
+  [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue?style=flat-square)](https://www.python.org/)
+  [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+  [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)](https://www.microsoft.com/windows)
+  [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-ffdd00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/1b9hbqniv1)
+</div>
 
-Every file processed by Siftool is automatically re-scanned, proving that it is mathematically clean through our built-in **Verified Clean Seal**.
+---
+
+## ✦ Overview
+
+**Siftool** is a high-performance, 100% offline, lossless metadata cleaner built for Windows. It strips private tracking records—such as EXIF camera specs, precise GPS telemetry, ICC profiles, Photoshop IRB blocks, and **Content Credentials (C2PA)**—without re-encoding the actual pixel data. 
+
+Every image processed is mathematically re-verified post-clean to guarantee zero remaining trackers, sealing the file with Siftool's signature **Verified Clean Seal**.
+
+<div align="center">
+  <a href="https://buymeacoffee.com/1b9hbqniv1">
+    <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=1b9hbqniv1&button_color=7c3aed&font_color=ffffff&coffee_color=FFDD00" alt="Buy Me A Coffee Button">
+  </a>
+</div>
 
 ---
 
 ## ✦ Key Features
 
-- ⚡ **Lossless Stripping Engine:** Never degrades image quality. JPEGs are parsed segment-by-segment at the byte level, and PNGs are rewritten chunk-by-chunk, keeping pixel data completely untouched.
-- 🛡️ **Content Credentials (C2PA) Detection:** The first open-source tool to detect, explain, and strip cryptographically signed provenance data (embedded by Google Pixel 10, Adobe Photoshop, DALL-E, etc.) that can track your identity, edits, and geolocation.
-- ◈ **Sleek Dark Mode GUI:** A modern, premium violet-accented Tkinter dashboard with drag-and-drop support, multi-threaded batch processing, and a real-time **Metadata Inspector**.
-- 💻 **CLI Dual-Mode:** Full command-line interface with subcommands (`scan`, `clean`, `verify`) and `--json` outputs, making it perfect for custom automation pipelines and developers.
-- 🔒 **100% Offline & Private:** Zero network requests. Your photos never leave your machine.
+*   ⚡ **True Lossless Engine:** Never decompresses or re-encodes pixel data. Avoids the generation loss (compression artifacts, color shifting) introduced by standard image editors.
+*   🛡️ **Content Credentials (C2PA) Stripping:** Detects and strips cryptographically signed provenance data (embedded by modern devices like Google Pixel 10, Adobe Photoshop, and generative AI pipelines) that track edit history, tools, and creator IDs.
+*   ◈ **Premium Dark Mode GUI:** A violet-accented Tkinter interface featuring multi-threaded batch operations, native Drag-and-Drop, and a built-in **Metadata Inspector**.
+*   💻 **CLI Dual-Mode:** Full console interface featuring `scan`, `clean`, and `verify` commands with optional `--json` machine-readable outputs for pipeline automation.
+*   🔒 **Zero-Trust Offline Operation:** Fully offline. No telemetry, no external API calls. Your photos never leave your computer.
 
 ---
 
-## ✦ How It Works (Lossless vs. Re-encoding)
+## ✦ Core Architecture: Lossless vs. Re-encoding
 
-Unlike standard image editors that decode an image and re-encode it back (which introduces compression artifacts, changes hashes, and shifts colors), Siftool manipulates the container at the byte-level:
+Standard image cleaners load an image into memory, discard metadata, and write it back. This causes **re-encoding** which alters hashes and degrades image quality. 
+
+Siftool works at the container byte level:
 
 ```
-[Original JPEG]  ───>  [Segment Parser]  ───>  [Stripped JPEG]
-  ├── SOI  (Keep)        ├── APP1  EXIF (Strip)   ├── SOI
-  ├── APP1 EXIF          ├── APP2  ICC  (Strip)   ├── SOF0 (Unchanged Pixels)
-  ├── SOF0 Pixels        ├── SOF0  Keep           └── EOI
-  └── EOI  (Keep)        └── EOI   Keep
+[Original JPEG File] ───> [Siftool Byte Parser] ───> [Cleaned JPEG File]
+   ├── SOI (Start Marker)    ──> Preserve              ├── SOI
+   ├── APP1 (EXIF / GPS)     ──> Strip                 ├── SOF0 (Raw Pixel Stream)
+   ├── APP2 (ICC Color)      ──> Strip                 └── EOI
+   ├── SOF0 (Uncompressed)   ──> Copy Untouched
+   └── EOI (End Marker)      ──> Preserve
 ```
 
-- **JPEG:** Strips `APP0` (JFIF headers), `APP1` (EXIF/GPS/XMP), `APP2` (ICC color profiles), `APP11` (C2PA/JUMBF), and `APP13` (IPTC) byte-by-byte.
-- **PNG:** Parses chunk structures, dropping metadata chunks (`tEXt`, `iTXt`, `zTXt`, `eXIf`, `caBX`, `cPRV`, `iCCP`) while preserving core rendering chunks (`IHDR`, `IDAT`, `PLTE`, `tRNS`, `pHYs`, `IEND`).
-- **WEBP & Others:** Decodes and saves without metadata, preserving WebP lossless mode if the source was lossless.
+### Feature Comparison
+
+| Feature | Siftool | Standard Python Scripts | Online Cleaners |
+| :--- | :---: | :---: | :---: |
+| **Pixel Preservation** | **100% Lossless (Byte-level)** | Re-encoded (Quality Loss) | Re-encoded (Quality Loss) |
+| **C2PA Detection** | **Yes** | No | No |
+| **Offline Privacy** | **Yes (100% Local)** | Yes | No (Uploads files) |
+| **Verification Seal** | **Yes (Auto Post-Scan)** | No | No |
+| **Dual GUI / CLI** | **Yes** | CLI Only | Web Page Only |
 
 ---
 
-## ✦ CLI Usage
+## ✦ Command Line Interface (CLI)
 
-Siftool automatically runs in **CLI Mode** when launched with arguments.
+When arguments are passed to the script, Siftool automatically skips GUI launch and operates in CLI mode.
 
 ### 1. Scan Metadata
-Examine all metadata entries inside one or more images:
+Read and list all metadata fields inside an image without starting a cleaning job:
 ```bash
-python siftool.py scan photo.jpg another.png
+python siftool.py scan photo.jpg
 ```
 
-### 2. Clean Images
-Strip metadata losslessly and output files with the `_clean` suffix in the same directory:
+### 2. Clean Metadata
+Remove all metadata from one or multiple files losslessly. Outputs files with a `_clean` suffix:
 ```bash
 # Clean specific files
-python siftool.py clean photo.jpg photo2.png
+python siftool.py clean photo1.jpg photo2.png
 
-# Clean all supported files in a folder
-python siftool.py clean --folder ./my-images
+# Clean an entire folder recursively
+python siftool.py clean --folder ./my-gallery
 ```
 
-### 3. Verify Clean State
-Check if images are truly clean of all tracking and camera metadata:
+### 3. Verify Cleanliness
+Perform a deep, case-insensitive check to confirm a file contains no tracking metadata:
 ```bash
 python siftool.py verify photo_clean.jpg
 ```
 
-### 4. Integration & JSON Mode
-Add the `--json` flag to any subcommand to get machine-readable outputs for your scripts and pipelines:
+### 4. Developer / Pipeline Integration
+Append `--json` to any subcommand to format output in structured JSON:
 ```bash
 python siftool.py clean photo.jpg --json
 ```
-**Output Example:**
+
+**JSON Output Structure:**
 ```json
 {
   "summary": {
@@ -96,36 +123,54 @@ python siftool.py clean photo.jpg --json
 
 ---
 
-## ✦ Installation & Development
+## ✦ GUI Interface & Inspector
 
-### Setup
-1. Clone the repository.
-2. Run `iniciar.bat` (Windows) to automatically create a virtual environment `.venv` and install the required dependencies:
-   - `Pillow` (Image scanning)
-   - `piexif` (EXIF parser)
-   - `tkinterdnd2` (Native drag-and-drop)
-   - `pyinstaller` (Executable compiler)
-
-### Running Siftool GUI
-Simply launch `siftool.py` without any arguments to open the Tkinter GUI:
+Launch Siftool with no arguments to open the visual client:
 ```bash
 python siftool.py
 ```
 
+*   **Drag & Drop:** Drag files or folders directly into the central drop zone.
+*   **Metadata Inspector:** Click any file in the queue to preview its original metadata fields, C2PA warning indicators, and active seal status.
+*   **Threaded Processing:** Run large batch files asynchronously without freezing the interface.
+
 ---
 
-## ✦ Compiling Standalone Executable (.exe)
+## ✦ Standalone Executable Build (.exe)
 
-You can package Siftool into a standalone, portable Windows application directory with zero Python requirements for end-users.
+You can package Siftool into a standalone directory containing a portable `.exe` binary that does not require Python on the host machine.
 
-Simply run the build script:
+Double-click or run:
 ```cmd
 build.bat
 ```
-This triggers PyInstaller to compile Siftool with the custom `siftool.spec`, incorporating native `tkinterdnd2/tkdnd` binaries and bundling our premium `siftool.ico` branding. 
 
-Your distribution is generated at:
+This runs PyInstaller with the custom configuration in `siftool.spec`, embedding the premium `siftool.ico` branding and extracting the native `tkinterdnd2` binary assets. The compiled program will be located in:
+
 `dist\siftool\siftool.exe`
+
+---
+
+## ✦ Installation & Requirements
+
+1. Clone the repository.
+2. Run `iniciar.bat` to create a virtual environment (`.venv`) and install all required modules:
+   *   `Pillow` (Image validation)
+   *   `piexif` (EXIF parser)
+   *   `tkinterdnd2` (Drag and drop)
+   *   `pyinstaller` (Executable compilation)
+
+---
+
+## ✦ Donate & Support
+
+If Siftool helped you protect your privacy or streamline your developer workflow, consider supporting its development:
+
+<div align="center">
+  <a href="https://buymeacoffee.com/1b9hbqniv1">
+    <img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=1b9hbqniv1&button_color=7c3aed&font_color=ffffff&coffee_color=FFDD00" alt="Buy Me A Coffee">
+  </a>
+</div>
 
 ---
 
