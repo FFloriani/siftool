@@ -16,7 +16,7 @@ echo [1/3] Activating virtual environment...
 call .venv\Scripts\activate.bat
 
 echo [2/3] Building Siftool executable using PyInstaller...
-.venv\Scripts\pyinstaller.exe --clean siftool.spec
+.venv\Scripts\pyinstaller.exe --clean -y siftool.spec
 
 if %ERRORLEVEL% NEQ 0 (
     echo.

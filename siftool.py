@@ -22,9 +22,23 @@ import threading
 from pathlib import Path
 
 import piexif
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image
+
+# Prevent crashes in pythonw.exe or PyInstaller console=False where sys.stdout/stderr are None
+if sys.stdout is None:
+    class NullWriter:
+        def write(self, *args, **kwargs): pass
+        def flush(self, *args, **kwargs): pass
+    sys.stdout = NullWriter()
+if sys.stderr is None:
+    class NullWriter:
+        def write(self, *args, **kwargs): pass
+        def flush(self, *args, **kwargs): pass
+    sys.stderr = NullWriter()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -587,6 +601,27 @@ class SiftoolApp:
 
         self._build_ui()
         self._poll()
+        self._start_socket_server()
+
+        # Check initial arguments (if files/folders are passed)
+        import sys
+        is_cli_cmd = False
+        if len(sys.argv) > 1:
+            if sys.argv[1] in ("scan", "clean", "verify", "register-context", "unregister-context"):
+                is_cli_cmd = True
+
+        if len(sys.argv) > 1 and not is_cli_cmd:
+            import os
+            abs_paths = [os.path.abspath(p) for p in sys.argv[1:]]
+            self.root.after(100, lambda: self._enqueue(abs_paths))
+
+        # Auto-update context menu registration if needed (Windows only)
+        if sys.platform == "win32":
+            try:
+                if is_context_menu_registered():
+                    register_context_menu()
+            except Exception:
+                pass
 
     # ── DnD bootstrap ────────────────────────────────────────────────────────
 
@@ -610,7 +645,10 @@ class SiftoolApp:
         hdr = tk.Frame(self.root, bg=SURFACE, pady=16)
         hdr.pack(fill="x")
 
-        row = tk.Frame(hdr, bg=SURFACE)
+        center_frame = tk.Frame(hdr, bg=SURFACE)
+        center_frame.pack()
+
+        row = tk.Frame(center_frame, bg=SURFACE)
         row.pack()
 
         tk.Label(row, text="◈", font=(FONT, 22, "bold"),
@@ -620,9 +658,28 @@ class SiftoolApp:
         tk.Label(row, text=f"  {VERSION}", font=(FONT, 10),
                  bg=SURFACE, fg=TEXT_M).pack(side="left", pady=(8, 0))
 
-        tk.Label(hdr,
+        tk.Label(center_frame,
                  text="Lossless metadata removal · 100 % offline · Verified Clean",
                  font=(FONT, 9), bg=SURFACE, fg=TEXT_M).pack(pady=(2, 0))
+
+        # Checkbox for Explorer Context Menu in Windows
+        import sys
+        if sys.platform == "win32":
+            self.context_menu_var = tk.BooleanVar()
+            try:
+                self.context_menu_var.set(is_context_menu_registered())
+            except Exception:
+                self.context_menu_var.set(False)
+            
+            chk = tk.Checkbutton(
+                hdr, text="Integrate with Windows Explorer",
+                variable=self.context_menu_var,
+                command=self._toggle_context_menu,
+                bg=SURFACE, fg=TEXT_M, selectcolor=BG,
+                activebackground=SURFACE, activeforeground=TEXT,
+                font=(FONT, 8), bd=0, highlightthickness=0
+            )
+            chk.place(relx=1.0, rely=0.5, anchor="e", x=-20)
 
     def _build_dropzone(self) -> None:
         outer = tk.Frame(self.root, bg=BG, padx=20, pady=10)
@@ -898,7 +955,12 @@ class SiftoolApp:
     def _enqueue(self, paths: list[str]) -> None:
         existing = {f.path for f in self.files}
         added = 0
+        skipped_clean = 0
         for p in paths:
+            path_obj = Path(p)
+            if path_obj.stem.endswith("_clean"):
+                skipped_clean += 1
+                continue
             if p not in existing:
                 row = FileRow(p)
                 self.files.append(row)
@@ -909,8 +971,76 @@ class SiftoolApp:
                 )
                 added += 1
         self._refresh_count()
+        
+        status_msg = ""
         if added:
-            self.status_var.set(f"{added} file(s) added to queue.")
+            status_msg += f"{added} file(s) added to queue."
+        if skipped_clean:
+            if status_msg:
+                status_msg += f" (Skipped {skipped_clean} already cleaned file(s))"
+            else:
+                status_msg = f"Skipped {skipped_clean} already cleaned file(s)."
+        
+        if status_msg:
+            self.status_var.set(status_msg)
+
+    def _toggle_context_menu(self) -> None:
+        if self.context_menu_var.get():
+            success, err = register_context_menu()
+            if success:
+                self.status_var.set("Successfully integrated with Windows Explorer.")
+            else:
+                self.status_var.set(f"Failed to integrate: {err}")
+                self.context_menu_var.set(False)
+        else:
+            success, err = unregister_context_menu()
+            if success:
+                self.status_var.set("Successfully removed Windows Explorer integration.")
+            else:
+                self.status_var.set(f"Failed to remove integration: {err}")
+                self.context_menu_var.set(True)
+
+    def _start_socket_server(self) -> None:
+        import sys
+        if sys.platform == "win32":
+            import threading
+            t = threading.Thread(target=self._socket_listener_thread, daemon=True)
+            t.start()
+
+    def _socket_listener_thread(self) -> None:
+        import socket
+        
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+            s.listen(5)
+        except Exception:
+            return
+            
+        while True:
+            try:
+                conn, addr = s.accept()
+                data = bytearray()
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                conn.close()
+                
+                paths = data.decode("utf-8").split("\n")
+                self.root.after(0, lambda p=paths: self._enqueue_from_socket(p))
+            except Exception:
+                pass
+
+    def _enqueue_from_socket(self, paths: list[str]) -> None:
+        paths = [p.strip() for p in paths if p.strip()]
+        if paths:
+            self._enqueue(paths)
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
 
     def _clear_all(self) -> None:
         if self._running:
@@ -1074,6 +1204,12 @@ Examples:
     verify_p.add_argument("files", nargs="+", help="File paths to verify")
     verify_p.add_argument("--json", action="store_true", help="Output results in JSON format")
 
+    # register-context
+    subparsers.add_parser("register-context", help="Register Siftool with Windows Explorer context menu")
+
+    # unregister-context
+    subparsers.add_parser("unregister-context", help="Remove Siftool from Windows Explorer context menu")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1219,6 +1355,144 @@ Examples:
                     res_str = ", ".join(res["residuals"])
                     print(f"  {path_str:30} | [WARN] Not Clean (residuals: {res_str})")
 
+    elif args.command == "register-context":
+        success, err = register_context_menu()
+        if success:
+            print("Successfully registered Siftool Windows Explorer integration.")
+        else:
+            print(f"Error registering Siftool integration: {err}")
+            sys.exit(1)
+
+    elif args.command == "unregister-context":
+        success, err = unregister_context_menu()
+        if success:
+            print("Successfully removed Siftool Windows Explorer integration.")
+        else:
+            print(f"Error removing Siftool integration: {err}")
+            sys.exit(1)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WINDOWS PLATFORM INTEGRATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+SINGLE_INSTANCE_PORT = 49152
+
+def send_to_existing_instance(paths: list[str]) -> bool:
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        s.sendall("\n".join(paths).encode("utf-8"))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def _delete_key_recursive(key, path):
+    import winreg
+    try:
+        h_key = winreg.OpenKey(key, path, 0, winreg.KEY_ALL_ACCESS)
+    except FileNotFoundError:
+        return
+    
+    subkeys = []
+    try:
+        idx = 0
+        while True:
+            subkeys.append(winreg.EnumKey(h_key, idx))
+            idx += 1
+    except OSError:
+        pass
+    
+    winreg.CloseKey(h_key)
+    
+    for subkey in subkeys:
+        _delete_key_recursive(key, f"{path}\\{subkey}")
+        
+    try:
+        winreg.DeleteKey(key, path)
+    except FileNotFoundError:
+        pass
+
+def register_context_menu() -> tuple[bool, str]:
+    import sys
+    import os
+    
+    if sys.platform != "win32":
+        return False, "Not supported on this platform"
+        
+    try:
+        import winreg
+        
+        current_path = os.path.abspath(sys.argv[0])
+        
+        if current_path.lower().endswith(".exe"):
+            cmd_str = f'"{current_path}" "%1"'
+            ico_path = current_path
+        else:
+            pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if not os.path.exists(pythonw_path):
+                pythonw_path = sys.executable
+            cmd_str = f'"{pythonw_path}" "{current_path}" "%1"'
+            ico_path = os.path.join(os.path.dirname(current_path), "siftool.ico")
+            
+        menu_title = "Sift with Siftool"
+        
+        for ext in SUPPORTED_EXTS:
+            key_path = f"Software\\Classes\\SystemFileAssociations\\{ext}\\shell\\Siftool"
+            
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, menu_title)
+            
+            if os.path.exists(ico_path) or current_path.lower().endswith(".exe"):
+                winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, ico_path)
+            winreg.CloseKey(key)
+            
+            cmd_key_path = f"{key_path}\\command"
+            cmd_key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, cmd_key_path, 0, winreg.KEY_ALL_ACCESS)
+            winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, cmd_str)
+            winreg.CloseKey(cmd_key)
+            
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def unregister_context_menu() -> tuple[bool, str]:
+    import sys
+    
+    if sys.platform != "win32":
+        return False, "Not supported on this platform"
+        
+    try:
+        import winreg
+        for ext in SUPPORTED_EXTS:
+            key_path = f"Software\\Classes\\SystemFileAssociations\\{ext}\\shell\\Siftool"
+            _delete_key_recursive(winreg.HKEY_CURRENT_USER, key_path)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def is_context_menu_registered() -> bool:
+    import sys
+    
+    if sys.platform != "win32":
+        return False
+        
+    try:
+        import winreg
+        first_ext = list(SUPPORTED_EXTS)[0]
+        key_path = f"Software\\Classes\\SystemFileAssociations\\{first_ext}\\shell\\Siftool"
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+        winreg.CloseKey(key)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
@@ -1226,7 +1500,19 @@ Examples:
 
 if __name__ == "__main__":
     import sys
+    import os
+    
+    is_cli_cmd = False
     if len(sys.argv) > 1:
+        if sys.argv[1] in ("scan", "clean", "verify", "register-context", "unregister-context"):
+            is_cli_cmd = True
+            
+    if len(sys.argv) > 1 and not is_cli_cmd:
+        abs_paths = [os.path.abspath(p) for p in sys.argv[1:]]
+        if send_to_existing_instance(abs_paths):
+            sys.exit(0)
+
+    if len(sys.argv) > 1 and is_cli_cmd:
         cli_main()
     else:
         try:
