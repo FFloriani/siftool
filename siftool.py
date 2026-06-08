@@ -13,6 +13,7 @@ Lesson applied: NEVER re-encode JPEG. Strip APPn segments byte-by-byte.
                 PNG: rewrite file keeping only essential chunks.
 """
 
+import binascii
 import io
 import os
 import queue
@@ -270,10 +271,276 @@ class PngCleaner:
             for ct in removed_types
         ]
 
-        with open(dst, "wb") as fh:
-            fh.write(bytes(out))
-
         return removed
+
+
+def _find_exif_tag(tag_name: str) -> tuple[str, int] | None:
+    for ifd in ("0th", "Exif", "GPS", "1st"):
+        for tag_id, tag_info in piexif.TAGS[ifd].items():
+            if tag_info.get("name") == tag_name:
+                return ifd, tag_id
+    if tag_name.startswith("Tag_"):
+        try:
+            tag_id = int(tag_name[4:])
+            for ifd in ("0th", "Exif", "GPS", "1st"):
+                if tag_id in piexif.TAGS[ifd]:
+                    return ifd, tag_id
+        except ValueError:
+            pass
+    return None
+
+def update_exif_tag(image_path: str, tag_name: str, new_val_str: str) -> bool:
+    try:
+        exif_dict = piexif.load(image_path)
+        tag_loc = _find_exif_tag(tag_name)
+        if not tag_loc:
+            return False
+        ifd, tag_id = tag_loc
+        orig_val = exif_dict[ifd].get(tag_id)
+        if isinstance(orig_val, bytes):
+            exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+        elif isinstance(orig_val, tuple) and len(orig_val) == 2:
+            if "/" in new_val_str:
+                num, den = new_val_str.split("/", 1)
+                exif_dict[ifd][tag_id] = (int(num.strip()), int(den.strip()))
+            else:
+                exif_dict[ifd][tag_id] = (int(new_val_str), 1)
+        elif isinstance(orig_val, int):
+            exif_dict[ifd][tag_id] = int(new_val_str)
+        else:
+            exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, image_path)
+        return True
+    except Exception as e:
+        print(f"Error EXIF update: {e}")
+        return False
+
+def delete_exif_tag(image_path: str, tag_name: str) -> bool:
+    try:
+        exif_dict = piexif.load(image_path)
+        tag_loc = _find_exif_tag(tag_name)
+        if not tag_loc:
+            return False
+        ifd, tag_id = tag_loc
+        if tag_id in exif_dict[ifd]:
+            exif_dict[ifd].pop(tag_id)
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, image_path)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error EXIF delete: {e}")
+        return False
+
+def make_png_chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
+    length = len(chunk_data)
+    len_bytes = struct.pack(">I", length)
+    type_and_data = chunk_type + chunk_data
+    crc = binascii.crc32(type_and_data) & 0xffffffff
+    crc_bytes = struct.pack(">I", crc)
+    return len_bytes + type_and_data + crc_bytes
+
+def modify_png_chunk(image_path: str, keyword: str, new_value: str | None = None) -> bool:
+    try:
+        with open(image_path, "rb") as f:
+            data = f.read()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        out = bytearray(b"\x89PNG\r\n\x1a\n")
+        i = 8
+        keyword_bytes = keyword.lower().encode("latin-1", errors="ignore")
+        new_chunk_written = False
+        while i + 12 <= len(data):
+            chunk_len  = struct.unpack(">I", data[i:i + 4])[0]
+            chunk_type = data[i + 4:i + 8]
+            chunk_data = data[i + 8:i + 8 + chunk_len]
+            chunk_end  = i + 12 + chunk_len
+            is_target = False
+            if chunk_type in (b"tEXt", b"zTXt", b"iTXt"):
+                null_idx = chunk_data.find(b"\x00")
+                if null_idx != -1:
+                    chunk_key = chunk_data[:null_idx].lower()
+                    if chunk_key == keyword_bytes:
+                        is_target = True
+            if is_target:
+                pass
+            else:
+                if chunk_type == b"IDAT" and new_value is not None and not new_chunk_written:
+                    new_data = keyword.encode("latin-1", errors="ignore") + b"\0" + new_value.encode("latin-1", errors="ignore")
+                    out.extend(make_png_chunk(b"tEXt", new_data))
+                    new_chunk_written = True
+                out.extend(data[i:chunk_end])
+            i = chunk_end
+        if new_value is not None and not new_chunk_written:
+            iend_idx = out.find(b"IEND")
+            if iend_idx != -1:
+                new_data = keyword.encode("latin-1", errors="ignore") + b"\0" + new_value.encode("latin-1", errors="ignore")
+                chunk_bytes = make_png_chunk(b"tEXt", new_data)
+                out.insert(iend_idx - 4, chunk_bytes)
+        with open(image_path, "wb") as f:
+            f.write(out)
+        return True
+    except Exception as e:
+        print(f"Error PNG modify: {e}")
+        return False
+
+def modify_png_exif(image_path: str, tag_name: str, new_val_str: str | None = None) -> bool:
+    try:
+        with open(image_path, "rb") as f:
+            data = f.read()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        out = bytearray(b"\x89PNG\r\n\x1a\n")
+        i = 8
+        exif_chunk_data = None
+        while i + 12 <= len(data):
+            chunk_len  = struct.unpack(">I", data[i:i + 4])[0]
+            chunk_type = data[i + 4:i + 8]
+            if chunk_type == b"eXIf":
+                exif_chunk_data = data[i + 8:i + 8 + chunk_len]
+                break
+            i += 12 + chunk_len
+        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        if exif_chunk_data is not None:
+            try:
+                exif_dict = piexif.load(exif_chunk_data)
+            except Exception:
+                pass
+        tag_loc = _find_exif_tag(tag_name)
+        if not tag_loc:
+            return False
+        ifd, tag_id = tag_loc
+        if new_val_str is None:
+            if tag_id in exif_dict[ifd]:
+                exif_dict[ifd].pop(tag_id)
+        else:
+            orig_val = exif_dict[ifd].get(tag_id)
+            if isinstance(orig_val, bytes):
+                exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+            elif isinstance(orig_val, tuple) and len(orig_val) == 2:
+                if "/" in new_val_str:
+                    num, den = new_val_str.split("/", 1)
+                    exif_dict[ifd][tag_id] = (int(num.strip()), int(den.strip()))
+                else:
+                    exif_dict[ifd][tag_id] = (int(new_val_str), 1)
+            elif isinstance(orig_val, int):
+                exif_dict[ifd][tag_id] = int(new_val_str)
+            else:
+                exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+        new_exif_bytes = piexif.dump(exif_dict)
+        i = 8
+        new_chunk_written = False
+        while i + 12 <= len(data):
+            chunk_len  = struct.unpack(">I", data[i:i + 4])[0]
+            chunk_type = data[i + 4:i + 8]
+            chunk_end  = i + 12 + chunk_len
+            if chunk_type == b"eXIf":
+                if new_exif_bytes and (exif_dict["0th"] or exif_dict["Exif"] or exif_dict["GPS"] or exif_dict["1st"]):
+                    out.extend(make_png_chunk(b"eXIf", new_exif_bytes))
+                new_chunk_written = True
+            else:
+                if chunk_type == b"IDAT" and not new_chunk_written and new_exif_bytes:
+                    out.extend(make_png_chunk(b"eXIf", new_exif_bytes))
+                    new_chunk_written = True
+                out.extend(data[i:chunk_end])
+            i = chunk_end
+        with open(image_path, "wb") as f:
+            f.write(out)
+        return True
+    except Exception as e:
+        print(f"Error PNG EXIF modify: {e}")
+        return False
+
+def modify_webp_exif(image_path: str, tag_name: str, new_val_str: str | None = None) -> bool:
+    try:
+        with open(image_path, "rb") as f:
+            data = f.read()
+        if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return False
+        chunks = []
+        i = 12
+        exif_chunk_idx = -1
+        while i + 8 <= len(data):
+            chunk_type = data[i:i + 4]
+            chunk_len = struct.unpack("<I", data[i + 4:i + 8])[0]
+            padded_len = chunk_len + (chunk_len % 2)
+            chunk_data = data[i + 8:i + 8 + chunk_len]
+            if chunk_type == b"EXIF":
+                exif_chunk_idx = len(chunks)
+            chunks.append((chunk_type, chunk_data))
+            i += 8 + padded_len
+        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        if exif_chunk_idx != -1:
+            try:
+                exif_dict = piexif.load(chunks[exif_chunk_idx][1])
+            except Exception:
+                pass
+        tag_loc = _find_exif_tag(tag_name)
+        if not tag_loc:
+            return False
+        ifd, tag_id = tag_loc
+        if new_val_str is None:
+            if tag_id in exif_dict[ifd]:
+                exif_dict[ifd].pop(tag_id)
+        else:
+            orig_val = exif_dict[ifd].get(tag_id)
+            if isinstance(orig_val, bytes):
+                exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+            elif isinstance(orig_val, tuple) and len(orig_val) == 2:
+                if "/" in new_val_str:
+                    num, den = new_val_str.split("/", 1)
+                    exif_dict[ifd][tag_id] = (int(num.strip()), int(den.strip()))
+                else:
+                    exif_dict[ifd][tag_id] = (int(new_val_str), 1)
+            elif isinstance(orig_val, int):
+                exif_dict[ifd][tag_id] = int(new_val_str)
+            else:
+                exif_dict[ifd][tag_id] = new_val_str.encode("utf-8")
+        new_exif_bytes = piexif.dump(exif_dict)
+        if exif_chunk_idx != -1:
+            if not exif_dict["0th"] and not exif_dict["Exif"] and not exif_dict["GPS"] and not exif_dict["1st"]:
+                chunks.pop(exif_chunk_idx)
+            else:
+                chunks[exif_chunk_idx] = (b"EXIF", new_exif_bytes)
+        else:
+            if new_exif_bytes:
+                chunks.append((b"EXIF", new_exif_bytes))
+        out_body = bytearray()
+        for c_type, c_data in chunks:
+            out_body.extend(c_type)
+            c_len = len(c_data)
+            out_body.extend(struct.pack("<I", c_len))
+            out_body.extend(c_data)
+            if c_len % 2 != 0:
+                out_body.extend(b"\x00")
+        out_header = b"RIFF" + struct.pack("<I", len(out_body) + 4) + b"WEBP"
+        with open(image_path, "wb") as f:
+            f.write(out_header + out_body)
+        return True
+    except Exception as e:
+        print(f"Error WebP EXIF modify: {e}")
+        return False
+
+def edit_image_metadata(image_path: str, tag_name: str, new_val_str: str | None = None) -> bool:
+    """
+    Modifies or deletes a specific metadata tag in the image file losslessly.
+    If new_val_str is None, the tag is deleted.
+    """
+    ext = Path(image_path).suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        if new_val_str is None:
+            return delete_exif_tag(image_path, tag_name)
+        else:
+            return update_exif_tag(image_path, tag_name, new_val_str)
+    elif ext == ".png":
+        if _find_exif_tag(tag_name) is not None:
+            return modify_png_exif(image_path, tag_name, new_val_str)
+        else:
+            return modify_png_chunk(image_path, tag_name, new_val_str)
+    elif ext == ".webp":
+        return modify_webp_exif(image_path, tag_name, new_val_str)
+    return False
 
 
 # ── Public engine functions ────────────────────────────────────────────────
@@ -832,36 +1099,136 @@ class SiftoolApp:
         # Metadata title
         tk.Label(self.right_pane, text="Original Metadata Elements", font=(FONT, 9, "bold"), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
 
-        # Borderless, modern scrollable Text view for metadata elements (replaces clunky treeview grids)
-        text_frame = tk.Frame(self.right_pane, bg=CARD)
-        text_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        # Styled treeview frame
+        tree_frame = tk.Frame(self.right_pane, bg=CARD)
+        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        meta_text = tk.Text(text_frame, bg=CARD, fg=TEXT, font=(FONT, 9),
-                            relief="flat", bd=0, highlightthickness=0,
-                            wrap="word", spacing1=2, spacing3=4)
+        cols = ("key", "val")
+        meta_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse", height=5)
+        meta_tree.heading("key", text="Element")
+        meta_tree.heading("val", text="Value")
+        meta_tree.column("key", width=100, anchor="w")
+        meta_tree.column("val", width=150, anchor="w")
+
+        msb = ttk.Scrollbar(tree_frame, orient="vertical", command=meta_tree.yview)
+        meta_tree.configure(yscrollcommand=msb.set)
         
-        # Style tag configurations
-        meta_text.tag_configure("key", font=(FONT, 9, "bold"), fg=TEXT_M)
-        meta_text.tag_configure("val", font=(FONT, 9), fg=TEXT)
-        meta_text.tag_configure("alert", font=(FONT, 9, "bold"), fg=WARNING)
-        
-        msb = ttk.Scrollbar(text_frame, orient="vertical", command=meta_text.yview)
-        meta_text.configure(yscrollcommand=msb.set)
-        
-        # Pack scrollbar first so it does not get squeezed out
+        # Pack scrollbar first
         msb.pack(side="right", fill="y")
-        meta_text.pack(side="left", fill="both", expand=True)
+        meta_tree.pack(side="left", fill="both", expand=True)
 
-        # Load and display metadata
+        # Load metadata
         meta = scan_metadata(path)
-        meta_text.config(state="normal")
         for k, v in meta.items():
-            meta_text.insert("end", f"{k}:  ", "key")
-            if "[!]" in v or "Present" in v or "Residuals" in v:
-                meta_text.insert("end", f"{v}\n", "alert")
+            meta_tree.insert("", "end", values=(k, v))
+
+        # Bind context menu and double-click
+        self.meta_context_menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=ACCENT, activeforeground=TEXT, bd=0)
+        self.meta_context_menu.add_command(label="Edit Element", command=lambda: self._edit_selected_meta(path, meta_tree))
+        self.meta_context_menu.add_command(label="Delete Element", command=lambda: self._delete_selected_meta(path, meta_tree))
+        
+        def show_menu(event):
+            row_id = meta_tree.identify_row(event.y)
+            if row_id:
+                meta_tree.selection_set(row_id)
+                self.meta_context_menu.post(event.x_root, event.y_root)
+                
+        meta_tree.bind("<Button-3>", show_menu)
+        meta_tree.bind("<Double-1>", lambda event: self._edit_selected_meta(path, meta_tree))
+
+        # Button frame for actions
+        btn_frame = tk.Frame(self.right_pane, bg=CARD)
+        btn_frame.pack(fill="x", padx=12, pady=(4, 10))
+        
+        edit_btn = self._btn(btn_frame, "  Edit  ", lambda: self._edit_selected_meta(path, meta_tree), ACCENT, width=12)
+        edit_btn.pack(side="left", padx=(0, 6))
+        
+        del_btn = self._btn(btn_frame, "  Delete  ", lambda: self._delete_selected_meta(path, meta_tree), CARD2, width=12)
+        del_btn.pack(side="left")
+
+    def _edit_selected_meta(self, image_path: str, meta_tree: ttk.Treeview) -> None:
+        sel = meta_tree.selection()
+        if not sel:
+            messagebox.showinfo("Edit", "Please select a metadata element to edit.")
+            return
+        
+        item = meta_tree.item(sel[0])
+        tag_name, current_val = item["values"]
+        
+        # Open edit dialog window
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Edit {tag_name}")
+        dialog.geometry("400x180")
+        dialog.configure(bg=BG)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center dialog on Siftool window
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 200
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 90
+        dialog.geometry(f"+{x}+{y}")
+        
+        lbl = tk.Label(dialog, text=f"Edit value for '{tag_name}':", font=(FONT, 10, "bold"), bg=BG, fg=TEXT)
+        lbl.pack(fill="x", padx=20, pady=(20, 10), anchor="w")
+        
+        entry = tk.Entry(dialog, font=(FONT, 10), bg=CARD, fg=TEXT, insertbackground=TEXT, relief="flat", bd=1, highlightthickness=1, highlightcolor=ACCENT, highlightbackground=CARD2)
+        entry.pack(fill="x", padx=20, pady=(0, 20))
+        entry.insert(0, current_val)
+        entry.focus_set()
+        
+        def save_changes():
+            new_val = entry.get()
+            success = edit_image_metadata(image_path, tag_name, new_val)
+            if success:
+                row = self._find(image_path)
+                if row:
+                    row.status = FileRow.WAITING
+                    row.error_msg = "Edited manually"
+                    self._update_row_in_tree(row)
+                
+                dialog.destroy()
+                self._on_tree_select(None)
             else:
-                meta_text.insert("end", f"{v}\n", "val")
-        meta_text.config(state="disabled")
+                messagebox.showerror("Error", f"Failed to modify tag '{tag_name}'.")
+        
+        btn_frame = tk.Frame(dialog, bg=BG)
+        btn_frame.pack(fill="x", padx=20, side="bottom", pady=15)
+        
+        save_btn = self._btn(btn_frame, " Save ", save_changes, ACCENT, width=10)
+        save_btn.pack(side="right", padx=(10, 0))
+        
+        cancel_btn = self._btn(btn_frame, " Cancel ", dialog.destroy, CARD2, width=10)
+        cancel_btn.pack(side="right")
+        
+        entry.bind("<Return>", lambda _: save_changes())
+
+    def _delete_selected_meta(self, image_path: str, meta_tree: ttk.Treeview) -> None:
+        sel = meta_tree.selection()
+        if not sel:
+            messagebox.showinfo("Delete", "Please select a metadata element to delete.")
+            return
+        
+        item = meta_tree.item(sel[0])
+        tag_name, current_val = item["values"]
+        
+        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the tag '{tag_name}' losslessly from this image?"):
+            return
+            
+        success = edit_image_metadata(image_path, tag_name, None)
+        if success:
+            row = self._find(image_path)
+            if row:
+                row.status = FileRow.WAITING
+                row.error_msg = "Edited manually"
+                self._update_row_in_tree(row)
+            self._on_tree_select(None)
+        else:
+            messagebox.showerror("Error", f"Failed to delete tag '{tag_name}'.")
+
+    def _update_row_in_tree(self, row: FileRow) -> None:
+        if row.status == FileRow.WAITING:
+            self.tree.item(row.path, values=(row.name, "⏳ Waiting", row.error_msg or "Edited manually"), tags=("waiting",))
 
     def _build_footer(self) -> None:
         # Status bar (bottom-most)
