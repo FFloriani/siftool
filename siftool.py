@@ -829,31 +829,39 @@ class SiftoolApp:
                     rem_text += f"\n• and {len(row.removed) - 4} more..."
                 tk.Label(info_frame, text=rem_text, font=(FONT, 8), bg=CARD, fg=TEXT_M, justify="left", anchor="w").pack(fill="x", pady=(2, 6))
 
-        # Metadata table title
+        # Metadata title
         tk.Label(self.right_pane, text="Original Metadata Elements", font=(FONT, 9, "bold"), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
 
-        # Treeview for metadata elements
-        tree_frame = tk.Frame(self.right_pane, bg=CARD)
-        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        # Borderless, modern scrollable Text view for metadata elements (replaces clunky treeview grids)
+        text_frame = tk.Frame(self.right_pane, bg=CARD)
+        text_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
-        cols = ("key", "val")
-        # height=5 prevents the treeview from requesting too much space and clipping out on small screens
-        meta_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="none", height=5)
-        meta_tree.heading("key", text="Element")
-        meta_tree.heading("val", text="Value")
-        meta_tree.column("key", width=100, anchor="w")
-        meta_tree.column("val", width=150, anchor="w")
-
-        msb = ttk.Scrollbar(tree_frame, orient="vertical", command=meta_tree.yview)
-        meta_tree.configure(yscrollcommand=msb.set)
-        # Pack the scrollbar first so it stays sized correctly and is not squeezed out by the expanding treeview
+        meta_text = tk.Text(text_frame, bg=CARD, fg=TEXT, font=(FONT, 9),
+                            relief="flat", bd=0, highlightthickness=0,
+                            wrap="word", spacing1=2, spacing3=4)
+        
+        # Style tag configurations
+        meta_text.tag_configure("key", font=(FONT, 9, "bold"), fg=TEXT_M)
+        meta_text.tag_configure("val", font=(FONT, 9), fg=TEXT)
+        meta_text.tag_configure("alert", font=(FONT, 9, "bold"), fg=WARNING)
+        
+        msb = ttk.Scrollbar(text_frame, orient="vertical", command=meta_text.yview)
+        meta_text.configure(yscrollcommand=msb.set)
+        
+        # Pack scrollbar first so it does not get squeezed out
         msb.pack(side="right", fill="y")
-        meta_tree.pack(side="left", fill="both", expand=True)
+        meta_text.pack(side="left", fill="both", expand=True)
 
-        # Load metadata
+        # Load and display metadata
         meta = scan_metadata(path)
+        meta_text.config(state="normal")
         for k, v in meta.items():
-            meta_tree.insert("", "end", values=(k, v))
+            meta_text.insert("end", f"{k}:  ", "key")
+            if "[!]" in v or "Present" in v or "Residuals" in v:
+                meta_text.insert("end", f"{v}\n", "alert")
+            else:
+                meta_text.insert("end", f"{v}\n", "val")
+        meta_text.config(state="disabled")
 
     def _build_footer(self) -> None:
         # Status bar (bottom-most)
@@ -907,6 +915,18 @@ class SiftoolApp:
                          background=SURFACE, foreground=TEXT_M,
                          relief="flat", font=(FONT, 9, "bold"))
         style.map("Treeview", background=[("selected", ACCENT)])
+
+        # Premium Dark Scrollbar styling
+        style.configure("TScrollbar",
+                        background=CARD2,
+                        troughcolor=BG,
+                        bordercolor=BG,
+                        arrowcolor=TEXT_M,
+                        relief="flat",
+                        width=11,
+                        arrowsize=10)
+        style.map("TScrollbar",
+                  background=[("active", ACCENT)])
 
         self.tree.tag_configure("waiting",    foreground=TEXT_M)
         self.tree.tag_configure("processing", foreground=WARNING)
