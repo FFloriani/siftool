@@ -585,7 +585,7 @@ class SiftoolApp:
             self.root.iconbitmap("siftool.ico")
         except Exception:
             pass
-        self.root.geometry("860x660")
+        self.root.geometry("860x700")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(680, 500)
@@ -642,7 +642,7 @@ class SiftoolApp:
         self._build_list_panel()   # list fills remaining space with expand=True
 
     def _build_header(self) -> None:
-        hdr = tk.Frame(self.root, bg=SURFACE, pady=16)
+        hdr = tk.Frame(self.root, bg=SURFACE, pady=10)
         hdr.pack(fill="x")
 
         center_frame = tk.Frame(hdr, bg=SURFACE)
@@ -682,15 +682,15 @@ class SiftoolApp:
             chk.place(relx=1.0, rely=0.5, anchor="e", x=-20)
 
     def _build_dropzone(self) -> None:
-        outer = tk.Frame(self.root, bg=BG, padx=20, pady=10)
-        outer.pack(fill="x")
+        outer = tk.Frame(self.root, bg=BG, padx=20, pady=0)
+        outer.pack(fill="x", pady=(10, 4))
 
         self.drop_frame = tk.Frame(outer, bg=CARD, relief="flat", bd=0,
-                                   pady=22, padx=24, cursor="hand2")
+                                   pady=14, padx=24, cursor="hand2")
         self.drop_frame.pack(fill="x")
         self.drop_frame.bind("<Button-1>", lambda _: self._add_files())
 
-        tk.Label(self.drop_frame, text="⬇", font=(FONT, 26),
+        tk.Label(self.drop_frame, text="⬇", font=(FONT, 20),
                  bg=CARD, fg=ACCENT, cursor="hand2").pack()
 
         hint = ("Drop images or folders here"
@@ -712,7 +712,7 @@ class SiftoolApp:
 
         # Button row
         btn_row = tk.Frame(self.root, bg=BG)
-        btn_row.pack(pady=(0, 6))
+        btn_row.pack(pady=(0, 4))
 
         self._btn(btn_row, "＋  Add Files",   self._add_files,  ACCENT).pack(side="left", padx=5)
         self._btn(btn_row, "📁  Add Folder",  self._add_folder, CARD2).pack(side="left", padx=5)
@@ -837,7 +837,8 @@ class SiftoolApp:
         tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
         cols = ("key", "val")
-        meta_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="none")
+        # height=5 prevents the treeview from requesting too much space and clipping out on small screens
+        meta_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="none", height=5)
         meta_tree.heading("key", text="Element")
         meta_tree.heading("val", text="Value")
         meta_tree.column("key", width=100, anchor="w")
@@ -845,8 +846,9 @@ class SiftoolApp:
 
         msb = ttk.Scrollbar(tree_frame, orient="vertical", command=meta_tree.yview)
         meta_tree.configure(yscrollcommand=msb.set)
-        meta_tree.pack(side="left", fill="both", expand=True)
+        # Pack the scrollbar first so it stays sized correctly and is not squeezed out by the expanding treeview
         msb.pack(side="right", fill="y")
+        meta_tree.pack(side="left", fill="both", expand=True)
 
         # Load metadata
         meta = scan_metadata(path)
@@ -858,10 +860,10 @@ class SiftoolApp:
         self.status_var = tk.StringVar(value="Ready — add files and press Sift All.")
         tk.Label(self.root, textvariable=self.status_var,
                  bg=CARD, fg=TEXT_M, font=(FONT, 9),
-                 anchor="w", padx=14, pady=6).pack(fill="x", side="bottom")
+                 anchor="w", padx=14, pady=4).pack(fill="x", side="bottom")
 
         # Progress + action button
-        foot = tk.Frame(self.root, bg=SURFACE, pady=12)
+        foot = tk.Frame(self.root, bg=SURFACE, pady=8)
         foot.pack(fill="x", side="bottom")
 
         inner = tk.Frame(foot, bg=SURFACE)
