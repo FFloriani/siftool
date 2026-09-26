@@ -30,15 +30,18 @@ def load(path: Path, max_bytes: int = MAX_IMAGE_BYTES) -> bytes:
     """Read `path` fully into memory.
 
     Raises `CorruptFileError` if the file is empty, or `UnsafeFileError` if
-    it is larger than `max_bytes`. Any `OSError` from the underlying read
-    (e.g. `FileNotFoundError`) propagates unchanged.
+    it is larger than `max_bytes` -- checked via `stat()` before any of the
+    file's bytes are read, so an oversized file (e.g. a multi-GB video) is
+    never actually loaded into memory. Any `OSError` from the underlying
+    `stat`/read (e.g. `FileNotFoundError`) propagates unchanged.
     """
-    data = Path(path).read_bytes()
-    if not data:
+    path = Path(path)
+    size = path.stat().st_size
+    if size == 0:
         raise CorruptFileError(f"{path} is empty")
-    if len(data) > max_bytes:
+    if size > max_bytes:
         raise UnsafeFileError("file too large for an image")
-    return data
+    return path.read_bytes()
 
 
 def check_destination(src: Path, dst: Path, overwrite: bool) -> None:

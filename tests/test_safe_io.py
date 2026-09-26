@@ -11,6 +11,13 @@ def test_load_over_limit_is_unsafe(tmp_path):
     p = tmp_path / "big.png"; p.write_bytes(b"x" * 11)
     with pytest.raises(UnsafeFileError): load(p, max_bytes=10)
 
+def test_load_over_limit_does_not_read_the_file(tmp_path, monkeypatch):
+    p = tmp_path / "big.png"; p.write_bytes(b"x" * 11)
+    def _boom(self):
+        raise AssertionError("must not read")
+    monkeypatch.setattr(Path, "read_bytes", _boom)
+    with pytest.raises(UnsafeFileError): load(p, max_bytes=10)
+
 def test_same_file_is_refused_even_with_different_spelling(tmp_path):
     p = tmp_path / "a.png"; p.write_bytes(b"1")
     other = Path(str(p).upper()) if os.name == "nt" else p
