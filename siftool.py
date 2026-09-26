@@ -48,21 +48,25 @@ if sys.stderr is None:
 
 VERSION = "1.0.0"
 
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
+SUPPORTED_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp",
+    ".mp4", ".mov", ".mkv", ".avi", ".m4v"
+}
 
-# Colour palette — deep dark with violet accent
-BG      = "#0f0f17"
-SURFACE = "#16161f"
-CARD    = "#1c1c2a"
-CARD2   = "#21212f"
-ACCENT  = "#7c3aed"
-ACCENT_H = "#6d28d9"
-TEXT    = "#e2e8f0"
-TEXT_M  = "#7878a0"
-SUCCESS = "#22c55e"
-WARNING = "#f59e0b"
-DANGER  = "#ef4444"
-SEAL    = "#10b981"  # Verified Clean seal
+# Colour palette — deep dark with violet accent (Espelho do Universo)
+BG      = "#050508"
+SURFACE = "#0b0b14"
+CARD    = "#111122"
+CARD2   = "#181832"
+ACCENT  = "#8B00FF"
+ACCENT_H = "#C026FF"
+TEXT    = "#f1efff"
+TEXT_M  = "#8a85a5"
+SUCCESS = "#00FFC2"
+WARNING = "#FFC107"
+DANGER  = "#FF007F"
+SEAL    = "#00F0FF"  # Verified Clean seal
+
 
 FONT = "Segoe UI"
 
@@ -108,7 +112,22 @@ class JpegCleaner:
     }
 
     @classmethod
-    def clean(cls, src: str, dst: str) -> list[str]:
+    def _sanitise_exif(cls, exif_seg_data: bytes) -> bytes:
+        exif_dict = piexif.load(exif_seg_data[6:])
+        if "GPS" in exif_dict:
+            exif_dict["GPS"] = {}
+        if "0th" in exif_dict:
+            exif_dict["0th"].pop(315, None)      # Artist
+            exif_dict["0th"].pop(33432, None)    # Copyright
+        if "Exif" in exif_dict:
+            exif_dict["Exif"].pop(37500, None)   # MakerNote
+            exif_dict["Exif"].pop(42033, None)   # BodySerialNumber
+            exif_dict["Exif"].pop(42032, None)   # CameraOwnerName
+        exif_bytes = piexif.dump(exif_dict)
+        return exif_bytes
+
+    @classmethod
+    def clean(cls, src: str, dst: str, preset: str = "paranoia") -> list[str]:
         """
         Write a clean copy to *dst*. Returns list of removed items.
         Raises ValueError / IOError on bad input.
@@ -122,6 +141,11 @@ class JpegCleaner:
         removed: list[str] = []
         out = bytearray(b"\xff\xd8")  # SOI always goes through
         i = 2
+
+        strip_markers = set(cls._STRIP)
+        if preset in ("photographer", "social"):
+            # Preserve ICC profile (APP2)
+            strip_markers.discard(0xE2)
 
         while i < len(data):
             # Seek next 0xFF (skip padding / raw bytes)
@@ -160,12 +184,21 @@ class JpegCleaner:
             seg_len = struct.unpack(">H", data[i + 2: i + 4])[0]
             seg_end = i + 2 + seg_len   # length field includes itself
 
-            if marker in cls._STRIP:
+            if marker in strip_markers:
                 # Identify what we stripped
                 if marker == 0xE1:
                     seg_data = data[i + 4: seg_end]
                     if seg_data.startswith(b"Exif"):
-                        removed.append("EXIF data (camera, GPS, settings)")
+                        if preset == "photographer":
+                            try:
+                                sanitized_exif = cls._sanitise_exif(seg_data)
+                                out += b"\xff\xe1" + struct.pack(">H", len(sanitized_exif) + 2) + sanitized_exif
+                                removed.append("GPS & personal tags removed (EXIF preserved)")
+                            except Exception:
+                                # Fallback to stripping if sanitisation fails
+                                removed.append("EXIF data (camera, GPS, settings)")
+                        else:
+                            removed.append("EXIF data (camera, GPS, settings)")
                     elif b"xpacket" in seg_data[:64] or seg_data.startswith(b"http://"):
                         removed.append("XMP metadata")
                     else:
@@ -240,7 +273,7 @@ class PngCleaner:
     }
 
     @classmethod
-    def clean(cls, src: str, dst: str) -> list[str]:
+    def clean(cls, src: str, dst: str, preset: str = "paranoia") -> list[str]:
         """
         Write a clean copy to *dst*. Returns list of removed items.
         """
@@ -251,25 +284,56 @@ class PngCleaner:
             raise ValueError("Not a valid PNG file (missing PNG signature)")
 
         removed_types: set[bytes] = set()
+        exif_sanitised = False
         out = bytearray(cls.PNG_SIG)
         i = 8
+
+        strip_chunks = set(cls._STRIP)
+        if preset in ("photographer", "social"):
+            strip_chunks.difference_update({b"iCCP", b"sRGB", b"gAMA", b"cHRM"})
+        if preset == "photographer":
+            strip_chunks.discard(b"eXIf")
 
         while i + 12 <= len(data):
             chunk_len  = struct.unpack(">I", data[i:i + 4])[0]
             chunk_type = data[i + 4:i + 8]
+            chunk_data = data[i + 8:i + 8 + chunk_len]
             chunk_end  = i + 12 + chunk_len  # 4 len + 4 type + N data + 4 CRC
 
-            if chunk_type in cls._STRIP:
+            if chunk_type in strip_chunks:
                 removed_types.add(chunk_type)
+            elif chunk_type == b"eXIf" and preset == "photographer":
+                try:
+                    # PNG eXIf chunk has raw EXIF bytes
+                    exif_dict = piexif.load(chunk_data)
+                    if "GPS" in exif_dict:
+                        exif_dict["GPS"] = {}
+                    if "0th" in exif_dict:
+                        exif_dict["0th"].pop(315, None)      # Artist
+                        exif_dict["0th"].pop(33432, None)    # Copyright
+                    if "Exif" in exif_dict:
+                        exif_dict["Exif"].pop(37500, None)   # MakerNote
+                        exif_dict["Exif"].pop(42033, None)   # BodySerialNumber
+                        exif_dict["Exif"].pop(42032, None)   # CameraOwnerName
+                    sanitized_exif = piexif.dump(exif_dict)
+                    out += make_png_chunk(b"eXIf", sanitized_exif)
+                    exif_sanitised = True
+                except Exception:
+                    removed_types.add(b"eXIf")  # Fallback to stripping
             else:
                 out += data[i:chunk_end]
 
             i = chunk_end
 
+        with open(dst, "wb") as fh:
+            fh.write(bytes(out))
+
         removed = [
             cls._LABELS.get(ct, ct.decode("ascii", errors="replace"))
             for ct in removed_types
         ]
+        if exif_sanitised:
+            removed.append("GPS & personal tags removed (EXIF preserved)")
 
         return removed
 
@@ -623,6 +687,10 @@ def scan_metadata(image_path: str) -> dict[str, str]:
     Read all metadata from *image_path* and return as an ordered dict.
     Pure function — no side effects, no GUI dependency.
     """
+    ext = Path(image_path).suffix.lower()
+    if ext in (".mp4", ".mov", ".mkv", ".avi", ".m4v"):
+        return scan_video_metadata(image_path)
+
     meta: dict[str, str] = {}
     try:
         # Check C2PA presence
@@ -698,6 +766,26 @@ def verify_clean(image_path: str) -> tuple[bool, list[str]]:
     Returns (is_clean: bool, residuals: list[str]).
     An empty residuals list means the file is fully clean.
     """
+    # Fail closed: a file we cannot read must never receive the Verified Clean seal
+    if not os.path.isfile(image_path):
+        return (False, ["File not found — nothing to verify"])
+
+    ext = Path(image_path).suffix.lower()
+    if ext in (".mp4", ".mov", ".mkv", ".avi", ".m4v"):
+        residuals: list[str] = []
+        try:
+            meta = scan_video_metadata(image_path)
+            if "Creation Date" in meta:
+                residuals.append("Timestamps")
+            if "GPS Location" in meta:
+                residuals.append("GPS Coordinates")
+            for key in ("Title", "Artist", "Comment", "Encoding Tool"):
+                if key in meta:
+                    residuals.append(f"Metadata Tag: {key}")
+        except Exception as exc:
+            residuals.append(f"Verification failed: {exc}")
+        return (len(residuals) == 0, residuals)
+
     residuals: list[str] = []
     try:
         # Check C2PA
@@ -738,13 +826,13 @@ def verify_clean(image_path: str) -> tuple[bool, list[str]]:
                 pass
 
         img.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        residuals.append(f"Verification failed: {exc}")
 
     return (len(residuals) == 0, residuals)
 
 
-def clean_lossless(src: str, dst: str) -> tuple[bool, list[str]]:
+def clean_lossless(src: str, dst: str, preset: str = "paranoia") -> tuple[bool, list[str]]:
     """
     Dispatcher: routes to the appropriate lossless cleaner by file extension.
     Returns (success: bool, items: list[str]).
@@ -756,27 +844,71 @@ def clean_lossless(src: str, dst: str) -> tuple[bool, list[str]]:
     removed: list[str] = []
 
     try:
-        if ext in (".jpg", ".jpeg"):
-            removed = JpegCleaner.clean(src, dst)
+        if ext in (".mp4", ".mov", ".mkv", ".avi", ".m4v"):
+            removed = VideoCleaner.clean(src, dst, preset)
+
+        elif ext in (".jpg", ".jpeg"):
+            removed = JpegCleaner.clean(src, dst, preset)
 
         elif ext == ".png":
-            removed = PngCleaner.clean(src, dst)
+            removed = PngCleaner.clean(src, dst, preset)
 
         elif ext == ".webp":
             img = Image.open(src)
             info = img.info or {}
-            tracked: list[str] = []
-            if "exif"        in info and info["exif"]:       tracked.append("EXIF data")
-            if "icc_profile" in info and info["icc_profile"]: tracked.append("ICC color profile")
-            if "xmp"         in info and info["xmp"]:         tracked.append("XMP metadata")
-
-            c2pa_present, _ = detect_c2pa(src)
-            if c2pa_present:
-                tracked.append("C2PA / Content Credentials")
-
+            
+            exif_bytes = info.get("exif", b"")
+            icc_profile = info.get("icc_profile", b"")
+            xmp_bytes = info.get("xmp", b"")
+            
+            save_kw: dict = {"format": "WEBP", "exif": b"", "icc_profile": b"", "xmp": b""}
+            
+            if preset == "paranoia":
+                if exif_bytes: removed.append("EXIF data")
+                if icc_profile: removed.append("ICC color profile")
+                if xmp_bytes: removed.append("XMP metadata")
+                c2pa_present, _ = detect_c2pa(src)
+                if c2pa_present: removed.append("C2PA / Content Credentials")
+                
+            elif preset == "photographer":
+                if icc_profile:
+                    save_kw["icc_profile"] = icc_profile
+                if xmp_bytes:
+                    removed.append("XMP metadata")
+                c2pa_present, _ = detect_c2pa(src)
+                if c2pa_present:
+                    removed.append("C2PA / Content Credentials")
+                if exif_bytes:
+                    try:
+                        exif_dict = piexif.load(exif_bytes)
+                        if "GPS" in exif_dict:
+                            exif_dict["GPS"] = {}
+                        if "0th" in exif_dict:
+                            exif_dict["0th"].pop(315, None)      # Artist
+                            exif_dict["0th"].pop(33432, None)    # Copyright
+                        if "Exif" in exif_dict:
+                            exif_dict["Exif"].pop(37500, None)   # MakerNote
+                            exif_dict["Exif"].pop(42033, None)   # BodySerialNumber
+                            exif_dict["Exif"].pop(42032, None)   # CameraOwnerName
+                        sanitized_exif = piexif.dump(exif_dict)
+                        save_kw["exif"] = sanitized_exif
+                        removed.append("GPS & personal tags removed (EXIF preserved)")
+                    except Exception:
+                        removed.append("EXIF data")  # Fallback to stripping
+                
+            elif preset == "social":
+                if icc_profile:
+                    save_kw["icc_profile"] = icc_profile
+                if exif_bytes:
+                    removed.append("EXIF data")
+                if xmp_bytes:
+                    removed.append("XMP metadata")
+                c2pa_present, _ = detect_c2pa(src)
+                if c2pa_present:
+                    removed.append("C2PA / Content Credentials")
+            
             # Detect if the source WEBP was lossless
             is_lossless = bool(info.get("lossless", False))
-            save_kw: dict = {"format": "WEBP", "exif": b"", "icc_profile": b"", "xmp": b""}
             if is_lossless:
                 save_kw["lossless"] = True
             else:
@@ -784,14 +916,34 @@ def clean_lossless(src: str, dst: str) -> tuple[bool, list[str]]:
 
             img.save(dst, **save_kw)
             img.close()
-            removed = tracked or ["No metadata found"]
 
         elif ext == ".gif":
             img = Image.open(src)
             info = img.info or {}
             if "comment" in info:
                 removed.append("Comment")
-            img.save(dst, format="GIF")
+            
+            if getattr(img, "is_animated", False):
+                frames = []
+                durations = []
+                disposals = []
+                for frame_idx in range(img.n_frames):
+                    img.seek(frame_idx)
+                    frames.append(img.copy())
+                    durations.append(img.info.get("duration", 100))
+                    disposals.append(img.info.get("disposal", 2))
+                
+                frames[0].save(
+                    dst,
+                    format="GIF",
+                    save_all=True,
+                    append_images=frames[1:],
+                    loop=info.get("loop", 0),
+                    duration=durations,
+                    disposal=disposals
+                )
+            else:
+                img.save(dst, format="GIF")
             img.close()
 
         elif ext in (".tiff", ".tif"):
@@ -811,6 +963,9 @@ def clean_lossless(src: str, dst: str) -> tuple[bool, list[str]]:
             img.save(dst)
             img.close()
 
+        if not os.path.isfile(dst):
+            return False, ["Error: cleaned file was not written"]
+
         if not removed:
             removed.append("No metadata found — file was already clean")
 
@@ -820,9 +975,407 @@ def clean_lossless(src: str, dst: str) -> tuple[bool, list[str]]:
         return False, [f"Error: {exc}"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────────────────────────────────────
+def scan_native_mp4_metadata(path: str) -> dict[str, str]:
+    meta = {}
+    try:
+        import datetime
+        import struct
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            f.seek(0)
+            
+            def find_mvhd(start_offset, end_offset):
+                f.seek(start_offset)
+                while f.tell() < end_offset:
+                    offset = f.tell()
+                    header = f.read(8)
+                    if not header or len(header) < 8:
+                        break
+                    box_size, box_type = struct.unpack(">I4s", header)
+                    header_len = 8
+                    if box_size == 1:
+                        ext = f.read(8)
+                        box_size = struct.unpack(">Q", ext)[0]
+                        header_len = 16
+                    if box_size <= 0:
+                        break
+                        
+                    if box_type == b"mvhd":
+                        f.seek(offset)
+                        return f.read(box_size)
+                    elif box_type in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                        res = find_mvhd(offset + header_len, offset + box_size)
+                        if res:
+                            return res
+                    f.seek(offset + box_size)
+                return None
+
+            mvhd_data = find_mvhd(0, file_size)
+            if mvhd_data:
+                header_len = 8
+                box_size = struct.unpack_from(">I", mvhd_data, 0)[0]
+                if box_size == 1:
+                    header_len = 16
+                
+                version = mvhd_data[header_len]
+                if version == 0:
+                    creation_time = struct.unpack_from(">I", mvhd_data, header_len + 4)[0]
+                    modification_time = struct.unpack_from(">I", mvhd_data, header_len + 8)[0]
+                    time_scale = struct.unpack_from(">I", mvhd_data, header_len + 12)[0]
+                    duration = struct.unpack_from(">I", mvhd_data, header_len + 16)[0]
+                else:
+                    creation_time = struct.unpack_from(">Q", mvhd_data, header_len + 4)[0]
+                    modification_time = struct.unpack_from(">Q", mvhd_data, header_len + 12)[0]
+                    time_scale = struct.unpack_from(">I", mvhd_data, header_len + 20)[0]
+                    duration = struct.unpack_from(">Q", mvhd_data, header_len + 24)[0]
+                
+                if creation_time > 0:
+                    try:
+                        base = datetime.datetime(1904, 1, 1, tzinfo=datetime.timezone.utc)
+                        dt = base + datetime.timedelta(seconds=creation_time)
+                        meta["Creation Date"] = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    except Exception:
+                        meta["Creation Date"] = f"Raw: {creation_time}"
+                
+                if duration > 0 and time_scale > 0:
+                    dur_secs = duration / time_scale
+                    mins = int(dur_secs // 60)
+                    secs = dur_secs % 60
+                    meta["Duration"] = f"{mins}m {secs:.2f}s" if mins > 0 else f"{dur_secs:.2f}s"
+                    
+            def find_udta_tags(start_offset, end_offset):
+                f.seek(start_offset)
+                while f.tell() < end_offset:
+                    offset = f.tell()
+                    header = f.read(8)
+                    if not header or len(header) < 8:
+                        break
+                    box_size, box_type = struct.unpack(">I4s", header)
+                    header_len = 8
+                    if box_size == 1:
+                        ext = f.read(8)
+                        box_size = struct.unpack(">Q", ext)[0]
+                        header_len = 16
+                    if box_size <= 0:
+                        break
+                        
+                    if box_type == b"udta":
+                        f.seek(offset)
+                        udta_bytes = f.read(box_size)
+                        udta_payload_start = header_len
+                        while udta_payload_start + 8 < len(udta_bytes):
+                            sub_size = struct.unpack_from(">I", udta_bytes, udta_payload_start)[0]
+                            if sub_size <= 0 or udta_payload_start + sub_size > len(udta_bytes):
+                                break
+                            sub_type = udta_bytes[udta_payload_start+4:udta_payload_start+8]
+                            if sub_type.startswith(b"\xa9") or sub_type in (b"xyz", b"meta"):
+                                tag_name = sub_type.decode("latin1")
+                                payload = udta_bytes[udta_payload_start+8:udta_payload_start+sub_size]
+                                data_idx = payload.find(b"data")
+                                if data_idx != -1 and data_idx + 12 < len(payload):
+                                    text_bytes = payload[data_idx+12:]
+                                    try:
+                                        text = text_bytes.decode("utf-8", errors="ignore").strip("\x00\r\n\t ")
+                                    except Exception:
+                                        text = ""
+                                else:
+                                    try:
+                                        text = payload.decode("utf-8", errors="ignore").strip("\x00\r\n\t ")
+                                        text = "".join(c for c in text if c.isprintable())
+                                    except Exception:
+                                        text = ""
+
+                                if text:
+                                    friendly_names = {
+                                        "\xa9nam": "Title",
+                                        "nam": "Title",
+                                        "\xa9ART": "Artist",
+                                        "art": "Artist",
+                                        "\xa9alb": "Album",
+                                        "alb": "Album",
+                                        "\xa9day": "Year",
+                                        "day": "Year",
+                                        "\xa9too": "Encoding Tool",
+                                        "too": "Encoding Tool",
+                                        "\xa9cmt": "Comment",
+                                        "cmt": "Comment",
+                                        "\xa9xyz": "GPS Location",
+                                        "xyz": "GPS Location"
+                                    }
+                                    friendly = friendly_names.get(tag_name)
+                                    if not friendly and tag_name.startswith("\xa9"):
+                                        friendly = friendly_names.get(tag_name[1:])
+                                    if not friendly:
+                                        friendly = friendly_names.get(tag_name.lower())
+                                        
+                                    if friendly:
+                                        meta[friendly] = text
+                                    else:
+                                        meta[tag_name.upper()] = text
+                            udta_payload_start += sub_size
+                        break
+                    elif box_type in (b"moov", b"meta"):
+                        find_udta_tags(offset + header_len, offset + box_size)
+                    f.seek(offset + box_size)
+            
+            find_udta_tags(0, file_size)
+    except Exception as e:
+        print(f"[siftool] Native video scan error: {e}")
+        
+    return meta
+
+
+def scan_video_metadata(path: str) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    ext = Path(path).suffix.lower()
+    
+    if VideoCleaner.detect_ffmpeg():
+        try:
+            import subprocess
+            import json
+            cmd = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", path]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=0x08000000)
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                
+                fmt = data.get("format", {})
+                meta["Format"] = fmt.get("format_long_name", ext[1:].upper())
+                
+                v_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
+                a_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+                
+                if v_streams:
+                    v = v_streams[0]
+                    meta["Video Codec"] = v.get("codec_name", "Unknown").upper()
+                    meta["Resolution"] = f"{v.get('width')} \u00d7 {v.get('height')} px"
+                    if "r_frame_rate" in v:
+                        fps_parts = v["r_frame_rate"].split("/")
+                        if len(fps_parts) == 2 and float(fps_parts[1]) > 0:
+                            fps = float(fps_parts[0]) / float(fps_parts[1])
+                            meta["Frame Rate"] = f"{fps:.2f} fps"
+                            
+                if a_streams:
+                    meta["Audio Codec"] = a_streams[0].get("codec_name", "Unknown").upper()
+                    
+                dur_str = fmt.get("duration")
+                if dur_str:
+                    try:
+                        dur_secs = float(dur_str)
+                        mins = int(dur_secs // 60)
+                        secs = dur_secs % 60
+                        meta["Duration"] = f"{mins}m {secs:.2f}s" if mins > 0 else f"{dur_secs:.2f}s"
+                    except Exception:
+                        meta["Duration"] = f"{dur_str} s"
+                        
+                tags = fmt.get("tags", {})
+                for s in data.get("streams", []):
+                    tags.update(s.get("tags", {}))
+                    
+                friendly = {
+                    "creation_time": "Creation Date",
+                    "location": "GPS Location",
+                    "location-eng": "GPS Location",
+                    "encoder": "Encoding Tool",
+                    "title": "Title",
+                    "artist": "Artist",
+                    "comment": "Comment"
+                }
+                for k, v in tags.items():
+                    k_lower = k.lower()
+                    if k_lower in friendly:
+                        meta[friendly[k_lower]] = v
+                    elif k_lower not in ("compatible_brands", "major_brand", "minor_version", "handler_name"):
+                        meta[k.upper()] = v
+                return meta
+        except Exception as e:
+            print(f"[siftool] ffprobe scan failed: {e}. Falling back to native...")
+
+    if ext in (".mp4", ".mov", ".m4v"):
+        meta.update(scan_native_mp4_metadata(path))
+        meta["Format"] = ext[1:].upper() + " Video"
+    else:
+        meta["Format"] = ext[1:].upper() + " Video"
+        meta["Duration"] = "Unknown (Install FFmpeg for details)"
+        
+    return meta
+
+
+class VideoCleaner:
+    @classmethod
+    def clean(cls, src: str, dst: str, preset: str = "paranoia") -> list[str]:
+        if cls.detect_ffmpeg():
+            try:
+                return cls.clean_with_ffmpeg(src, dst)
+            except Exception as e:
+                print(f"[siftool] FFmpeg cleaning failed: {e}. Falling back to native...")
+                
+        ext = Path(src).suffix.lower()
+        if ext in (".mp4", ".mov", ".m4v"):
+            return cls.clean_native_mp4(src, dst)
+            
+        raise Exception("FFmpeg is required to clean this video format. Please install FFmpeg.")
+
+    @staticmethod
+    def detect_ffmpeg() -> bool:
+        import shutil
+        return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+    @staticmethod
+    def clean_with_ffmpeg(src: str, dst: str) -> list[str]:
+        import subprocess
+        cmd = ["ffmpeg", "-i", src, "-map_metadata", "-1", "-c", "copy", "-y", dst]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=0x08000000)
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error: {result.stderr}")
+        return ["All Metadata Streams", "GPS Coordinates", "Timestamps", "Camera profile"]
+
+    @staticmethod
+    def clean_native_mp4(src: str, dst: str) -> list[str]:
+        import struct
+        
+        def sanitize_container_bytes(data: bytearray, start: int, end: int) -> None:
+            i = start
+            while i + 8 <= end:
+                box_size = struct.unpack_from(">I", data, i)[0]
+                box_type = data[i+4:i+8]
+                
+                header_len = 8
+                real_size = box_size
+                if box_size == 1:
+                    real_size = struct.unpack_from(">Q", data, i + 8)[0]
+                    header_len = 16
+                    
+                if real_size <= 0:
+                    break
+                    
+                if box_type in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+                    sanitize_container_bytes(data, i + header_len, i + real_size)
+                    
+                elif box_type in (b"udta", b"meta"):
+                    data[i+4:i+8] = b"free"
+                    
+                elif box_type == b"mvhd":
+                    version = data[i + header_len]
+                    if version == 0:
+                        struct.pack_into(">I", data, i + header_len + 4, 0)
+                        struct.pack_into(">I", data, i + header_len + 8, 0)
+                    elif version == 1:
+                        struct.pack_into(">Q", data, i + header_len + 4, 0)
+                        struct.pack_into(">Q", data, i + header_len + 12, 0)
+                        
+                elif box_type == b"tkhd":
+                    version = data[i + header_len]
+                    if version == 0:
+                        struct.pack_into(">I", data, i + header_len + 4, 0)
+                        struct.pack_into(">I", data, i + header_len + 8, 0)
+                    elif version == 1:
+                        struct.pack_into(">Q", data, i + header_len + 4, 0)
+                        struct.pack_into(">Q", data, i + header_len + 12, 0)
+                        
+                elif box_type == b"mdhd":
+                    version = data[i + header_len]
+                    if version == 0:
+                        struct.pack_into(">I", data, i + header_len + 4, 0)
+                        struct.pack_into(">I", data, i + header_len + 8, 0)
+                    elif version == 1:
+                        struct.pack_into(">Q", data, i + header_len + 4, 0)
+                        struct.pack_into(">Q", data, i + header_len + 12, 0)
+                        
+                i += real_size
+
+        removed = []
+        with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+            f_in.seek(0, 2)
+            file_size = f_in.tell()
+            f_in.seek(0)
+            
+            while f_in.tell() < file_size:
+                header_offset = f_in.tell()
+                header = f_in.read(8)
+                if not header or len(header) < 8:
+                    break
+                    
+                box_size, box_type = struct.unpack(">I4s", header)
+                header_len = 8
+                if box_size == 1:
+                    ext_header = f_in.read(8)
+                    box_size = struct.unpack(">Q", ext_header)[0]
+                    header_len = 16
+                    
+                if box_size <= 0:
+                    break
+                    
+                if box_type == b"moov":
+                    f_in.seek(header_offset)
+                    moov_data = bytearray(f_in.read(box_size))
+                    sanitize_container_bytes(moov_data, 0, len(moov_data))
+                    f_out.write(moov_data)
+                    removed.append("Metadata Atoms (moov/udta/meta)")
+                    removed.append("Creation/Modification Timestamps")
+                elif box_type == b"mdat":
+                    f_out.write(header)
+                    if header_len == 16:
+                        f_out.write(ext_header)
+                    
+                    bytes_to_copy = box_size - header_len
+                    chunk_size = 64 * 1024
+                    while bytes_to_copy > 0:
+                        read_size = min(bytes_to_copy, chunk_size)
+                        chunk = f_in.read(read_size)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        bytes_to_copy -= len(chunk)
+                else:
+                    f_in.seek(header_offset)
+                    other_data = f_in.read(box_size)
+                    if box_type in (b"udta", b"meta"):
+                        other_data_ba = bytearray(other_data)
+                        other_data_ba[4:8] = b"free"
+                        other_data = bytes(other_data_ba)
+                        removed.append("Metadata Atoms (udta/meta)")
+                    f_out.write(other_data)
+                    
+        return removed
+
+
+class ScrollableFrame(tk.Frame):
+    def __init__(self, parent, bg):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg=bg)
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+        
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        
+        self.canvas.bind('<Configure>', lambda event: self.canvas.itemconfig(self.canvas_window, width=event.width))
+        
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        
+        # Smooth mousewheel binding only when hovered
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            
+        def _bind_mouse(event):
+            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            
+        def _unbind_mouse(event):
+            self.canvas.unbind_all("<MouseWheel>")
+            
+        self.canvas.bind("<Enter>", _bind_mouse)
+        self.canvas.bind("<Leave>", _unbind_mouse)
+
 
 class FileRow:
     """State model for a single file in the batch queue."""
@@ -852,7 +1405,7 @@ class SiftoolApp:
             self.root.iconbitmap("siftool.ico")
         except Exception:
             pass
-        self.root.geometry("860x700")
+        self.root.geometry("960x720")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(680, 500)
@@ -866,9 +1419,15 @@ class SiftoolApp:
         self._DND_FILES: str = ""
         self._try_enable_dnd()
 
+        # Setup styles before building UI to ensure they apply to all widgets properly
+        self._setup_styles()
+
         self._build_ui()
         self._poll()
         self._start_socket_server()
+
+        # Responsive window resizing
+        self.root.bind("<Configure>", self._on_window_resize)
 
         # Check initial arguments (if files/folders are passed)
         import sys
@@ -909,7 +1468,7 @@ class SiftoolApp:
         self._build_list_panel()   # list fills remaining space with expand=True
 
     def _build_header(self) -> None:
-        hdr = tk.Frame(self.root, bg=SURFACE, pady=10)
+        hdr = tk.Frame(self.root, bg=SURFACE, pady=6)
         hdr.pack(fill="x")
 
         center_frame = tk.Frame(hdr, bg=SURFACE)
@@ -918,16 +1477,16 @@ class SiftoolApp:
         row = tk.Frame(center_frame, bg=SURFACE)
         row.pack()
 
-        tk.Label(row, text="◈", font=(FONT, 22, "bold"),
-                 bg=SURFACE, fg=ACCENT).pack(side="left")
-        tk.Label(row, text=" Siftool", font=(FONT, 20, "bold"),
+        tk.Label(row, text="✦", font=(FONT, 18, "bold"),
+                 bg=SURFACE, fg=ACCENT_H).pack(side="left")
+        tk.Label(row, text=" Siftool", font=(FONT, 16, "bold"),
                  bg=SURFACE, fg=TEXT).pack(side="left")
-        tk.Label(row, text=f"  {VERSION}", font=(FONT, 10),
-                 bg=SURFACE, fg=TEXT_M).pack(side="left", pady=(8, 0))
+        tk.Label(row, text=f"  {VERSION}", font=(FONT, 9),
+                 bg=SURFACE, fg=TEXT_M).pack(side="left", pady=(6, 0))
 
         tk.Label(center_frame,
                  text="Lossless metadata removal · 100 % offline · Verified Clean",
-                 font=(FONT, 9), bg=SURFACE, fg=TEXT_M).pack(pady=(2, 0))
+                 font=(FONT, 8), bg=SURFACE, fg=TEXT_M).pack(pady=(2, 0))
 
         # Checkbox for Explorer Context Menu in Windows
         import sys
@@ -950,27 +1509,62 @@ class SiftoolApp:
 
     def _build_dropzone(self) -> None:
         outer = tk.Frame(self.root, bg=BG, padx=20, pady=0)
-        outer.pack(fill="x", pady=(10, 4))
+        outer.pack(fill="x", pady=(6, 2))
 
         self.drop_frame = tk.Frame(outer, bg=CARD, relief="flat", bd=0,
-                                   pady=14, padx=24, cursor="hand2")
+                                   pady=8, padx=16, cursor="hand2",
+                                   highlightthickness=1, highlightbackground=CARD2)
         self.drop_frame.pack(fill="x")
         self.drop_frame.bind("<Button-1>", lambda _: self._add_files())
 
-        tk.Label(self.drop_frame, text="⬇", font=(FONT, 20),
-                 bg=CARD, fg=ACCENT, cursor="hand2").pack()
+        arrow_lbl = tk.Label(self.drop_frame, text="✦  ⬇  ✦", font=(FONT, 16, "bold"),
+                             bg=CARD, fg=ACCENT, cursor="hand2")
+        arrow_lbl.pack()
+        arrow_lbl.bind("<Button-1>", lambda _: self._add_files())
 
-        hint = ("Drop images or folders here"
-                if not self._dnd_available
-                else "Drop images or folders here")
+        hint = "Drop images, videos or folders here"
         self.drop_hint = tk.Label(self.drop_frame, text=hint,
-                                   font=(FONT, 12), bg=CARD, fg=TEXT_M, cursor="hand2")
-        self.drop_hint.pack(pady=(4, 2))
+                                   font=(FONT, 11, "bold"), bg=CARD, fg=TEXT, cursor="hand2")
+        self.drop_hint.pack(pady=(2, 1))
         self.drop_hint.bind("<Button-1>", lambda _: self._add_files())
 
-        tk.Label(self.drop_frame,
-                 text="JPEG · PNG · WEBP · GIF · TIFF · BMP",
-                 font=(FONT, 9), bg=CARD, fg=TEXT_M).pack()
+        format_lbl = tk.Label(self.drop_frame,
+                              text="✦ JPEG · PNG · WEBP · MP4 · MOV · GIF · TIFF ✦",
+                              font=(FONT, 8), bg=CARD, fg=TEXT_M, cursor="hand2")
+        format_lbl.pack()
+        format_lbl.bind("<Button-1>", lambda _: self._add_files())
+
+        # Portal/gravity well glow effects on hover
+        def on_drop_enter(e):
+            self.drop_frame.config(bg=CARD2, highlightbackground=ACCENT_H)
+            for widget in self.drop_frame.winfo_children():
+                try:
+                    widget.config(bg=CARD2)
+                except Exception:
+                    pass
+                if widget == arrow_lbl:
+                    widget.config(fg=ACCENT_H)
+
+        def on_drop_leave(e):
+            x, y = self.drop_frame.winfo_pointerxy()
+            gx = self.drop_frame.winfo_rootx()
+            gy = self.drop_frame.winfo_rooty()
+            gw = self.drop_frame.winfo_width()
+            gh = self.drop_frame.winfo_height()
+            if gx <= x <= gx + gw and gy <= y <= gy + gh:
+                return  # Still inside
+            self.drop_frame.config(bg=CARD, highlightbackground=CARD2)
+            for widget in self.drop_frame.winfo_children():
+                try:
+                    widget.config(bg=CARD)
+                except Exception:
+                    pass
+                if widget == arrow_lbl:
+                    widget.config(fg=ACCENT)
+
+        for w in (self.drop_frame, arrow_lbl, self.drop_hint, format_lbl):
+            w.bind("<Enter>", on_drop_enter, add="+")
+            w.bind("<Leave>", on_drop_leave, add="+")
 
         if self._dnd_available:
             from tkinterdnd2 import DND_FILES
@@ -979,7 +1573,7 @@ class SiftoolApp:
 
         # Button row
         btn_row = tk.Frame(self.root, bg=BG)
-        btn_row.pack(pady=(0, 4))
+        btn_row.pack(pady=(0, 2))
 
         self._btn(btn_row, "＋  Add Files",   self._add_files,  ACCENT).pack(side="left", padx=5)
         self._btn(btn_row, "📁  Add Folder",  self._add_folder, CARD2).pack(side="left", padx=5)
@@ -1000,11 +1594,11 @@ class SiftoolApp:
         main_split = tk.Frame(panel, bg=BG)
         main_split.pack(fill="both", expand=True)
 
-        left_pane = tk.Frame(main_split, bg=BG)
-        left_pane.pack(side="left", fill="both", expand=True)
+        self.left_pane = tk.Frame(main_split, bg=BG)
+        # Packed via _apply_layout
 
         cols = ("name", "status", "details")
-        self.tree = ttk.Treeview(left_pane, columns=cols, show="headings",
+        self.tree = ttk.Treeview(self.left_pane, columns=cols, show="headings",
                                   selectmode="browse", height=13)
         self.tree.heading("name",    text="File")
         self.tree.heading("status",  text="Status")
@@ -1013,20 +1607,84 @@ class SiftoolApp:
         self.tree.column("status",  width=120, anchor="center", stretch=False)
         self.tree.column("details", width=200, anchor="w",      stretch=True)
 
-        sb = ttk.Scrollbar(left_pane, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(self.left_pane, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
         # Right pane: Details Panel (width=300)
         self.right_pane = tk.Frame(main_split, bg=CARD, width=300, bd=1, relief="flat")
-        self.right_pane.pack(side="right", fill="both", padx=(14, 0))
-        self.right_pane.pack_propagate(False) # Keep fixed width
+        
+        # Apply layout dynamically (split or stacked) based on window geometry
+        self._current_layout_mode = None
+        self._apply_layout("split")
 
         self._build_details_placeholder()
 
-        self._style_tree()
+        # Configure Treeview tags locally
+        self.tree.tag_configure("waiting",    foreground=TEXT_M)
+        self.tree.tag_configure("processing", foreground=WARNING)
+        self.tree.tag_configure("done",       foreground=SEAL)
+        self.tree.tag_configure("residual",   foreground=WARNING)
+        self.tree.tag_configure("error",      foreground=DANGER)
+
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+    def _on_window_resize(self, event) -> None:
+        if event.widget == self.root:
+            w = event.width
+            # Check threshold: width >= 720 is split (desktop), else stacked (9:16 mobile)
+            mode = "split" if w >= 720 else "stacked"
+            self._apply_layout(mode)
+
+    def _apply_layout(self, mode: str) -> None:
+        if getattr(self, "_current_layout_mode", None) == mode:
+            return  # Already in this layout
+        
+        self._current_layout_mode = mode
+        
+        # Safely unpack to re-layout
+        try:
+            self.left_pane.pack_forget()
+            self.right_pane.pack_forget()
+        except Exception:
+            pass
+
+        if mode == "split":
+            # Desktop mode: side-by-side
+            try:
+                self.tree.config(height=10)
+            except Exception:
+                pass
+            self.left_pane.pack(side="left", fill="both", expand=True)
+            self.right_pane.config(width=320) # Wider sidebar
+            self.right_pane.pack_propagate(False)
+            self.right_pane.pack(side="right", fill="both", padx=(14, 0))
+            
+            # Adjust column widths for desktop view
+            try:
+                self.tree.column("name",    width=240, stretch=True)
+                self.tree.column("status",  width=120, stretch=False)
+                self.tree.column("details", width=160, stretch=True)
+            except Exception:
+                pass
+        else:
+            # Mobile Portrait (9:16) stacked mode: vertical
+            try:
+                self.tree.config(height=5) # Smaller file queue to prioritize inspector height
+            except Exception:
+                pass
+            self.left_pane.pack(side="top", fill="both", expand=False)
+            self.right_pane.pack_propagate(True)
+            self.right_pane.pack(side="bottom", fill="both", expand=True, pady=(14, 0))
+            
+            # Adjust column widths for narrow mobile view
+            try:
+                self.tree.column("name",    width=140, stretch=True)
+                self.tree.column("status",  width=95,  stretch=False)
+                self.tree.column("details", width=105, stretch=True)
+            except Exception:
+                pass
 
     def _build_details_placeholder(self) -> None:
         for widget in self.right_pane.winfo_children():
@@ -1035,10 +1693,10 @@ class SiftoolApp:
         container = tk.Frame(self.right_pane, bg=CARD)
         container.pack(fill="both", expand=True, pady=60)
         
-        tk.Label(container, text="◈", font=(FONT, 32), bg=CARD, fg=TEXT_M).pack()
-        tk.Label(container, text="Metadata Inspector", font=(FONT, 12, "bold"), bg=CARD, fg=TEXT).pack(pady=10)
+        tk.Label(container, text="✦", font=(FONT, 32), bg=CARD, fg=TEXT_M).pack()
+        tk.Label(container, text="Metadata Inspector", font=(FONT, 14, "bold"), bg=CARD, fg=TEXT).pack(pady=10)
         tk.Label(container, text="Select any file in the queue\nto inspect its EXIF tags & C2PA state.", 
-                 font=(FONT, 9), bg=CARD, fg=TEXT_M, justify="center").pack()
+                 font=(FONT, 10), bg=CARD, fg=TEXT_M, justify="center").pack()
 
     def _on_tree_select(self, event) -> None:
         selected = self.tree.selection()
@@ -1052,109 +1710,184 @@ class SiftoolApp:
             self._build_details_placeholder()
             return
             
+        self.right_pane_active_path = path
+
         for widget in self.right_pane.winfo_children():
             widget.destroy()
             
+        # Create scrollable frame for the entire details pane
+        scroll_frame = ScrollableFrame(self.right_pane, bg=CARD)
+        scroll_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        content_pane = scroll_frame.scrollable_frame
+
+        # Determine wrapping widths based on current layout mode
+        is_split = getattr(self, "_current_layout_mode", "split") == "split"
+        name_wrap = 280 if is_split else 600
+        banner_wrap = 260 if is_split else 580
+
         # Title
-        hdr = tk.Frame(self.right_pane, bg=CARD, padx=12, pady=10)
-        hdr.pack(fill="x")
+        hdr = tk.Frame(content_pane, bg=CARD, pady=10)
+        hdr.pack(fill="x", padx=12)
         
-        tk.Label(hdr, text=row.name, font=(FONT, 11, "bold"), bg=CARD, fg=TEXT, anchor="w").pack(fill="x")
+        lbl_name = tk.Label(hdr, text=row.name, font=(FONT, 12, "bold"), bg=CARD, fg=TEXT, anchor="w", justify="left", wraplength=name_wrap)
+        lbl_name.pack(fill="x")
         
-        ext_desc = Path(path).suffix.upper()[1:] + " Image"
-        tk.Label(hdr, text=ext_desc, font=(FONT, 9), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x")
+        ext = Path(path).suffix.lower()
+        if ext in (".mp4", ".mov", ".mkv", ".avi", ".m4v"):
+            ext_desc = ext[1:].upper() + " Video"
+        else:
+            ext_desc = ext[1:].upper() + " Image"
+        tk.Label(hdr, text=ext_desc, font=(FONT, 10), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x")
 
         # C2PA Check
         c2pa_present, c2pa_desc = detect_c2pa(path)
         
         if c2pa_present:
             # High-impact warning banner
-            c2pa_banner = tk.Frame(self.right_pane, bg="#451a03", bd=1, relief="solid", highlightbackground=WARNING, padx=10, pady=8)
+            c2pa_banner = tk.Frame(content_pane, bg="#1a0b16", bd=1, relief="solid", highlightbackground=DANGER, highlightthickness=1, padx=10, pady=8)
             c2pa_banner.pack(fill="x", padx=12, pady=6)
-            tk.Label(c2pa_banner, text="⚠  Content Credentials (C2PA)", font=(FONT, 9, "bold"), bg="#451a03", fg=WARNING, anchor="w").pack(fill="x")
-            tk.Label(c2pa_banner, text="This image contains cryptographically signed metadata. It may leak: author identity, AI tool origin, exact timestamps, and edit history.\n\nSiftool will remove this on Sift.", 
-                     font=(FONT, 8), bg="#451a03", fg=TEXT, justify="left", wraplength=250, anchor="w").pack(fill="x", pady=(4, 0))
+            tk.Label(c2pa_banner, text="⚠  Content Credentials (C2PA)", font=(FONT, 10, "bold"), bg="#1a0b16", fg=DANGER, anchor="w").pack(fill="x")
+            
+            lbl_warning = tk.Label(c2pa_banner, text="This image contains cryptographically signed metadata. It may leak: author identity, AI tool origin, exact timestamps, and edit history.\n\nSiftool will remove this on Sift.", 
+                     font=(FONT, 10), bg="#1a0b16", fg=TEXT, justify="left", anchor="w", wraplength=banner_wrap)
+            lbl_warning.pack(fill="x", pady=(4, 0))
+            
         elif row.status == FileRow.DONE and row.verified:
             # Verified Clean seal banner
-            seal_banner = tk.Frame(self.right_pane, bg="#064e3b", bd=1, relief="solid", highlightbackground=SEAL, padx=10, pady=8)
+            seal_banner = tk.Frame(content_pane, bg="#0b171a", bd=1, relief="solid", highlightbackground=SEAL, highlightthickness=1, padx=10, pady=8)
             seal_banner.pack(fill="x", padx=12, pady=6)
-            tk.Label(seal_banner, text="✓  Verified Clean Seal", font=(FONT, 9, "bold"), bg="#064e3b", fg=SEAL, anchor="w").pack(fill="x")
-            tk.Label(seal_banner, text="All privacy-sensitive metadata, including EXIF, ICC, GPS, and C2PA, have been successfully stripped.", 
-                     font=(FONT, 8), bg="#064e3b", fg=TEXT, justify="left", wraplength=250, anchor="w").pack(fill="x", pady=(4, 0))
+            tk.Label(seal_banner, text="✓  Verified Clean Seal", font=(FONT, 10, "bold"), bg="#0b171a", fg=SEAL, anchor="w").pack(fill="x")
+            
+            lbl_seal = tk.Label(seal_banner, text="All privacy-sensitive metadata, including EXIF, ICC, GPS, and C2PA, have been successfully stripped.", 
+                     font=(FONT, 10), bg="#0b171a", fg=TEXT, justify="left", anchor="w", wraplength=banner_wrap)
+            lbl_seal.pack(fill="x", pady=(4, 0))
         
         # Details section (removed items or residuals)
         if row.status == FileRow.DONE:
-            info_frame = tk.Frame(self.right_pane, bg=CARD, padx=12, pady=6)
-            info_frame.pack(fill="x")
+            info_frame = tk.Frame(content_pane, bg=CARD, pady=6)
+            info_frame.pack(fill="x", padx=12)
             if row.removed:
-                removed_lbl = tk.Label(info_frame, text=f"Removed: {len(row.removed)} type(s)", font=(FONT, 9, "bold"), bg=CARD, fg=SUCCESS, anchor="w")
+                removed_lbl = tk.Label(info_frame, text=f"Removed: {len(row.removed)} type(s)", font=(FONT, 10, "bold"), bg=CARD, fg=SUCCESS, anchor="w")
                 removed_lbl.pack(fill="x")
                 
                 # bullet list of removed
                 rem_text = "\n".join(f"• {item}" for item in row.removed[:4])
                 if len(row.removed) > 4:
                     rem_text += f"\n• and {len(row.removed) - 4} more..."
-                tk.Label(info_frame, text=rem_text, font=(FONT, 8), bg=CARD, fg=TEXT_M, justify="left", anchor="w").pack(fill="x", pady=(2, 6))
+                tk.Label(info_frame, text=rem_text, font=(FONT, 10), bg=CARD, fg=TEXT_M, justify="left", anchor="w").pack(fill="x", pady=(2, 6))
+
+        # Open folder button for processed files
+        if row.status == FileRow.DONE and row.dst_path:
+            folder_frame = tk.Frame(content_pane, bg=CARD, pady=4)
+            folder_frame.pack(fill="x", padx=12, pady=4)
+            btn_folder = self._btn(
+                folder_frame,
+                "📁 Abrir Pasta de Destino",
+                lambda: self._open_file_folder(row.dst_path),
+                ACCENT
+            )
+            btn_folder.pack(fill="x", pady=2)
 
         # Metadata title
-        tk.Label(self.right_pane, text="Original Metadata Elements", font=(FONT, 9, "bold"), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(content_pane, text="Original Metadata Elements", font=(FONT, 10, "bold"), bg=CARD, fg=TEXT_M, anchor="w").pack(fill="x", padx=12, pady=(10, 4))
 
-        # Styled treeview frame
-        tree_frame = tk.Frame(self.right_pane, bg=CARD)
-        tree_frame.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        # Metadata container frame for async population
+        self.meta_container = tk.Frame(content_pane, bg=CARD)
+        self.meta_container.pack(fill="both", expand=True)
 
-        cols = ("key", "val")
-        meta_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse", height=5)
-        meta_tree.heading("key", text="Element")
-        meta_tree.heading("val", text="Value")
-        meta_tree.column("key", width=100, anchor="w")
-        meta_tree.column("val", width=150, anchor="w")
+        # Loading label
+        loading_lbl = tk.Label(self.meta_container, text="⏳ Carregando metadados...", font=(FONT, 10, "italic"), bg=CARD, fg=TEXT_M, pady=20)
+        loading_lbl.pack(fill="x", padx=12)
 
-        msb = ttk.Scrollbar(tree_frame, orient="vertical", command=meta_tree.yview)
-        meta_tree.configure(yscrollcommand=msb.set)
+        # Start async loading thread
+        threading.Thread(target=self._async_scan_metadata, args=(path,), daemon=True).start()
+
+    def _async_scan_metadata(self, path: str) -> None:
+        try:
+            meta = scan_metadata(path)
+        except Exception as e:
+            print(f"[siftool] Async scan metadata error: {e}")
+            meta = None
         
-        # Pack scrollbar first
-        msb.pack(side="right", fill="y")
-        meta_tree.pack(side="left", fill="both", expand=True)
+        self._q.put(("metadata_loaded", path, meta))
 
-        # Load metadata
-        meta = scan_metadata(path)
-        for k, v in meta.items():
-            meta_tree.insert("", "end", values=(k, v))
+    def _async_scan_metadata_callback(self, path: str, meta: dict | None) -> None:
+        # Prevent race conditions by checking active path
+        if not hasattr(self, "right_pane_active_path") or path != self.right_pane_active_path:
+            return
+            
+        # Ensure the container still exists
+        if not hasattr(self, "meta_container") or not self.meta_container.winfo_exists():
+            return
+            
+        # Clear loading label
+        for widget in self.meta_container.winfo_children():
+            widget.destroy()
+            
+        # Re-determine wrapping widths based on current layout mode
+        is_split = getattr(self, "_current_layout_mode", "split") == "split"
+        val_wrap = 200 if is_split else 480
 
-        # Bind context menu and double-click
-        self.meta_context_menu = tk.Menu(self.root, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=ACCENT, activeforeground=TEXT, bd=0)
-        self.meta_context_menu.add_command(label="Edit Element", command=lambda: self._edit_selected_meta(path, meta_tree))
-        self.meta_context_menu.add_command(label="Delete Element", command=lambda: self._delete_selected_meta(path, meta_tree))
-        
-        def show_menu(event):
-            row_id = meta_tree.identify_row(event.y)
-            if row_id:
-                meta_tree.selection_set(row_id)
-                self.meta_context_menu.post(event.x_root, event.y_root)
+        if not meta:
+            empty_lbl = tk.Label(self.meta_container, text="No metadata tags found.", font=(FONT, 10, "italic"), bg=CARD, fg=TEXT_M, pady=20)
+            empty_lbl.pack(fill="x", padx=12)
+        else:
+            for tag_name, val_str in meta.items():
+                item_frame = tk.Frame(self.meta_container, bg=CARD, pady=8)
+                item_frame.pack(fill="x", side="top", padx=12)
                 
-        meta_tree.bind("<Button-3>", show_menu)
-        meta_tree.bind("<Double-1>", lambda event: self._edit_selected_meta(path, meta_tree))
+                # Bottom border separator
+                sep = tk.Frame(self.meta_container, bg=CARD2, height=1)
+                sep.pack(fill="x", side="top", pady=2, padx=12)
+                
+                lbl_key = tk.Label(item_frame, text=tag_name, font=(FONT, 9, "bold"), bg=CARD, fg=TEXT_M, anchor="w")
+                lbl_key.pack(fill="x", side="top")
+                
+                val_row = tk.Frame(item_frame, bg=CARD)
+                val_row.pack(fill="x", side="top", pady=(3, 0))
+                
+                # Actions packed first to align right
+                actions = tk.Frame(val_row, bg=CARD)
+                actions.pack(side="right")
+                
+                edit_btn = self._icon_btn(actions, "✎", lambda t=tag_name, v=val_str: self._edit_meta(path, t, v), CARD2, SUCCESS)
+                edit_btn.pack(side="left", padx=2)
+                
+                del_btn = self._icon_btn(actions, "🗑", lambda t=tag_name: self._delete_meta(path, t), CARD2, DANGER)
+                del_btn.pack(side="left", padx=2)
+                
+                # Value label packed second to expand left
+                lbl_val = tk.Label(val_row, text=val_str, font=(FONT, 11), bg=CARD, fg=TEXT, anchor="w", justify="left", wraplength=val_wrap)
+                lbl_val.pack(side="left", fill="x", expand=True)
+                
+                # Double click shortcuts to edit
+                lbl_key.bind("<Double-1>", lambda _, t=tag_name, v=val_str: self._edit_meta(path, t, v))
+                lbl_val.bind("<Double-1>", lambda _, t=tag_name, v=val_str: self._edit_meta(path, t, v))
+                item_frame.bind("<Double-1>", lambda _, t=tag_name, v=val_str: self._edit_meta(path, t, v))
 
-        # Button frame for actions
-        btn_frame = tk.Frame(self.right_pane, bg=CARD)
-        btn_frame.pack(fill="x", padx=12, pady=(4, 10))
-        
-        edit_btn = self._btn(btn_frame, "  Edit  ", lambda: self._edit_selected_meta(path, meta_tree), ACCENT, width=12)
-        edit_btn.pack(side="left", padx=(0, 6))
-        
-        del_btn = self._btn(btn_frame, "  Delete  ", lambda: self._delete_selected_meta(path, meta_tree), CARD2, width=12)
-        del_btn.pack(side="left")
-
-    def _edit_selected_meta(self, image_path: str, meta_tree: ttk.Treeview) -> None:
-        sel = meta_tree.selection()
-        if not sel:
-            messagebox.showinfo("Edit", "Please select a metadata element to edit.")
+    def _open_file_folder(self, file_path: str) -> None:
+        if not file_path or not os.path.exists(file_path):
             return
         
-        item = meta_tree.item(sel[0])
-        tag_name, current_val = item["values"]
+        file_path = os.path.abspath(file_path)
+        import subprocess
+        import sys
         
+        try:
+            if sys.platform == "win32":
+                # explorer /select accepts Windows paths with backslashes
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(file_path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", file_path])
+            else:
+                # Linux/Unix: Open containing folder using xdg-open
+                parent_dir = os.path.dirname(file_path)
+                subprocess.Popen(["xdg-open", parent_dir])
+        except Exception as e:
+            print(f"[siftool] Failed to open folder for {file_path}: {e}")
+
+
+    def _edit_meta(self, image_path: str, tag_name: str, current_val: str) -> None:
         # Open edit dialog window
         dialog = tk.Toplevel(self.root)
         dialog.title(f"Edit {tag_name}")
@@ -1203,15 +1936,7 @@ class SiftoolApp:
         
         entry.bind("<Return>", lambda _: save_changes())
 
-    def _delete_selected_meta(self, image_path: str, meta_tree: ttk.Treeview) -> None:
-        sel = meta_tree.selection()
-        if not sel:
-            messagebox.showinfo("Delete", "Please select a metadata element to delete.")
-            return
-        
-        item = meta_tree.item(sel[0])
-        tag_name, current_val = item["values"]
-        
+    def _delete_meta(self, image_path: str, tag_name: str) -> None:
         if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete the tag '{tag_name}' losslessly from this image?"):
             return
             
@@ -1244,9 +1969,18 @@ class SiftoolApp:
         inner = tk.Frame(foot, bg=SURFACE)
         inner.pack()
 
+        # Preset selector dropdown
+        self.preset_var = tk.StringVar(value="Paranoico (Max)")
+        self.preset_cb = ttk.Combobox(
+            inner, textvariable=self.preset_var,
+            values=["Paranoico (Max)", "Fotógrafo", "Redes Sociais"],
+            state="readonly", width=16, font=(FONT, 9, "bold")
+        )
+        self.preset_cb.pack(side="left", padx=(0, 14))
+
         self.progress_var = tk.DoubleVar(value=0)
         self.progress = ttk.Progressbar(inner, variable=self.progress_var,
-                                         maximum=100, length=360,
+                                         maximum=100, length=320,
                                          mode="determinate")
         self.progress.pack(side="left", padx=(0, 14))
 
@@ -1269,19 +2003,60 @@ class SiftoolApp:
         )
         if width:
             kw["width"] = width
-        return tk.Button(parent, **kw)
+        btn = tk.Button(parent, **kw)
 
-    def _style_tree(self) -> None:
+        # Cosmic hover micro-interactions
+        def on_enter(e):
+            if btn["state"] == "normal":
+                if color == ACCENT:
+                    btn.config(bg=ACCENT_H)
+                elif color == CARD2:
+                    btn.config(bg="#25254c")
+                else:
+                    btn.config(bg=CARD2)
+
+        def on_leave(e):
+            if btn["state"] == "normal":
+                btn.config(bg=color)
+
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        return btn
+
+    def _icon_btn(self, parent, text, cmd, bg_color, fg_color) -> tk.Button:
+        btn = tk.Button(
+            parent, text=text, command=cmd,
+            bg=bg_color, fg=fg_color,
+            font=(FONT, 10, "bold"),
+            relief="flat", bd=0,
+            padx=8, pady=4,
+            cursor="hand2",
+            activebackground=ACCENT_H,
+            activeforeground=TEXT,
+        )
+        # Compact hover micro-interactions
+        def on_enter(e):
+            if btn["state"] == "normal":
+                btn.config(bg="#25254c" if bg_color == CARD2 else ACCENT_H)
+        def on_leave(e):
+            if btn["state"] == "normal":
+                btn.config(bg=bg_color)
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        return btn
+
+    def _setup_styles(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Treeview",
                          background=CARD, foreground=TEXT,
                          rowheight=30, fieldbackground=CARD,
-                         borderwidth=0, font=(FONT, 9))
+                         borderwidth=0, font=(FONT, 10))
         style.configure("Treeview.Heading",
                          background=SURFACE, foreground=TEXT_M,
-                         relief="flat", font=(FONT, 9, "bold"))
-        style.map("Treeview", background=[("selected", ACCENT)])
+                         relief="flat", font=(FONT, 10, "bold"))
+        style.map("Treeview", background=[("selected", "#25183a")], foreground=[("selected", "#ffffff")])
+        style.map("Treeview.Heading", background=[("active", CARD2)])
 
         # Premium Dark Scrollbar styling
         style.configure("TScrollbar",
@@ -1295,19 +2070,45 @@ class SiftoolApp:
         style.map("TScrollbar",
                   background=[("active", ACCENT)])
 
-        self.tree.tag_configure("waiting",    foreground=TEXT_M)
-        self.tree.tag_configure("processing", foreground=WARNING)
-        self.tree.tag_configure("done",       foreground=SEAL)
-        self.tree.tag_configure("residual",   foreground=WARNING)
-        self.tree.tag_configure("error",      foreground=DANGER)
+        # Cosmic Progressbar styling
+        style.configure("Horizontal.TProgressbar",
+                        troughcolor=BG,
+                        bordercolor=CARD2,
+                        background=ACCENT,
+                        lightcolor=ACCENT,
+                        darkcolor=ACCENT)
+
+        # Custom Dark Combobox styling
+        style.configure("TCombobox",
+                        fieldbackground=CARD,
+                        background=CARD2,
+                        foreground=TEXT,
+                        bordercolor=CARD2,
+                        arrowcolor=TEXT_M,
+                        darkcolor=CARD,
+                        lightcolor=CARD)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", CARD), ("disabled", CARD2)],
+                  foreground=[("readonly", TEXT), ("disabled", TEXT_M)])
+
+        # Option database styling for Combobox dropdown listbox
+        self.root.option_add("*TCombobox*Listbox.background", CARD)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+        self.root.option_add("*TCombobox*Listbox.relief", "flat")
+        self.root.option_add("*TCombobox*Listbox.bd", "0")
 
     # ── File management ───────────────────────────────────────────────────────
 
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Select images",
+            title="Select media files (Images & Videos)",
             filetypes=[
+                ("All Supported Files", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif *.webp *.mp4 *.mov *.mkv *.avi *.m4v"),
                 ("Images", "*.jpg *.jpeg *.png *.bmp *.gif *.tiff *.tif *.webp"),
+                ("Videos", "*.mp4 *.mov *.mkv *.avi *.m4v"),
                 ("All files", "*.*"),
             ],
         )
@@ -1407,19 +2208,32 @@ class SiftoolApp:
         except Exception:
             return
             
+        MAX_PAYLOAD_SIZE = 65536  # 64KB limit
         while True:
             try:
                 conn, addr = s.accept()
+                # Security: Verify connection comes from localhost client
+                if addr[0] != "127.0.0.1":
+                    conn.close()
+                    continue
+
                 data = bytearray()
                 while True:
                     chunk = conn.recv(4096)
                     if not chunk:
                         break
                     data.extend(chunk)
+                    # Protect against buffer overflow / memory exhaustion DoS
+                    if len(data) > MAX_PAYLOAD_SIZE:
+                        break
                 conn.close()
                 
-                paths = data.decode("utf-8").split("\n")
-                self.root.after(0, lambda p=paths: self._enqueue_from_socket(p))
+                if len(data) <= MAX_PAYLOAD_SIZE:
+                    paths = data.decode("utf-8", errors="ignore").split("\n")
+                    # Basic path validation to prevent path traversal/non-existent files
+                    sanitized_paths = [p.strip() for p in paths if p.strip() and os.path.exists(p.strip())]
+                    if sanitized_paths:
+                        self.root.after(0, lambda p=sanitized_paths: self._enqueue_from_socket(p))
             except Exception:
                 pass
 
@@ -1449,6 +2263,14 @@ class SiftoolApp:
 
     # ── Batch processing ──────────────────────────────────────────────────────
 
+    def _get_active_preset(self) -> str:
+        val = self.preset_var.get()
+        if val == "Fotógrafo":
+            return "photographer"
+        elif val == "Redes Sociais":
+            return "social"
+        return "paranoia"
+
     def _start_batch(self) -> None:
         pending = [f for f in self.files if f.status == FileRow.WAITING]
         if not pending:
@@ -1457,13 +2279,16 @@ class SiftoolApp:
 
         self._running = True
         self.sift_btn.config(state="disabled")
-        self.status_var.set(f"Processing {len(pending)} file(s)…")
+        self.preset_cb.config(state="disabled")
+        
+        active_preset = self._get_active_preset()
+        self.status_var.set(f"Processing {len(pending)} file(s) [{self.preset_var.get()}]…")
         self.progress_var.set(0)
 
-        t = threading.Thread(target=self._worker_fn, args=(pending,), daemon=True)
+        t = threading.Thread(target=self._worker_fn, args=(pending, active_preset), daemon=True)
         t.start()
 
-    def _worker_fn(self, rows: list[FileRow]) -> None:
+    def _worker_fn(self, rows: list[FileRow], preset: str) -> None:
         """Background thread — communicates results via self._q."""
         total = len(rows)
         for idx, row in enumerate(rows):
@@ -1472,7 +2297,7 @@ class SiftoolApp:
             p = Path(row.path)
             dst = str(p.parent / (p.stem + "_clean" + p.suffix))
 
-            ok, items = clean_lossless(row.path, dst)
+            ok, items = clean_lossless(row.path, dst, preset)
             if ok:
                 is_clean, residuals = verify_clean(dst)
                 self._q.put(("done", row.path, dst, items, is_clean, residuals))
@@ -1488,7 +2313,11 @@ class SiftoolApp:
                 msg = self._q.get_nowait()
                 kind = msg[0]
 
-                if kind == "progress":
+                if kind == "metadata_loaded":
+                    _, path, meta = msg
+                    self._async_scan_metadata_callback(path, meta)
+
+                elif kind == "progress":
                     _, path, idx, total = msg
                     row = self._find(path)
                     if row:
@@ -1540,6 +2369,7 @@ class SiftoolApp:
                     self.progress_var.set(100)
                     self._running = False
                     self.sift_btn.config(state="normal")
+                    self.preset_cb.config(state="readonly")
                     self.status_var.set(
                         f"Done — {done} cleaned · {verified} Verified Clean "
                         f"· {errors} error(s) · saved as *_clean.ext"
@@ -1586,6 +2416,7 @@ Examples:
     clean_p = subparsers.add_parser("clean", help="Clean metadata from files losslessly")
     clean_p.add_argument("files", nargs="*", help="File paths to clean")
     clean_p.add_argument("--folder", help="Folder path to clean all supported images in")
+    clean_p.add_argument("--preset", choices=["paranoia", "photographer", "social"], default="paranoia", help="Cleaning preset: paranoia (default), photographer, social")
     clean_p.add_argument("--json", action="store_true", help="Output results in JSON format")
 
     # verify
@@ -1673,7 +2504,7 @@ Examples:
 
         for p in paths_to_clean:
             dst = p.parent / (p.stem + "_clean" + p.suffix)
-            ok, items = clean_lossless(str(p), str(dst))
+            ok, items = clean_lossless(str(p), str(dst), args.preset)
             if ok:
                 is_clean, residuals = verify_clean(str(dst))
                 status_str = "Verified Clean" if is_clean else "Residuals"
