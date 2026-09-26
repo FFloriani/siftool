@@ -4,3 +4,8 @@ env/
 *.pyc
 build/
 dist/
+*.egg-info/
+.pytest_cache/
+*.siftool-tmp-*
+tests/samples-local/*
+!tests/samples-local/.gitkeep
