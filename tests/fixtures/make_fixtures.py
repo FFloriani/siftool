@@ -209,3 +209,127 @@ def write(tmp_path, name: str, data: bytes) -> Path:
     path = Path(tmp_path) / name
     path.write_bytes(data)
     return path
+
+
+# ---------------------------------------------------------------------------
+# XMP / C2PA / ICC / IPTC builders (Task 5)
+# ---------------------------------------------------------------------------
+
+
+def cbor_text(s: str) -> bytes:
+    """Encode `s` as a CBOR major-type-3 (text string) item, `len(s) < 24`."""
+    return bytes([0x60 + len(s)]) + s.encode()
+
+
+def make_xmp(*, ai: bool = True, gps: bool = True, creator: str = "Felipe") -> bytes:
+    """Build a deterministic, syntactically-valid XMP packet for tests.
+
+    Always carries `xmp:CreatorTool="TestSoftware"` (software) and a
+    `dc:creator` (identity) as a nested `rdf:Seq`/`rdf:li`, so the reader's
+    element-form value extraction gets exercised too, not just attributes.
+    `gps=True` adds `exif:GPSLatitude="37,46.494N"` (location). `ai=True`
+    adds `Iptc4xmpExt:DigitalSourceType` set to the IPTC "trained
+    algorithmic media" URI (ai_provenance).
+    """
+    attrs = ['xmp:CreatorTool="TestSoftware"']
+    if ai:
+        attrs.append(
+            'Iptc4xmpExt:DigitalSourceType='
+            '"http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"'
+        )
+    if gps:
+        attrs.append('exif:GPSLatitude="37,46.494N"')
+
+    description = (
+        '<rdf:Description rdf:about="" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+        'xmlns:exif="http://ns.adobe.com/exif/1.0/" '
+        'xmlns:Iptc4xmpExt="http://iptc.org/std/Iptc4xmpExt/2008-02-29/" '
+        + " ".join(attrs) + ">"
+        f"<dc:creator><rdf:Seq><rdf:li>{creator}</rdf:li></rdf:Seq></dc:creator>"
+        "</rdf:Description>"
+    )
+    packet = (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        + description +
+        '</rdf:RDF></x:xmpmeta>'
+        '<?xpacket end="w"?>'
+    )
+    return packet.encode("utf-8")
+
+
+def make_c2pa_payload(generator: str = "ChatGPT", ai: bool = True) -> bytes:
+    """Build a synthetic JUMBF/C2PA payload with a `claim_generator_info` CBOR map.
+
+    Layout: a 4-byte JUMBF box-size placeholder + `jumbc2pa` + the CBOR
+    text key `claim_generator_info` + `\\x81\\xa2` (array/map headers, not
+    semantically valid CBOR -- only `c2pa_findings`'s byte-search cares) +
+    the CBOR text pairs `name`/`generator` and `version`/`"gpt-image"`.
+    `ai=True` appends the literal marker `trainedAlgorithmicMedia`.
+    """
+    payload = (
+        b"\x00\x00\x00\x40jumbc2pa"
+        + cbor_text("claim_generator_info")
+        + b"\x81\xa2"
+        + cbor_text("name")
+        + cbor_text(generator)
+        + cbor_text("version")
+        + cbor_text("gpt-image")
+    )
+    if ai:
+        payload += b"trainedAlgorithmicMedia"
+    return payload
+
+
+def make_icc(description: str, version: int = 2) -> bytes:
+    """Build a minimal ICC profile with a single `desc` tag.
+
+    128-byte header (`acsp` at offset 36, `version` as a single byte at
+    offset 8) + a 1-entry tag table at offset 128 + the tag's data. The
+    tag's own value type follows the real ICC split: `version < 4` writes
+    a v2 `desc` (textDescriptionType: 4-byte ASCII length at +8, ASCII
+    text at +12); `version >= 4` writes a v4 `mluc`
+    (multiLocalizedUnicodeType: one language/country record whose 3rd and
+    4th fields are the length and offset of a UTF-16BE string).
+    """
+    header = bytearray(128)
+    header[8] = version
+    header[36:40] = b"acsp"
+
+    if version >= 4:
+        text = description.encode("utf-16-be")
+        record = b"enUS" + struct.pack(">II", len(text), 28)
+        tag_data = b"mluc" + b"\x00" * 4 + struct.pack(">II", 1, 12) + record + text
+    else:
+        text = description.encode("ascii") + b"\x00"
+        tag_data = b"desc" + b"\x00" * 4 + struct.pack(">I", len(text)) + text
+
+    tag_offset = 128 + 4 + 12  # header + tag count (4 bytes) + one 12-byte entry
+    table = struct.pack(">I", 1) + b"desc" + struct.pack(">II", tag_offset, len(tag_data))
+    return bytes(header) + table + tag_data
+
+
+def _iim_dataset(record: int, dataset: int, value: str) -> bytes:
+    data = value.encode("utf-8")
+    return bytes([0x1C, record, dataset]) + struct.pack(">H", len(data)) + data
+
+
+def _8bim_resource(resource_id: int, data: bytes) -> bytes:
+    block = b"8BIM" + struct.pack(">H", resource_id) + b"\x00\x00" + struct.pack(">I", len(data)) + data
+    if len(data) % 2:
+        block += b"\x00"
+    return block
+
+
+def make_iptc_irb(byline: str = "Felipe", city: str = "Sao Paulo", caption: str = "secret caption") -> bytes:
+    """Build a Photoshop IRB with one `8BIM` 0x0404 (IPTC-NAA) resource.
+
+    The resource's data is three IIM datasets in the Application Record
+    (record 2): 2:80 By-line, 2:90 City and 2:120 Caption/Abstract, each
+    `\\x1c` + record + dataset + a 2-byte big-endian length + UTF-8 text.
+    """
+    iim = _iim_dataset(2, 80, byline) + _iim_dataset(2, 90, city) + _iim_dataset(2, 120, caption)
+    return b"Photoshop 3.0\x00" + _8bim_resource(0x0404, iim)
