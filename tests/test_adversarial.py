@@ -300,3 +300,64 @@ def test_webp_iccp_carrying_identity_text_is_dropped(tmp_path, mode):
     assert dict(riff_chunks(out))[b"VP8X"][0] == 0  # ICC flag cleared with the chunk
     span = 8 + len(QUIET_SECRET) + len(QUIET_SECRET) % 2
     assert Finding(C.UNKNOWN, "Invalid ICC profile", None, "ICCP", span) in res.removed
+
+
+# ---------------------------------------------------------------------------
+# C3, I2 / ruling R19 (JPEG) and I1 / ruling R20 (JPEG APP2 ICC).
+# ---------------------------------------------------------------------------
+
+
+def _jpeg_after_soi(segment: bytes) -> bytes:
+    base = base_jpeg()
+    return base[:2] + segment + base[2:]
+
+
+def _jpeg_before_eoi(extra: bytes) -> bytes:
+    base = base_jpeg()
+    assert base.endswith(b"\xff\xd9")
+    return base[:-2] + extra + b"\xff\xd9"
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_jpeg_dac_carrying_text_is_dropped(tmp_path, mode):
+    res, out = _clean(tmp_path, _jpeg_after_soi(_segment(0xCC, SECRET)), ".jpg", mode)
+    assert res.verdict.status is Status.VERIFIED and SECRET not in out
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_jpeg_decodable_dac_pairs_are_dropped(tmp_path, mode):
+    pairs = b"".join(b"\x10" + bytes([c]) for c in SECRET)  # libjpeg accepts these (Tc=1, Tb=0) entries
+    res, out = _clean(tmp_path, _jpeg_after_soi(_segment(0xCC, pairs)), ".jpg", mode)
+    assert res.verdict.status is Status.VERIFIED and pairs not in out
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_jpeg_second_sof_after_the_scan_is_corrupt(tmp_path, mode):
+    nf = len(QUIET_SECRET) // 3
+    sof = bytes([8]) + struct.pack(">HH", 48, 64) + bytes([nf]) + QUIET_SECRET[: 3 * nf]  # component bytes = text
+    src = write(tmp_path, "a.jpg", _jpeg_before_eoi(_segment(0xC0, sof)))
+    with pytest.raises(siftool.CorruptFileError, match="^invalid SOF$"):
+        siftool.clean(src, tmp_path / "out.jpg", mode)
+    assert not (tmp_path / "out.jpg").exists()
+
+
+def test_jpeg_without_frame_or_scan_is_corrupt(tmp_path):
+    exif = _segment(0xE1, b"Exif\x00\x00" + tiff_header() + tiff_ifd([]))
+    src = write(tmp_path, "a.jpg", b"\xff\xd8" + exif + b"\xff\xd9")
+    with pytest.raises(siftool.CorruptFileError, match="^missing image data$"):
+        siftool.clean(src, tmp_path / "out.jpg", Mode.MAXIMUM)
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_jpeg_icc_chunk_carrying_identity_text_is_dropped(tmp_path, mode):
+    data = _jpeg_after_soi(_segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + QUIET_SECRET))
+    res, out = _clean(tmp_path, data, ".jpg", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out and out == base_jpeg()
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_jpeg_signature_split_across_three_icc_chunks_is_dropped(tmp_path, mode):
+    parts = [b"G", b"PS +23.55", b"05-046.6333 owner=Felipe"]
+    chunks = b"".join(_segment(0xE2, b"ICC_PROFILE\x00" + bytes([i + 1, 3]) + p) for i, p in enumerate(parts))
+    res, out = _clean(tmp_path, _jpeg_after_soi(chunks), ".jpg", mode)
+    assert res.verdict.status is Status.VERIFIED and b"05-046.6333" not in out and out == base_jpeg()

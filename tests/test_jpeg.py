@@ -226,3 +226,132 @@ def test_pillow_optimized_progressive_restart_and_cmyk_are_verified(tmp_path):
         src = tmp_path / f"{name}.jpg"; src.write_bytes(data)
         res = siftool.clean(src, tmp_path / f"{name}_clean.jpg")
         assert res.verdict.status is Status.VERIFIED
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave. Ruling R19 (C3, I2): one SOF, at least one SOF and
+# one SOS, DAC trusted only in an arithmetic frame and only in its standard
+# form. Ruling R20 (I1, triage T6): ICC_PROFILE chunks are reassembled across
+# the whole file by seq/count and kept only as a valid profile. Review M2:
+# every handler-built finding says where it is.
+# ---------------------------------------------------------------------------
+
+from siftool.model import Finding
+from fixtures.make_fixtures import make_icc
+
+def _before_eoi(data: bytes, extra: bytes) -> bytes:
+    assert data.endswith(b"\xff\xd9")
+    return data[:-2] + extra + b"\xff\xd9"
+
+def _segment(marker: int, payload: bytes) -> bytes:
+    return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+def _arithmetic_jpeg() -> bytes:
+    """base_jpeg() with its SOF0 relabelled SOF9 (extended sequential, arithmetic):
+    structurally an arithmetic-coded frame, which is all DAC classification reads."""
+    data = bytearray(base_jpeg())
+    start, _ = _first_segment_span(bytes(data), 0xC0)
+    data[start + 1] = 0xC9
+    return bytes(data)
+
+def test_second_sof_is_corrupt():
+    sof = _first_segment_span(base_jpeg(), 0xC0)
+    second = base_jpeg()[sof[0]:sof[1]]
+    with pytest.raises(CorruptFileError, match="^invalid SOF$"): H.parse(_before_eoi(base_jpeg(), second))
+
+@pytest.mark.parametrize("data", [
+    b"\xff\xd8" + _segment(0xE1, b"Exif\x00\x00MM\x00*\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00") + b"\xff\xd9",
+    b"\xff\xd8\xff\xd9",
+    b"\xff\xd8" + _segment(0xC0, bytes([8, 0, 1, 0, 1, 1, 1, 0x11, 0])) + b"\xff\xd9",
+], ids=["app1-only", "soi-eoi", "sof-without-sos"])
+def test_jpeg_without_image_data_is_corrupt(data):
+    with pytest.raises(CorruptFileError, match="^missing image data$"): H.parse(data)
+
+@pytest.mark.parametrize("payload", [
+    b" GPS +23.5505-046.6333 owner=Felipe",
+    b"".join(b"\x10" + bytes([c]) for c in b"owner=Felipe"),  # libjpeg-valid (Tc=1, Tb=0) pairs
+    b"\x00\x10",
+], ids=["raw-text", "valid-pairs", "one-entry"])
+def test_dac_in_huffman_frame_is_unused(payload):
+    c = H.parse(_insert_after_soi(base_jpeg(), 0xCC, payload))
+    [dac] = by_tag(c, "DAC")
+    assert (dac.kind, dac.removable, dac.label, dac.findings) == (Kind.UNKNOWN, True, "Unused DAC segment", [])
+    assert "DAC" not in tags(H.parse(clean_bytes(_insert_after_soi(base_jpeg(), 0xCC, payload), Mode.MAXIMUM)))
+
+@pytest.mark.parametrize("payload", [b"\x00\x10", b"\x00\x10\x10\x05", bytes(v for tb in range(4) for v in (tb, 0x10, 0x10 | tb, 5))],
+                         ids=["dc0", "dc0-ac0", "all-eight"])
+def test_standard_dac_in_arithmetic_frame_is_essential(payload):
+    for where in ("after-soi", "before-eoi"):
+        data = (_insert_after_soi(_arithmetic_jpeg(), 0xCC, payload) if where == "after-soi"
+                else _before_eoi(_arithmetic_jpeg(), _segment(0xCC, payload)))
+        [dac] = by_tag(H.parse(data), "DAC")
+        assert dac.kind is Kind.ESSENTIAL
+
+@pytest.mark.parametrize("payload", [
+    b"", b"\x00", b"\x20\x10", b"\x04\x10", b"\x00\x10\x00\x11",
+    bytes(v for tb in range(4) for v in (tb, 0x10, 0x10 | tb, 5)) + b"\x00\x10",
+    b" GPS +23.5505-046.6333 owner=Felipe",
+], ids=["empty", "odd", "tc-2", "tb-4", "duplicate", "nine-entries", "text"])
+def test_non_standard_dac_in_arithmetic_frame_is_demoted(payload):
+    [dac] = by_tag(H.parse(_insert_after_soi(_arithmetic_jpeg(), 0xCC, payload)), "DAC?")
+    assert dac.kind is Kind.UNKNOWN and dac.removable is False
+    assert dac.findings == [Finding(C.UNKNOWN, "Non-standard DAC segment", None, "DAC?", len(payload))]
+
+PROFILE = make_icc("Display P3", 4)
+
+def _icc_chunks(parts, seqs=None, count=None):
+    seqs = seqs or range(1, len(parts) + 1)
+    count = len(parts) if count is None else count
+    return [_segment(0xE2, b"ICC_PROFILE\x00" + bytes([s, count]) + p) for s, p in zip(seqs, parts)]
+
+def _thirds(data):
+    k = len(data) // 3
+    return [data[:k], data[k:2 * k], data[2 * k:]]
+
+def test_icc_profile_split_across_chunks_is_reassembled():
+    chunks = _icc_chunks(_thirds(PROFILE))
+    for order in ([0, 1, 2], [2, 0, 1]):  # stream order is irrelevant: seq numbers decide
+        data = base_jpeg()[:2] + b"".join(chunks[i] for i in order) + base_jpeg()[2:]
+        [icc] = by_tag(H.parse(data), "APP2:ICC")
+        assert icc.kind is Kind.METADATA and icc.logical == PROFILE
+        assert icc.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "APP2:ICC", len(PROFILE))]
+
+def test_icc_chunks_apart_in_the_file_still_form_one_profile():
+    first, second = _icc_chunks([PROFILE[:100], PROFILE[100:]])
+    data = base_jpeg()[:2] + first + _segment(0xFE, b"between") + second + base_jpeg()[2:]
+    a, b = by_tag(H.parse(data), "APP2:ICC")
+    assert (a.kind, b.kind) == (Kind.METADATA, Kind.METADATA) and a.logical == PROFILE and b.logical is None
+    assert a.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "APP2:ICC", len(PROFILE))]
+    assert b.findings == [Finding(C.APPEARANCE, "ICC profile (continued)", None, "APP2:ICC", len(PROFILE) - 100)]
+
+INVALID_ICC = {
+    "duplicate-seq": _icc_chunks(_thirds(PROFILE), seqs=[1, 2, 2]),
+    "missing-seq": _icc_chunks(_thirds(PROFILE), seqs=[1, 2, 4], count=3),
+    "count-mismatch": _icc_chunks(_thirds(PROFILE), count=4),
+    "inconsistent-count": _icc_chunks(_thirds(PROFILE))[:2] + _icc_chunks([_thirds(PROFILE)[2]], seqs=[3], count=5),
+    "two-profiles": _icc_chunks([PROFILE]) + _icc_chunks([PROFILE]),
+    "seq-zero": _icc_chunks([PROFILE], seqs=[0], count=0),
+    "no-seq-bytes": [_segment(0xE2, b"ICC_PROFILE\x00\x01")],
+    "not-a-profile": _icc_chunks([b"G", b"PS +23.55", b"05-046.6333 owner=Felipe"]),
+    "identity-text": _icc_chunks([b"owner=Felipe Floriani; phone=+55 11 91234-5678"]),
+}
+
+@pytest.mark.parametrize("case", sorted(INVALID_ICC))
+def test_invalid_icc_profile_is_dropped(case):
+    data = base_jpeg()[:2] + b"".join(INVALID_ICC[case]) + base_jpeg()[2:]
+    blocks = by_tag(H.parse(data), "APP2:ICC")
+    assert blocks and all((b.kind, b.removable, b.label, b.findings) == (Kind.UNKNOWN, True, "Invalid ICC profile", [])
+                          for b in blocks)
+    assert clean_bytes(data) == base_jpeg()
+
+def test_every_jpeg_finding_says_where_it_is():  # review M2
+    data = make_jpeg(mpf=True, jfif_thumbnail=True, reserved_marker=True, trailing=b"tail")
+    data = _insert_after_soi(data, 0xEC, b"Ducky\x00\x01")  # APP12
+    data = _insert_after_soi(data, 0xE0, b"JFXX\x00\x13" + bytes(3 * 4))  # JFXX, 2x2 RGB thumbnail
+    readers = {"APP1:Exif": "APP1/Exif/", "APP1:XMP": "APP1/XMP", "APP11:JUMBF": "APP11/JUMBF", "APP13:IRB": "APP13/IRB"}
+    seen = set()
+    for block in H.parse(data).blocks:
+        for finding in block.findings:
+            expected = readers.get(block.tag, block.tag)
+            assert finding.where.startswith(expected) if block.tag in readers else finding.where == expected, finding
+            seen.add(block.tag)
+    assert {"COM", "TRAILING", "APP2:ICC", "APP0:JFIF", "APP0:JFXX", "APP2:MPF", "APP12", "RESERVED:0xF0"} <= seen

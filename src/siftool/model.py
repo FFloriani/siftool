@@ -90,7 +90,15 @@ class Finding:
 
 @dataclass
 class Block:
-    """A structural unit of a file (segment/chunk/box/atom) and its findings."""
+    """A structural unit of a file (segment/chunk/box/atom) and its findings.
+
+    `logical` is the block's content as a reader assembles it, when that
+    differs from the raw bytes at `span` -- an ICC profile reassembled from
+    several JPEG APP2 chunks, or inflated from a PNG `iCCP` chunk (ruling
+    R20). `verify` scans it in addition to the raw span, so a signature
+    split across chunk headers or hidden in compressed data is still
+    found. None when the raw span already is the content.
+    """
 
     kind: Kind
     span: Span
@@ -101,6 +109,7 @@ class Block:
     rewritable: bool = False
     corrupt: bool = False
     raw: bytes = b""
+    logical: bytes | None = None
 
 
 TRAILING_TAG = "TRAILING"

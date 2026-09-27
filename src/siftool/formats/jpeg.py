@@ -3,20 +3,31 @@
 A JPEG is a sequence of marker segments starting with `SOI` (`0xFFD8`) and
 ending with `EOI` (`0xFFD9`); anything after `EOI` is a `TRAILING` block
 (Motion Photo video, an MPF secondary image, a Samsung SEFT trailer, ...).
-Segments that define how pixels decode (`DQT`/`DHT`/`SOF`/`SOS` plus its
-entropy-coded data/`EOI`/`DRI`/`DNL`/the FIRST standard, exactly-12-byte
-Adobe `APP14` color-transform marker) are `ESSENTIAL`: `write` always
-copies them byte-for-byte from the source, so `essential_digest` is
-unchanged by cleaning -- the "bit-for-bit" proof behind the Verified Clean
-seal. Everything else is metadata, classified into privacy categories per
-spec table 7.1 and either kept, dropped, or (EXIF, and JFIF carrying a
+Segments that define how pixels decode -- `DQT`/`DHT`, the file's one
+`SOF`, `SOS` plus its entropy-coded data, `EOI`, `DRI`/`DNL`, `DAC` in an
+arithmetic-coded frame, and the FIRST standard, exactly-12-byte Adobe
+`APP14` color-transform marker -- are `ESSENTIAL`: `write` always copies
+them byte-for-byte from the source, so `essential_digest` is unchanged by
+cleaning -- the "bit-for-bit" proof behind the Verified Clean seal.
+Everything else is metadata, classified into privacy categories per spec
+table 7.1 and either kept, dropped, or (EXIF, and JFIF carrying a
 thumbnail) rewritten by the planner.
 
 Every one of those ESSENTIAL structures is copied byte-for-byte and never
-reached by `verify`'s signature scan (spec section 8), so each is only
+gets `verify`'s full signature scan (spec section 8), so each is only
 trusted at exactly the shape a decoder actually needs, never merely "close
-enough" (ruling R15, closing gaps a first pass at Task 9b left open):
+enough" (rulings R15 and R19):
 
+- The file has exactly one `SOF` -- a second frame header is
+  `CorruptFileError("invalid SOF")`, which also rejects rare hierarchical
+  JPEGs -- and at least one `SOS`; without both there is no image at all,
+  `CorruptFileError("missing image data")` (`_frame_code`).
+- `DAC` only means something in an arithmetic-coded frame (`SOF9`-`SOF11`,
+  `SOF13`-`SOF15`), classified against the file's one `SOF` even when it
+  comes first: in a Huffman-coded frame it is a removable `UNKNOWN` block
+  ("Unused DAC segment", dropped); in an arithmetic one it must be 1-8
+  two-byte entries with `Tc` 0/1, `Tb` 0-3 and no repeated table, else it
+  is demoted to `"DAC?"` like the segments below (`_classify_dac`).
 - `DRI`/`DNL` must be exactly 2 bytes (their one field), `CorruptFileError`
   otherwise.
 - An `APP14` starting with `b"Adobe"` is ESSENTIAL only the FIRST time it
@@ -25,8 +36,8 @@ enough" (ruling R15, closing gaps a first pass at Task 9b left open):
   fix could still be bypassed -- or any size mismatch, demotes it (and
   every later Adobe-signature `APP14`) to a non-removable `UNKNOWN` block
   tagged plainly `"APP14"`; it's kept (dropping it would shift a CMYK
-  JPEG's colors) but now covered by `verify`'s signature scan rather than
-  trusted unscanned like the one real Adobe marker.
+  JPEG's colors) but now covered by `verify`'s full signature scan rather
+  than trusted like the one real Adobe marker.
 - `SOF0`-`SOF15`/`SOS`/`DQT`/`DHT`'s declared length must equal what their
   own content implies (`SOF`: `8 + 3*Nf`; `SOS`: `6 + 2*Ns`; `DQT`: the sum
   over its tables of 65 or 129 bytes each, 8-/16-bit precision; `DHT`: the
@@ -34,12 +45,20 @@ enough" (ruling R15, closing gaps a first pass at Task 9b left open):
   count/order or DRI/DNL/VP8X-family violation, this one does NOT raise --
   dropping or rejecting the segment would break decoding -- it demotes the
   segment (bytes unchanged) to a non-removable `UNKNOWN` block tagged
-  `f"{NAME}?"` (e.g. `"DQT?"`), so it's kept but signature-scanned instead
-  of trusted unscanned.
+  `f"{NAME}?"` (e.g. `"DQT?"`), so it's kept but fully signature-scanned
+  instead of trusted.
 
-Fill bytes (extra `0xFF` before a marker) are tolerated on read and, since
-they are folded into the following block's span, reproduced unchanged
-whenever that block is kept -- pixels are never re-encoded.
+`ICC_PROFILE` APP2 chunks are reassembled across the whole file by their
+seq/count bytes and kept as `appearance` only when every chunk 1..count is
+present exactly once and the joined profile is structurally valid
+(`_reassemble_icc`, ruling R20); the reassembled profile is exposed as the
+first ICC block's `logical`, which `verify` scans too. Otherwise every ICC
+chunk is a removable `UNKNOWN` block ("Invalid ICC profile"), dropped.
+
+Fill bytes (extra `0xFF` before a marker) are tolerated on read and kept
+inside a block's span -- the following segment's, or, after a scan, the
+`SOS` segment's own -- so they are reproduced unchanged whenever that block
+is kept; pixels are never re-encoded.
 """
 
 from __future__ import annotations
@@ -51,7 +70,7 @@ from ..detect import register
 from ..errors import CorruptFileError
 from ..metadata.c2pa import c2pa_findings
 from ..metadata.exif import build_minimal_exif, parse_exif, strip_exif_header
-from ..metadata.icc import icc_description
+from ..metadata.icc import icc_description, icc_profile_valid
 from ..metadata.iptc import iptc_findings
 from ..metadata.xmp import xmp_findings
 from ..model import Action, Block, Category, Container, Finding, Kind, Plan, Span, TRAILING_TAG
@@ -62,8 +81,11 @@ _SOI, _EOI = 0xD8, 0xD9
 _RST_LO, _RST_HI = 0xD0, 0xD7
 
 # SOF0..SOF15, minus the codes reused for DHT (0xC4), the reserved "JPG"
-# extension marker (0xC8) and DAC (0xCC).
+# extension marker (0xC8) and DAC (0xCC). The arithmetic-coded frames are
+# SOF9-SOF11 and SOF13-SOF15; the others are Huffman-coded (ITU-T T.81 B.1).
 _SOF_CODES = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+_ARITHMETIC_SOF_CODES = frozenset({0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
+_SOS, _DAC = 0xDA, 0xCC
 
 # Application-data marker signatures (Task 6 brief's classification table).
 _JFIF_SIG = b"JFIF\x00"
@@ -97,7 +119,8 @@ class JpegHandler:
 
     def parse(self, buf: bytes) -> Container:
         segments, eoi_end = _read_segments(buf)
-        blocks = _classify_segments(segments)
+        arithmetic = _frame_code(segments) in _ARITHMETIC_SOF_CODES
+        blocks = _classify_segments(segments, arithmetic)
         if eoi_end < len(buf):
             blocks.append(_trailing_block(buf, eoi_end, len(buf)))
         return Container(format="jpeg", blocks=blocks, source=buf, positional=False)
@@ -212,18 +235,39 @@ def _scan_to_next_marker(data: bytes, p: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
-    """Convert raw segments into `Block`s, merging multi-segment ICC profiles.
+def _frame_code(segments: list[tuple[Span, int, bytes]]) -> int:
+    """Return the marker code of the file's one `SOF` (ruling R19).
 
-    Tracks `seen_standard_adobe` across the whole file: only the FIRST
-    Adobe-signature `APP14` can become the `ESSENTIAL` `"APP14:Adobe"`
-    (ruling R15 -- a repeat, even at the same legal 12-byte size, is not
-    trusted). This one piece of cross-segment state is why the Adobe
-    `APP14` case is intercepted here rather than left inside `_classify`/
-    `_classify_app`, which are otherwise stateless per segment.
+    A second `SOF` is `CorruptFileError("invalid SOF")`: a decoder never
+    uses it (hierarchical JPEGs, the one legitimate multi-frame case, are
+    rejected with it), so it could only smuggle bytes through as
+    `ESSENTIAL`. No `SOF` or no `SOS` at all is `CorruptFileError("missing
+    image data")`: nothing in the file is an image. A demoted (`"SOF0?"`,
+    `"SOS?"`) segment still counts: its marker is what a decoder acts on.
     """
+    sof_codes = [code for _, code, _ in segments if code in _SOF_CODES]
+    if len(sof_codes) > 1:
+        raise CorruptFileError("invalid SOF")
+    if not sof_codes or not any(code == _SOS for _, code, _ in segments):
+        raise CorruptFileError("missing image data")
+    return sof_codes[0]
+
+
+def _classify_segments(segments: list[tuple[Span, int, bytes]], arithmetic: bool) -> list[Block]:
+    """Convert raw segments into `Block`s, merging runs of adjacent ICC chunks.
+
+    Keeps the three pieces of cross-segment state `_classify`/`_classify_app`
+    (otherwise stateless per segment) can't: only the FIRST Adobe-signature
+    `APP14` can become the `ESSENTIAL` `"APP14:Adobe"` (ruling R15 -- a
+    repeat, even at the same legal 12-byte size, is not trusted); `DAC` is
+    classified against the whole file's frame type (`arithmetic`, ruling
+    R19); and the ICC profile is reassembled from every `ICC_PROFILE`
+    chunk in the file before any of them is classified (ruling R20).
+    """
+    icc_profile = _reassemble_icc(segments)
     blocks: list[Block] = []
     seen_standard_adobe = False
+    seen_icc = False
     i = 0
     while i < len(segments):
         span, code, payload = segments[i]
@@ -237,12 +281,16 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
             blocks.append(Block(Kind.ESSENTIAL, span, f"Restart marker {code - _RST_LO}", "RST"))
             i += 1
         elif code == 0xE2 and payload.startswith(_ICC_SIG):
-            block, i = _classify_icc_run(segments, i)
+            block, i = _classify_icc_run(segments, i, icc_profile, first=not seen_icc)
+            seen_icc = True
             blocks.append(block)
         elif code == 0xEE and payload.startswith(_ADOBE_SIG):
             block = _classify_adobe(span, payload, seen_standard_adobe)
             seen_standard_adobe = seen_standard_adobe or block.kind is Kind.ESSENTIAL
             blocks.append(block)
+            i += 1
+        elif code == _DAC:
+            blocks.append(_classify_dac(span, payload, arithmetic))
             i += 1
         else:
             blocks.append(_classify(code, span, payload))
@@ -251,7 +299,7 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
 
 
 def _classify(code: int, span: Span, payload: bytes) -> Block:
-    """Classify one non-SOI/EOI/RST/ICC/Adobe-APP14 segment into its `Block`.
+    """Classify one non-SOI/EOI/RST/ICC/Adobe-APP14/DAC segment into its `Block`.
 
     `SOF`/`SOS`/`DQT`/`DHT` additionally check that the declared length
     (`len(payload)`, i.e. the segment's own length field minus itself)
@@ -271,8 +319,6 @@ def _classify(code: int, span: Span, payload: bytes) -> Block:
         if not _dht_payload_len_ok(payload):
             return _demoted(span, "DHT", payload)
         return Block(Kind.ESSENTIAL, span, "Huffman Table", "DHT")
-    if code == 0xCC:
-        return Block(Kind.ESSENTIAL, span, "Arithmetic Coding Conditioning", "DAC")
     if code == 0xDB:
         if not _dqt_payload_len_ok(payload):
             return _demoted(span, "DQT", payload)
@@ -293,12 +339,15 @@ def _classify(code: int, span: Span, payload: bytes) -> Block:
         return _classify_app(code, span, payload)
     if code == 0xFE:
         text = payload.decode("utf-8", errors="replace")
-        return Block(Kind.METADATA, span, "Comment", "COM", findings=[Finding(Category.TEXT, "Comment", text)])
+        return Block(
+            Kind.METADATA, span, "Comment", "COM", findings=[Finding(Category.TEXT, "Comment", text, "COM", len(payload))]
+        )
     if code == 0xC8 or 0xF0 <= code <= 0xFD:
         label = f"Reserved marker 0x{code:02X}"
+        tag = f"RESERVED:0x{code:02X}"
         return Block(
-            Kind.UNKNOWN, span, label, f"RESERVED:0x{code:02X}",
-            findings=[Finding(Category.UNKNOWN, label)], removable=False,
+            Kind.UNKNOWN, span, label, tag,
+            findings=[Finding(Category.UNKNOWN, label, None, tag, len(payload))], removable=False,
         )
     return Block(Kind.UNKNOWN, span, f"Unknown marker 0x{code:02X}", f"UNK:0x{code:02X}", removable=True)
 
@@ -352,12 +401,14 @@ def _dht_payload_len_ok(payload: bytes) -> bool:
 
 
 def _demoted(span: Span, name: str, payload: bytes) -> Block:
-    """A `SOF`/`SOS`/`DQT`/`DHT` segment whose declared length disagrees
-    with what its own content implies (ruling R15): kept, byte-for-byte,
-    since dropping or rejecting it would break decoding -- but demoted to
-    a non-removable `UNKNOWN` block tagged `f"{name}?"`, so `verify`'s
-    signature scan (spec section 8) covers it instead of trusting it
-    unscanned like a real, internally-consistent one.
+    """A segment a decoder needs but that isn't in its standard form -- a
+    `SOF`/`SOS`/`DQT`/`DHT` whose declared length disagrees with what its
+    own content implies (ruling R15), or a non-standard `DAC` in an
+    arithmetic-coded frame (ruling R19): kept, byte-for-byte, since
+    dropping or rejecting it could break decoding -- but demoted to a
+    non-removable `UNKNOWN` block tagged `f"{name}?"`, so `verify`'s full
+    signature scan (spec section 8) covers it instead of trusting it like
+    a real, internally-consistent one.
     """
     tag = f"{name}?"
     label = f"Non-standard {name} segment"
@@ -366,6 +417,31 @@ def _demoted(span: Span, name: str, payload: bytes) -> Block:
         findings=[Finding(Category.UNKNOWN, label, None, tag, len(payload))],
         removable=False,
     )
+
+
+def _classify_dac(span: Span, payload: bytes, arithmetic: bool) -> Block:
+    """`DAC`, classified against the file's one frame (ruling R19).
+
+    In a Huffman-coded frame no decoder reads a `DAC`: a removable
+    `UNKNOWN` block ("Unused DAC segment"), dropped. In an arithmetic-coded
+    frame it is `ESSENTIAL` in its standard form (`_dac_payload_ok`), and
+    otherwise kept but demoted to `"DAC?"` (`_demoted`) -- dropping a
+    conditioning table a decoder does read could break decoding.
+    """
+    if not arithmetic:
+        return Block(Kind.UNKNOWN, span, "Unused DAC segment", "DAC", removable=True)
+    if not _dac_payload_ok(payload):
+        return _demoted(span, "DAC", payload)
+    return Block(Kind.ESSENTIAL, span, "Arithmetic Coding Conditioning", "DAC")
+
+
+def _dac_payload_ok(payload: bytes) -> bool:
+    """`DAC`: 1-8 two-byte entries, each Tc/Tb(1) + Cs(1), with Tc in {0, 1},
+    Tb <= 3 and no (Tc, Tb) table conditioned twice."""
+    if len(payload) % 2 or not 2 <= len(payload) <= 16:
+        return False
+    tables = {(payload[k] >> 4, payload[k] & 0x0F) for k in range(0, len(payload), 2)}
+    return len(tables) == len(payload) // 2 and all(tc <= 1 and tb <= 3 for tc, tb in tables)
 
 
 def _classify_app(code: int, span: Span, payload: bytes) -> Block:
@@ -384,7 +460,7 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
     if code == 0xE0 and payload.startswith(_JFXX_SIG):
         return Block(
             Kind.METADATA, span, "JFIF extension thumbnail", "APP0:JFXX",
-            findings=[Finding(Category.EXTRAS, "JFXX thumbnail", size=len(payload))],
+            findings=[Finding(Category.EXTRAS, "JFXX thumbnail", None, "APP0:JFXX", len(payload))],
         )
     if code == 0xE1 and payload.startswith(_EXIF_SIG):
         return _classify_exif(span, payload)
@@ -402,7 +478,7 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
     if code == 0xE2 and payload.startswith(_MPF_SIG):
         return Block(
             Kind.METADATA, span, "MPF index", "APP2:MPF",
-            findings=[Finding(Category.EXTRAS, "MPF index", size=len(payload))],
+            findings=[Finding(Category.EXTRAS, "MPF index", None, "APP2:MPF", len(payload))],
         )
     if code == 0xEB and payload.startswith(_JUMBF_CI):
         return Block(
@@ -412,7 +488,7 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
     if code == 0xEC:
         return Block(
             Kind.METADATA, span, "APP12 data", "APP12",
-            findings=[Finding(Category.SOFTWARE, "APP12 data", size=len(payload))],
+            findings=[Finding(Category.SOFTWARE, "APP12 data", None, "APP12", len(payload))],
         )
     if code == 0xED and payload.startswith(_IPTC_SIG):
         return Block(
@@ -434,8 +510,8 @@ def _classify_adobe(span: Span, payload: bytes, already_have_standard: bool) -> 
     kept -- dropping it would shift a CMYK JPEG's colors -- but demoted to
     a non-removable `UNKNOWN` block tagged plainly `"APP14"`, not
     `"APP14:Adobe"`, so it reads as the same non-standard structure either
-    way and is covered by `verify`'s signature scan (spec section 8)
-    rather than trusted unscanned like the one real Adobe marker.
+    way and is covered by `verify`'s full signature scan (spec section 8)
+    rather than trusted like the one real Adobe marker.
     """
     if not already_have_standard and len(payload) == _ADOBE_PAYLOAD_LEN:
         return Block(Kind.ESSENTIAL, span, "Adobe color transform", "APP14:Adobe")
@@ -450,9 +526,9 @@ def _classify_adobe(span: Span, payload: bytes, already_have_standard: bool) -> 
 def _classify_jfif(span: Span, payload: bytes) -> Block:
     """JFIF header: `appearance`; a thumbnail adds `extras` and makes it rewritable."""
     has_thumbnail = len(payload) > 14
-    findings = [Finding(Category.APPEARANCE, "JFIF header")]
+    findings = [Finding(Category.APPEARANCE, "JFIF header", None, "APP0:JFIF", min(len(payload), 14))]
     if has_thumbnail:
-        findings.append(Finding(Category.EXTRAS, "JFIF thumbnail", size=len(payload) - 14))
+        findings.append(Finding(Category.EXTRAS, "JFIF thumbnail", None, "APP0:JFIF", len(payload) - 14))
     return Block(
         Kind.METADATA, span, "JFIF header", "APP0:JFIF", findings=findings,
         rewritable=has_thumbnail, raw=payload if has_thumbnail else b"",
@@ -466,34 +542,64 @@ def _classify_exif(span: Span, payload: bytes) -> Block:
     return Block(Kind.METADATA, span, "EXIF data", "APP1:Exif", findings=findings, rewritable=True, raw=tiff)
 
 
-def _classify_icc_run(segments: list[tuple[Span, int, bytes]], i: int) -> tuple[Block, int]:
-    """Merge one or more consecutive `ICC_PROFILE` APP2 chunks into one Block.
+def _reassemble_icc(segments: list[tuple[Span, int, bytes]]) -> bytes | None:
+    """The file's ICC profile, reassembled from every `ICC_PROFILE` APP2 chunk, or None.
 
-    Real encoders split a large ICC profile across several back-to-back
-    APP2 segments (spec 7.1: "inclusive multissegmento"); their chunk data
-    (each payload after the 12-byte signature + 1-byte seq + 1-byte count
-    header) is concatenated in stream order before reading the profile's
-    description, so `icc_description` always sees the complete profile.
+    Each chunk's payload is the 12-byte signature, a 1-byte seq, a 1-byte
+    count, then its slice of the profile. As libjpeg's own reader does,
+    the chunks may sit anywhere in the file and in any order, but every
+    seq from 1 to count must appear exactly once, with the same count in
+    every chunk; the slices joined in seq order must then be a
+    structurally valid profile (`icc_profile_valid`, ruling R20). None
+    means the file has no valid ICC profile (or no ICC chunk at all).
     """
-    first_span, _, first_payload = segments[i]
-    parts = [first_payload[_ICC_HEADER_LEN:]]
-    last_span = first_span
-    j = i + 1
+    chunks = [payload for _, code, payload in segments if code == 0xE2 and payload.startswith(_ICC_SIG)]
+    if not chunks or any(len(chunk) < _ICC_HEADER_LEN for chunk in chunks):
+        return None
+    count = chunks[0][_ICC_HEADER_LEN - 1]
+    by_seq = {chunk[_ICC_HEADER_LEN - 2]: chunk[_ICC_HEADER_LEN:] for chunk in chunks}
+    if any(chunk[_ICC_HEADER_LEN - 1] != count for chunk in chunks) or len(chunks) != count:
+        return None
+    if sorted(by_seq) != list(range(1, count + 1)):
+        return None
+    profile = b"".join(by_seq[seq] for seq in range(1, count + 1))
+    return profile if icc_profile_valid(profile) else None
+
+
+def _classify_icc_run(
+    segments: list[tuple[Span, int, bytes]], i: int, profile: bytes | None, first: bool
+) -> tuple[Block, int]:
+    """One Block for the run of adjacent `ICC_PROFILE` APP2 chunks starting at `i`.
+
+    Real encoders write a large profile as back-to-back APP2 chunks (spec
+    7.1: "inclusive multissegmento"), so a run is normally the whole
+    profile. `profile` is the file-wide reassembly (`_reassemble_icc`):
+    when it is valid, the file's `first` run carries the profile's
+    `appearance` finding and exposes the whole profile as `logical`; a
+    later run -- chunks apart in the file -- carries "ICC profile
+    (continued)". When it is None, every run is a removable `UNKNOWN`
+    "Invalid ICC profile" block, so the broken profile is dropped.
+    Returns `(block, index after the run)`.
+    """
+    first_span = last_span = segments[i][0]
+    data_size = 0
+    j = i
     while j < len(segments):
         span, code, payload = segments[j]
         if code != 0xE2 or not payload.startswith(_ICC_SIG):
             break
-        parts.append(payload[_ICC_HEADER_LEN:])
+        data_size += max(len(payload) - _ICC_HEADER_LEN, 0)
         last_span = span
         j += 1
+    span = Span(first_span.start, last_span.end)
 
-    profile = b"".join(parts)
-    finding = Finding(Category.APPEARANCE, "ICC profile", icc_description(profile), size=len(profile))
-    block = Block(
-        Kind.METADATA, Span(first_span.start, last_span.end), "ICC color profile", "APP2:ICC",
-        findings=[finding],
-    )
-    return block, j
+    if profile is None:
+        return Block(Kind.UNKNOWN, span, "Invalid ICC profile", "APP2:ICC", removable=True), j
+    if first:
+        finding = Finding(Category.APPEARANCE, "ICC profile", icc_description(profile), "APP2:ICC", len(profile))
+        return Block(Kind.METADATA, span, "ICC color profile", "APP2:ICC", findings=[finding], logical=profile), j
+    finding = Finding(Category.APPEARANCE, "ICC profile (continued)", None, "APP2:ICC", data_size)
+    return Block(Kind.METADATA, span, "ICC color profile (continued)", "APP2:ICC", findings=[finding]), j
 
 
 def _trailing_block(source: bytes, start: int, end: int) -> Block:
@@ -510,7 +616,7 @@ def _trailing_block(source: bytes, start: int, end: int) -> Block:
         label = "Data after end of image"
     return Block(
         Kind.METADATA, Span(start, end), label, TRAILING_TAG,
-        findings=[Finding(Category.EXTRAS, label, size=len(data))],
+        findings=[Finding(Category.EXTRAS, label, None, TRAILING_TAG, len(data))],
     )
 
 

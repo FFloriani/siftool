@@ -265,3 +265,8 @@ def test_iccp_must_be_a_valid_icc_profile():
     [iccp] = [b for b in H.parse(_riff(_chunk(b"VP8X", _vp8x(0x20)) + _chunk(b"ICCP", good) + _chunk(b"VP8L", VP8L))).blocks
               if b.tag == "ICCP"]
     assert iccp.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "ICCP", len(good))]
+
+def test_every_webp_finding_says_where_it_is():  # review M2 ("check PNG/WEBP too")
+    blocks = H.parse(make_webp("lossless", trailing=b"tail")).blocks
+    assert {b.tag for b in blocks if b.findings} == {"ICCP", "EXIF", "XMP", "C2PA", "TRAILING"}
+    assert all(f.where.startswith(b.tag) for b in blocks for f in b.findings)
