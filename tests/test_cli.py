@@ -1,4 +1,6 @@
-import json, subprocess, sys
+import json, os, subprocess, sys
+from pathlib import Path
+import siftool
 from siftool.cli import main
 from fixtures.make_fixtures import make_jpeg, make_png, write
 
@@ -73,10 +75,6 @@ def test_cli_folder_skips_previous_outputs_and_does_not_overwrite(tmp_path):
 # plus the handlers' own, so HEIC/video files are reported, not skipped.
 # Ruling R23 (review I4): a failed record says why.
 # ---------------------------------------------------------------------------
-
-import os
-import siftool
-from pathlib import Path
 
 def _json(capsys, argv):
     code = main(argv)

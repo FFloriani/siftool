@@ -1,9 +1,11 @@
 import io, struct, zlib, pytest
+import siftool
+from siftool import Finding, Status
 from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.png import PngHandler, AI_TEXT_KEYWORDS
 from siftool.errors import CorruptFileError, UnsafeFileError
-from fixtures.make_fixtures import make_png, png_chunk, decode_pixels
+from fixtures.make_fixtures import make_png, png_chunk, decode_pixels, make_icc, write
 
 H = PngHandler()
 def by_tag(c, t): return [b for b in c.blocks if b.tag == t]
@@ -151,10 +153,6 @@ def test_oversize_sbit_is_corrupt():
 # keyword is rewritten to "ICC profile"; the other appearance chunks must
 # have their exact sizes.
 # ---------------------------------------------------------------------------
-
-import siftool
-from siftool import Finding, Status
-from fixtures.make_fixtures import make_icc, write
 
 IDAT_16 = png_chunk(b"IDAT", zlib.compress(b"".join(b"\x00" + bytes(range(16)) for _ in range(16))))
 

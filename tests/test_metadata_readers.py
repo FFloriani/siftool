@@ -1,7 +1,8 @@
-from siftool.model import Category as C
+import struct
+from siftool.model import Category as C, Finding
 from siftool.metadata.xmp import xmp_findings
 from siftool.metadata.c2pa import c2pa_findings
-from siftool.metadata.icc import icc_description
+from siftool.metadata.icc import icc_description, icc_profile_valid
 from siftool.metadata.iptc import iptc_findings
 from fixtures.make_fixtures import make_xmp, make_c2pa_payload, make_icc, make_iptc_irb
 
@@ -47,9 +48,6 @@ def test_icc_description_v2_v4_and_garbage():
     assert icc_description(b"not an icc profile") is None
 
 def test_icc_profile_structure_is_validated():  # ruling R20
-    import struct
-    from siftool.metadata.icc import icc_profile_valid
-
     good = make_icc("Display P3", 4)
     assert icc_profile_valid(good) and icc_profile_valid(make_icc("sRGB IEC61966-2.1", 2))
     wrong_size_field = struct.pack(">I", len(good) + 1) + good[4:]
@@ -61,8 +59,6 @@ def test_icc_profile_structure_is_validated():  # ruling R20
         assert not icc_profile_valid(bad)
 
 def test_iptc_dataset_names_only_apply_to_record_2():  # review M1
-    import struct
-    from siftool.model import Finding
     # 1:90 is the Envelope Record's CodedCharacterSet (ESC % G = UTF-8), not 2:90 City.
     envelope = b"\x1c\x01\x5a\x00\x03\x1b%G"
     irb = b"Photoshop 3.0\x00" + b"8BIM\x04\x04\x00\x00" + struct.pack(">I", len(envelope)) + envelope

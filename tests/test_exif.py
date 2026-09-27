@@ -1,7 +1,9 @@
 import struct, pytest
-from siftool.model import Category as C
-from siftool.metadata.exif import parse_exif, build_minimal_exif, strip_exif_header
-from fixtures.make_fixtures import make_tiff_exif
+import tracemalloc
+from siftool.model import Category as C, Finding, Mode
+from siftool.modes import ALLOWED
+from siftool.metadata.exif import parse_exif, build_minimal_exif, strip_exif_header, STANDARD_FORMS, TAG_CATEGORIES
+from fixtures.make_fixtures import make_tiff_exif, tiff_header, tiff_ifd
 
 def by_label(findings): return {f.label: f for f in findings}
 
@@ -51,13 +53,6 @@ def test_minimal_exif_returns_none_when_nothing_allowed():
 # with count 1, and reports any pointer it cannot follow; the minimal writer
 # keeps an allowed tag only in its Exif-standard type and count.
 # ---------------------------------------------------------------------------
-
-import tracemalloc
-
-from siftool.model import Finding, Mode
-from siftool.modes import ALLOWED
-from siftool.metadata.exif import TAG_CATEGORIES
-from fixtures.make_fixtures import tiff_header, tiff_ifd
 
 PRIVACY = ALLOWED[Mode.PRIVACY]
 PHOTOGRAPHER = ALLOWED[Mode.PHOTOGRAPHER]
@@ -211,8 +206,6 @@ def _in_order(value, type_code, order):
 
 
 def test_every_allowable_tag_has_a_standard_form():
-    from siftool.metadata.exif import STANDARD_FORMS
-
     allowable = frozenset().union(*ALLOWED.values())
     assert {tag for (_ifd, tag), cat in TAG_CATEGORIES.items() if cat in allowable} == set(STANDARD_FORMS)
     assert {entry[0] for entry in STANDARD_ENTRIES} == set(STANDARD_FORMS)

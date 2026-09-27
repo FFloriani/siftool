@@ -1,5 +1,6 @@
 import os, pytest
 from pathlib import Path
+from siftool import safe_io
 from siftool.safe_io import load, check_destination, AtomicOutput, TEMP_MARKER
 from siftool.errors import CorruptFileError, UnsafeFileError, SameFileError, DestinationExistsError
 
@@ -43,8 +44,6 @@ def test_atomic_output_commit_and_discard(tmp_path):
 # Review M9: commit(overwrite=False) never replaces a destination that
 # appeared after check_destination -- os.rename refuses it on Windows; a hard
 # link refuses it everywhere (both strategies run here: NTFS has hard links).
-
-from siftool import safe_io
 
 @pytest.mark.parametrize("rename_refuses", [True, False], ids=["rename", "link"])
 def test_commit_without_overwrite_never_replaces_a_late_destination(tmp_path, monkeypatch, rename_refuses):

@@ -7,7 +7,7 @@ from siftool import Mode, Status, Category as C
 from siftool.errors import SameFileError, DestinationExistsError, VerificationFailedError
 from siftool.planner import MAXIMUM_APPEARANCE_NOTE
 from siftool.safe_io import TEMP_MARKER
-from fixtures.make_fixtures import base_jpeg, make_jpeg, make_png, make_webp, write
+from fixtures.make_fixtures import base_jpeg, make_jpeg, make_png, make_webp, png_chunk, write
 
 
 def _jpeg_with_empty_exif() -> bytes:
@@ -177,7 +177,6 @@ def test_verify_notes_explain_every_failure(tmp_path):
     assert v.essential_match is False
 
 def test_verify_fails_a_block_with_a_bad_crc(tmp_path):  # review M3
-    from fixtures.make_fixtures import png_chunk
     png = make_png(icc=False, exif=False, xmp=False, ai_text=False, meta=False, c2pa=False, unknown_ancillary=False)
     at = png.index(b"IDAT") - 4
     bad = write(tmp_path, "crc.png", png[:at] + png_chunk(b"sRGB", b"\x00", bad_crc=True) + png[at:])

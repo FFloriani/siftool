@@ -1,9 +1,12 @@
 import io, struct, pytest
+import siftool
+from PIL import Image
+from siftool import Finding, Status
 from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.webp import WebpHandler, VP8X_ICC, VP8X_EXIF, VP8X_XMP, VP8X_ANIM
 from siftool.errors import CorruptFileError
-from fixtures.make_fixtures import make_webp, riff_chunks, decode_pixels
+from fixtures.make_fixtures import make_webp, riff_chunks, decode_pixels, make_icc, write
 
 H = WebpHandler()
 def clean_bytes(data, mode=Mode.PRIVACY):
@@ -123,11 +126,6 @@ def test_anim_without_animation_flag_is_corrupt():
 # chunks are dropped; a file with no image data is corrupt. Ruling R20 (I1):
 # an ICCP must be a structurally valid ICC profile.
 # ---------------------------------------------------------------------------
-
-import siftool
-from siftool import Finding, Status
-from fixtures.make_fixtures import make_icc, write
-from PIL import Image
 
 def _chunk(fourcc, payload):
     return fourcc + struct.pack("<I", len(payload)) + payload + (b"\x00" if len(payload) % 2 else b"")

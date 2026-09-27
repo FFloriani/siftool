@@ -1,10 +1,10 @@
 import pytest
 import siftool
-from siftool.model import Category as C, Kind, Mode, Status
+from siftool.model import Category as C, Finding, Kind, Mode, Status
 from siftool.planner import plan_container
 from siftool.formats.jpeg import JpegHandler
 from siftool.errors import CorruptFileError, VerificationFailedError
-from fixtures.make_fixtures import make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER, make_c2pa_payload
+from fixtures.make_fixtures import make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER, make_c2pa_payload, make_icc
 import io
 import struct
 import warnings
@@ -234,9 +234,6 @@ def test_pillow_optimized_progressive_restart_and_cmyk_are_verified(tmp_path):
 # the whole file by seq/count and kept only as a valid profile. Review M2:
 # every handler-built finding says where it is.
 # ---------------------------------------------------------------------------
-
-from siftool.model import Finding
-from fixtures.make_fixtures import make_icc
 
 def _before_eoi(data: bytes, extra: bytes) -> bytes:
     assert data.endswith(b"\xff\xd9")
