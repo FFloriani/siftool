@@ -118,6 +118,45 @@ def _jpeg_with_app14(payload: bytes) -> bytes:
     base = base_jpeg()
     return base[:2] + segment + base[2:]
 
+# Review M8: OSError (FileNotFoundError, PermissionError, ...) propagates from
+# inspect/clean unchanged -- it is not a SiftoolError.
+
+def test_inspect_and_clean_let_oserror_propagate(tmp_path):
+    missing = tmp_path / "missing.jpg"
+    with pytest.raises(FileNotFoundError): siftool.inspect(missing)
+    with pytest.raises(FileNotFoundError): siftool.clean(missing, tmp_path / "out.jpg")
+    src = write(tmp_path, "a.jpg", make_jpeg())
+    with pytest.raises(FileNotFoundError): siftool.clean(src, tmp_path / "no_such_dir" / "out.jpg")
+    assert not list(tmp_path.glob(f"*{TEMP_MARKER}*"))
+
+# Review M9: without overwrite, clean never replaces a destination that
+# appeared while it was running (after its own existence check).
+
+def test_clean_never_clobbers_a_destination_created_during_the_clean(tmp_path, monkeypatch):
+    src = write(tmp_path, "a.jpg", make_jpeg()); dst = tmp_path / "o.jpg"
+    real_verify_file = siftool.api.verify_file
+    def racing_verify_file(path, mode, original=None):
+        dst.write_bytes(b"late")  # another program creates dst mid-clean
+        return real_verify_file(path, mode, original=original)
+    monkeypatch.setattr(siftool.api, "verify_file", racing_verify_file)
+    with pytest.raises(DestinationExistsError): siftool.clean(src, dst)
+    assert dst.read_bytes() == b"late" and not list(tmp_path.glob(f"*{TEMP_MARKER}*"))
+    assert siftool.clean(src, dst, overwrite=True).verdict.status is Status.VERIFIED
+    assert dst.read_bytes() != b"late"
+
+# Review M11: mode strings are coerced with Mode(mode); a bad one is a
+# ValueError before any I/O (a missing source proves nothing was read).
+
+def test_mode_is_coerced_and_validated_before_any_io(tmp_path):
+    src = write(tmp_path, "a.jpg", make_jpeg())
+    res = siftool.clean(src, tmp_path / "o.jpg", "photographer")
+    assert res.mode is Mode.PHOTOGRAPHER and res.verdict.status is Status.VERIFIED
+    assert siftool.verify(tmp_path / "o.jpg", "photographer").status is Status.VERIFIED
+    missing = tmp_path / "missing.jpg"
+    with pytest.raises(ValueError, match="'privcy' is not a valid Mode"): siftool.clean(missing, tmp_path / "x.jpg", "privcy")
+    with pytest.raises(ValueError, match="'privcy' is not a valid Mode"): siftool.verify(missing, "privcy")
+    assert not (tmp_path / "x.jpg").exists()
+
 # Ruling R23 (review I4, triage T9): a FAILED verdict always says why.
 
 def _flip_a_scan_bit(path):

@@ -27,8 +27,10 @@ _THUMBNAIL_RESOURCE_ID = 0x040C
 _IIM_MARKER = 0x1C
 
 # IIM Application Record (record 2) dataset number -> (label, Category).
-# Anything else -- a dataset not listed here, in record 2 or otherwise --
-# is "demais": Category.TEXT, per the design doc's dataset table.
+# Anything else -- a dataset not listed here, or any dataset of another
+# record (e.g. 1:90, the Envelope Record's CodedCharacterSet, is not 2:90
+# City) -- is "demais": Category.TEXT, per the design doc's dataset table.
+_APPLICATION_RECORD = 2
 _DATASETS: dict[int, tuple[str, Category]] = {
     80: ("By-line", Category.IDENTITY),
     85: ("By-line Title", Category.IDENTITY),
@@ -62,7 +64,8 @@ def _iim_datasets(data: bytes, where: str, findings: list[Finding]) -> None:
             break
         text = data[pos : pos + length].decode("utf-8", errors="replace")
         pos += length
-        label, category = _DATASETS.get(dataset, (f"IPTC {record}:{dataset}", Category.TEXT))
+        generic = (f"IPTC {record}:{dataset}", Category.TEXT)
+        label, category = _DATASETS.get(dataset, generic) if record == _APPLICATION_RECORD else generic
         findings.append(Finding(category, label, text, where))
 
 

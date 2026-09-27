@@ -60,6 +60,17 @@ def test_icc_profile_structure_is_validated():  # ruling R20
                 good + b"\x00"):
         assert not icc_profile_valid(bad)
 
+def test_iptc_dataset_names_only_apply_to_record_2():  # review M1
+    import struct
+    from siftool.model import Finding
+    # 1:90 is the Envelope Record's CodedCharacterSet (ESC % G = UTF-8), not 2:90 City.
+    envelope = b"\x1c\x01\x5a\x00\x03\x1b%G"
+    irb = b"Photoshop 3.0\x00" + b"8BIM\x04\x04\x00\x00" + struct.pack(">I", len(envelope)) + envelope
+    assert iptc_findings(irb, "APP13/IRB") == [
+        Finding(C.TEXT, "IPTC 1:90", "\x1b%G", "APP13/IRB"),
+        Finding(C.TEXT, "Photoshop/IPTC data", None, "APP13/IRB", len(irb)),
+    ]
+
 def test_iptc_categories():
     fs = iptc_findings(make_iptc_irb(), "APP13")
     by = {f.detail: f.category for f in fs if f.detail}
