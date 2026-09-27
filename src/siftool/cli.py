@@ -13,17 +13,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
 import siftool
 from siftool.detect import supported_extensions
-from siftool.errors import SiftoolError
+from siftool.errors import SiftoolError, VerificationFailedError
 from siftool.model import Finding, Mode, Status
 
 # A previous run's own output: "<stem>_clean<suffix>" or "<stem>_clean (N)<suffix>".
 _CLEAN_SUFFIX_RE = re.compile(r"_clean \(\d+\)$")
+
+# Spec section 10's folder-walk extensions. Formats without a handler yet
+# (HEIC, video) are walked too, so each is reported ("HEIC is not supported
+# yet", exit 2) instead of silently skipped (ruling R22).
+SPEC_WALK_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".mp4", ".mov", ".m4v"})
 
 _EXIT_CODE = {Status.VERIFIED.value: 0, Status.WARNINGS.value: 1, Status.FAILED.value: 2}
 
@@ -31,12 +37,15 @@ _EXIT_CODE = {Status.VERIFIED.value: 0, Status.WARNINGS.value: 1, Status.FAILED.
 def iter_inputs(paths: list[str]) -> list[Path]:
     """Expand `paths` into the sorted list of files a command should process.
 
-    A directory is walked recursively and filtered to `supported_extensions()`,
-    skipping any file whose stem is itself a previous run's output (ends in
-    `_clean`, or matches `_clean (N)`). A path that names a file directly is
-    always included, whatever its extension or stem -- explicit means explicit.
+    A directory is walked recursively and filtered to spec section 10's
+    extensions (`SPEC_WALK_EXTENSIONS`) plus any extension a registered
+    handler declares (`supported_extensions()`, e.g. `.apng`/`.jfif`/`.jpe`),
+    case-insensitively (ruling R22), skipping any file whose stem is itself
+    a previous run's output (ends in `_clean`, or matches `_clean (N)`). A
+    path that names a file directly is always included, whatever its
+    extension or stem -- explicit means explicit.
     """
-    extensions = supported_extensions()
+    extensions = SPEC_WALK_EXTENSIONS | supported_extensions()
     found: list[Path] = []
     for raw in paths:
         path = Path(raw)
@@ -53,21 +62,30 @@ def iter_inputs(paths: list[str]) -> list[Path]:
     return sorted(found, key=str)
 
 
-def output_path_for(src: Path, out_dir: Path | None, overwrite: bool) -> Path:
+def _path_key(path) -> str:
+    """How two output paths are compared: absolute, and case-folded where the OS folds case."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def output_path_for(
+    src: Path, out_dir: Path | None, overwrite: bool, taken: set[str] | frozenset[str] = frozenset()
+) -> Path:
     """Return the path `src`'s cleaned copy should be written to.
 
-    `<stem>_clean<suffix>`, beside `src` or inside `out_dir` when given. If
-    that already exists and `overwrite` is False, tries `<stem>_clean (2)
-    <suffix>`, then `(3)`, ... until a name that does not exist yet.
+    `<stem>_clean<suffix>`, beside `src` or inside `out_dir` when given;
+    else `<stem>_clean (2)<suffix>`, then `(3)`, ... The first candidate
+    wins unless it is in `taken` -- the `_path_key` of every output this
+    run has already produced, which is never reused, `overwrite` or not
+    (ruling R22: two sources named alike, e.g. `trip1/IMG_0001.jpg` and
+    `trip2/IMG_0001.jpg` with `--out`, never share an output) -- or it
+    already exists and `overwrite` is False.
     """
     directory = out_dir if out_dir is not None else src.parent
-    candidate = directory / f"{src.stem}_clean{src.suffix}"
-    if overwrite or not candidate.exists():
-        return candidate
-    n = 2
+    n = 1
     while True:
-        candidate = directory / f"{src.stem}_clean ({n}){src.suffix}"
-        if not candidate.exists():
+        name = f"{src.stem}_clean{src.suffix}" if n == 1 else f"{src.stem}_clean ({n}){src.suffix}"
+        candidate = directory / name
+        if _path_key(candidate) not in taken and (overwrite or not candidate.exists()):
             return candidate
         n += 1
 
@@ -145,20 +163,29 @@ def _run_scan(paths: list[str], as_json: bool) -> int:
 # --------------------------------------------------------------------------
 
 
-def _clean_one(src: Path, out_dir: Path | None, overwrite: bool, mode: Mode) -> dict:
-    dst = output_path_for(src, out_dir, overwrite)
+def _failed_record(src: Path, error: str, notes: list[str], violations: list[dict]) -> dict:
+    """A failed clean's record: always these keys, in this order (ruling R23)."""
+    return {
+        "file": str(src),
+        "output": None,
+        "status": Status.FAILED.value,
+        "removed": [],
+        "kept": [],
+        "notes": notes,
+        "error": error,
+        "violations": violations,
+    }
+
+
+def _clean_one(src: Path, out_dir: Path | None, overwrite: bool, mode: Mode, taken: set[str]) -> dict:
+    dst = output_path_for(src, out_dir, overwrite, taken)
     try:
         result = siftool.clean(src, dst, mode, overwrite=overwrite)
+    except VerificationFailedError as e:
+        violations = [_finding_dict(f) for f in e.verdict.violations]
+        return _failed_record(src, _error_message(e), list(e.verdict.notes), violations)
     except (SiftoolError, OSError) as e:
-        return {
-            "file": str(src),
-            "output": None,
-            "status": Status.FAILED.value,
-            "error": _error_message(e),
-            "removed": [],
-            "kept": [],
-            "notes": [],
-        }
+        return _failed_record(src, _error_message(e), [], [])
     notes = list(result.notes) + list(result.verdict.notes)
     return {
         "file": str(src),
@@ -173,6 +200,10 @@ def _clean_one(src: Path, out_dir: Path | None, overwrite: bool, mode: Mode) -> 
 def _print_clean_text(record: dict) -> None:
     if "error" in record:
         print(f"{record['file']}  [failed] {record['error']}")
+        for finding in record["violations"]:
+            print(f"  violation: {finding['label']} ({finding['category']})")
+        for note in record["notes"]:
+            print(f"  note: {note}")
         return
     print(f"{record['file']} -> {record['output']}  [{record['status']}]")
     for finding in record["removed"]:
@@ -193,8 +224,11 @@ def _run_clean(paths: list[str], mode: Mode, out_dir: Path | None, overwrite: bo
 
     results: list[dict] = []
     worst = 0
+    taken: set[str] = set()  # every output this run produced (ruling R22)
     for src in iter_inputs(paths):
-        record = _clean_one(src, out_dir, overwrite, mode)
+        record = _clean_one(src, out_dir, overwrite, mode, taken)
+        if record["output"] is not None:
+            taken.add(_path_key(record["output"]))
         results.append(record)
         worst = max(worst, _EXIT_CODE[record["status"]])
 
