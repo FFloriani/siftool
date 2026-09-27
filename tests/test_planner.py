@@ -57,3 +57,25 @@ def test_metadata_block_without_findings_is_dropped():
 def test_maximum_note_when_appearance_is_removed():
     plan = run([blk(Kind.METADATA, C.APPEARANCE)], mode=Mode.MAXIMUM)
     assert plan.actions == [Action.DROP] and MAXIMUM_APPEARANCE_NOTE in plan.notes
+
+# Ruling R18 (review C1): a rewritable block always goes through rewrite(),
+# whatever its categories -- a fully allowed one is re-serialized, never
+# KEPT verbatim (EXIF slack, unreported sub-IFDs and odd-typed allowed tags
+# would otherwise survive byte for byte).
+
+def test_fully_allowed_rewritable_block_is_rewritten_not_kept():
+    calls = []
+    def rewrite(block, allowed):
+        calls.append(allowed)
+        return b"NEW"
+    plan = run([blk(Kind.METADATA, C.APPEARANCE, rewritable=True)], rewrite=rewrite)
+    assert plan.actions == [Action.REWRITE] and plan.replacements == {0: b"NEW"}
+    assert calls == [ALLOWED[Mode.PRIVACY]] and plan.notes == []
+
+def test_fully_allowed_rewritable_block_whose_rewrite_returns_none_is_dropped():
+    assert run([blk(Kind.METADATA, C.APPEARANCE, rewritable=True)]).actions == [Action.DROP]
+
+def test_rewritable_block_with_nothing_allowed_still_goes_through_rewrite():
+    calls = []
+    plan = run([blk(Kind.METADATA, C.LOCATION, rewritable=True)], rewrite=lambda b, a: calls.append(a))
+    assert plan.actions == [Action.DROP] and calls == [ALLOWED[Mode.PRIVACY]] and plan.notes == []

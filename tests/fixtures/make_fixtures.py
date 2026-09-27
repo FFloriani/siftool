@@ -5,6 +5,8 @@ with IFD0, ExifIFD, GPS and IFD1 (thumbnail) sections, using exactly the
 tag/value set described in Task 4's brief. It is a small, independent
 TIFF writer -- it does not import `siftool.metadata.exif` and must stay
 deterministic byte-for-byte so tests can assert on exact `detail` strings.
+`tiff_header`/`tiff_ifd` are its raw counterpart: they emit exactly the
+entries they are given, for hand-laid adversarial TIFFs.
 
 `write` is a small helper for tests that need the bytes on disk.
 """
@@ -207,6 +209,27 @@ def make_tiff_exif(byte_order: str = "<") -> bytes:
     header = bom + struct.pack(order + "H", 0x2A) + struct.pack(order + "I", 8)
     body = _assemble(order, [ifd0, exif_ifd, gps, ifd1], {"thumbnail": b"\xff\xd8\xff\xd9"})
     return header + body
+
+
+def tiff_header(order: str = ">", ifd0_offset: int = 8) -> bytes:
+    """A TIFF header: byte-order mark, magic 42 and the IFD0 offset, in `order`."""
+    return (b"MM" if order == ">" else b"II") + struct.pack(order + "HI", 0x2A, ifd0_offset)
+
+
+def tiff_ifd(entries: list[tuple[int, int, int, bytes]], next_offset: int = 0, order: str = ">") -> bytes:
+    """One TIFF IFD built from literal entries `(tag, type, count, value_field)`.
+
+    `value_field` is the entry's raw 4-byte value/offset field exactly as it
+    goes on disk (already packed in `order`): the caller lays out every
+    out-of-line value itself, so adversarial layouts -- sub-IFD pointers of
+    odd types, unreferenced slack, dangling offsets -- are easy to build.
+    An IFD with `n` entries is `2 + 12 * n + 4` bytes long.
+    """
+    out = struct.pack(order + "H", len(entries))
+    for tag, type_code, count, value_field in entries:
+        assert len(value_field) == 4, "value_field must be the raw 4-byte field"
+        out += struct.pack(order + "HHI", tag, type_code, count) + value_field
+    return out + struct.pack(order + "I", next_offset)
 
 
 def write(tmp_path, name: str, data: bytes) -> Path:

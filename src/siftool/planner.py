@@ -2,14 +2,17 @@
 
 Rules, in order, for each block in `container.blocks`:
 - `ESSENTIAL` -> `KEEP`.
-- `METADATA`: let `cats` be the categories of its findings and
-  `ok = ALLOWED[mode]`.
-  - `cats` empty or disjoint from `ok` -> `DROP` (`ZERO` if
-    `container.positional`).
+- `METADATA`, `rewritable`: always `rewrite(block, ok)` with
+  `ok = ALLOWED[mode]`, whatever its categories (ruling R18) -- bytes ->
+  `REWRITE` (stored in `replacements[i]`); `None` -> `DROP` (`ZERO` if
+  `container.positional`). A rewritable block is never kept verbatim: its
+  bytes may hold more than its findings report (EXIF slack, sub-IFDs,
+  allowed tags in odd types), and the handler's canonical rewrite -- a
+  fixed point, so a second clean stays byte-identical -- is what drops it.
+- `METADATA`, not rewritable: let `cats` be the categories of its findings.
+  - `cats` empty or disjoint from `ok` -> `DROP`/`ZERO`.
   - `cats` subset of `ok` -> `KEEP`.
-  - Mixed: if `rewritable`, call `rewrite(block, ok)`; bytes -> `REWRITE`
-    (stored in `replacements[i]`); `None` -> `DROP`/`ZERO`. If not
-    `rewritable`, `DROP`/`ZERO` plus a note naming what could not be kept.
+  - Mixed -> `DROP`/`ZERO` plus a note naming what could not be kept.
 - `UNKNOWN`: `removable` -> `DROP`/`ZERO`; otherwise `KEEP` plus a note.
 
 In `Mode.MAXIMUM`, if any removed block had an `APPEARANCE` finding,
@@ -46,22 +49,21 @@ def plan_container(
         if block.kind == Kind.ESSENTIAL:
             action = Action.KEEP
         elif block.kind == Kind.METADATA:
-            if cats.isdisjoint(ok):
-                action = Action.ZERO if container.positional else Action.DROP
-            elif cats <= ok:
-                action = Action.KEEP
-            else:
-                new_bytes = rewrite(block, ok) if block.rewritable else None
+            if block.rewritable:
+                new_bytes = rewrite(block, ok)
                 if new_bytes is not None:
                     action = Action.REWRITE
                     replacements[index] = new_bytes
                 else:
                     action = Action.ZERO if container.positional else Action.DROP
-                    if not block.rewritable:
-                        kept = ", ".join(sorted(c.value for c in cats & ok))
-                        notes.append(
-                            f"{block.tag}: could not keep {kept} (block removed)"
-                        )
+            elif cats.isdisjoint(ok):
+                action = Action.ZERO if container.positional else Action.DROP
+            elif cats <= ok:
+                action = Action.KEEP
+            else:
+                action = Action.ZERO if container.positional else Action.DROP
+                kept = ", ".join(sorted(c.value for c in cats & ok))
+                notes.append(f"{block.tag}: could not keep {kept} (block removed)")
         else:  # Kind.UNKNOWN
             if block.removable:
                 action = Action.ZERO if container.positional else Action.DROP
