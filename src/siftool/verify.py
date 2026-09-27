@@ -6,14 +6,18 @@ never raises for a content problem: any read/parse failure degrades to
 check on any file) and `api.clean`'s "Verified Clean" seal, which calls it
 on the temporary output before ever replacing the destination.
 
-`block_findings` (controller ruling R11) is the single place that decides
-what a `Block` "shows up as" for reporting/verification purposes: a format
-handler never puts a `Finding` on an `UNKNOWN` block that carries none of
-its own (`jpeg.py`'s bare "Unknown marker"/"Unknown APPn", `png.py`'s and
-`webp.py`'s "Unknown chunk"), so without this helper such a block would be
-invisible to `inspect`'s report, `clean`'s removed/kept split and, worst of
-all, `verify`'s violation check -- a removable-but-unremoved unknown block
-would otherwise silently pass as VERIFIED.
+`block_findings` (controller ruling R11, extended by R13) is the single
+place that decides what a `Block` "shows up as" for reporting/verification
+purposes: a format handler can leave a non-`ESSENTIAL` block with no
+`Finding` of its own -- an `UNKNOWN` block with none of its own kind
+(`jpeg.py`'s bare "Unknown marker"/"Unknown APPn", `png.py`'s and
+`webp.py`'s "Unknown chunk"), or a `METADATA` block whose reader simply
+found nothing to report (e.g. an EXIF/`eXIf`/`EXIF` block wrapping a
+syntactically valid but tag-less TIFF -- an IFD0 with zero entries).
+Without this helper, either case would be invisible to `inspect`'s report,
+`clean`'s removed/kept split and, worst of all, `verify`'s violation check
+-- a removable-but-unremoved leftover block would otherwise silently pass
+as VERIFIED.
 """
 
 from __future__ import annotations
@@ -47,15 +51,18 @@ EXIF_BLOCK_TAGS = frozenset({"APP1:Exif", "eXIf", "EXIF"})
 def block_findings(block: Block) -> list[Finding]:
     """Return what `block` "shows up as": its own findings, or a synthesized one.
 
-    A format handler never attaches a `Finding` to an `UNKNOWN` block that
-    has none of its own; this returns a single
+    A format handler can leave a non-`ESSENTIAL` block -- `METADATA` or
+    `UNKNOWN` -- with no `Finding` of its own; this returns a single
     `[Finding(Category.UNKNOWN, block.label, None, block.tag,
     block.span.length)]` for that case, so the block is never silently
-    invisible to a report or a verification check (controller ruling R11).
-    Every other block's own `findings` (possibly empty, for an `ESSENTIAL`
-    block) is returned unchanged.
+    invisible to a report or a verification check (controller ruling R11,
+    extended by R13 to cover a findings-less `METADATA` block too -- e.g.
+    a leftover EXIF shell with a tag-less TIFF). An `ESSENTIAL` block's
+    own (always-empty) `findings` is returned unchanged: it is never a
+    "leftover", so it is never synthesized. Every other block's own,
+    non-empty `findings` is likewise returned unchanged.
     """
-    if block.findings or block.kind is not Kind.UNKNOWN:
+    if block.findings or block.kind is Kind.ESSENTIAL:
         return block.findings
     return [Finding(Category.UNKNOWN, block.label, None, block.tag, block.span.length)]
 

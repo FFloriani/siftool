@@ -1,3 +1,5 @@
+import struct
+
 import pytest
 from pathlib import Path
 import siftool
@@ -5,7 +7,20 @@ from siftool import Mode, Status, Category as C
 from siftool.errors import SameFileError, DestinationExistsError, VerificationFailedError
 from siftool.planner import MAXIMUM_APPEARANCE_NOTE
 from siftool.safe_io import TEMP_MARKER
-from fixtures.make_fixtures import make_jpeg, make_png, make_webp, write
+from fixtures.make_fixtures import base_jpeg, make_jpeg, make_png, make_webp, write
+
+
+def _jpeg_with_empty_exif() -> bytes:
+    """A base JPEG with an APP1 Exif segment wrapping a tag-less TIFF.
+
+    The TIFF is `MM\\x00*` + IFD0 offset 8 + an IFD0 with 0 entries + next
+    IFD 0 -- syntactically valid, but `parse_exif` finds nothing to report
+    (ruling R13's repro: a leftover EXIF shell with no parsed tags).
+    """
+    payload = b"Exif\x00\x00" + b"MM\x00\x2a\x00\x00\x00\x08" + b"\x00\x00" + b"\x00\x00\x00\x00"
+    segment = bytes([0xFF, 0xE1]) + struct.pack(">H", len(payload) + 2) + payload
+    base = base_jpeg()
+    return base[:2] + segment + base[2:]
 
 def test_inspect_reports_categories(tmp_path):
     r = siftool.inspect(write(tmp_path, "a.jpg", make_jpeg()))
@@ -55,6 +70,19 @@ def test_leftover_unknown_block_is_a_violation(tmp_path):
     assert v.status is Status.FAILED and any(f.category is C.UNKNOWN for f in v.violations)
     findings = siftool.inspect(src).findings
     assert any(f.category is C.UNKNOWN and f.where == "APP15" for f in findings)
+
+def test_leftover_empty_exif_block_is_a_violation(tmp_path):
+    src = write(tmp_path, "a.jpg", _jpeg_with_empty_exif())
+    assert siftool.verify(src, Mode.MAXIMUM).status is Status.FAILED
+    assert siftool.verify(src, Mode.PRIVACY).status is Status.FAILED
+    findings = siftool.inspect(src).findings
+    assert any(f.category is C.UNKNOWN and f.where == "APP1:Exif" for f in findings)
+
+def test_empty_exif_shell_is_listed_as_removed(tmp_path):
+    src = write(tmp_path, "a.jpg", _jpeg_with_empty_exif())
+    res = siftool.clean(src, tmp_path / "a_clean.jpg")
+    assert res.verdict.status in (Status.VERIFIED, Status.WARNINGS)
+    assert any(f.category is C.UNKNOWN and f.where == "APP1:Exif" for f in res.removed)
 
 def test_kept_unknown_block_gives_warnings_or_fails_on_signature(tmp_path):
     ok = siftool.clean(write(tmp_path, "a.jpg", make_jpeg(reserved_marker=True)), tmp_path / "a_clean.jpg")
