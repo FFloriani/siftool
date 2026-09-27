@@ -422,3 +422,91 @@ def test_png_oversize_gama_carrying_text_is_dropped(tmp_path, mode):
     data = _bare_png(png_chunk(b"gAMA", struct.pack(">I", 45455) + QUIET_SECRET))
     res, out = _clean(tmp_path, data, ".png", mode)
     assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out and out == make_png(**_BARE_PNG)
+
+
+# ---------------------------------------------------------------------------
+# I5 / ruling R21: ESSENTIAL spans and kept ICC profiles are scanned for the
+# long signatures only. I1 / ruling R20: a reassembled or inflated ICC
+# profile (Block.logical) is scanned too.
+# ---------------------------------------------------------------------------
+
+
+def _clean_fails(tmp_path, data: bytes, ext: str, mode: Mode):
+    dst = tmp_path / f"out_{mode.value}{ext}"
+    with pytest.raises(siftool.VerificationFailedError) as e:
+        siftool.clean(write(tmp_path, f"src_{mode.value}{ext}", data), dst, mode)
+    assert not dst.exists()
+    return e.value.verdict
+
+
+def _png_with_idat_after_the_zlib_stream(extra: bytes) -> bytes:
+    png = make_png(**_BARE_PNG)
+    at = png.index(b"IEND") - 4
+    return png[:at] + png_chunk(b"IDAT", extra) + png[at:]
+
+
+ESSENTIAL_CARRIERS = {
+    "jpeg-entropy-tail": (lambda s: _jpeg_before_eoi(s), ".jpg", "SOS"),
+    "png-idat-after-zlib-end": (_png_with_idat_after_the_zlib_stream, ".png", "IDAT"),
+    "webp-vp8l-tail": (lambda s: _riff(_riff_chunk(b"VP8L", _vp8l() + s)), ".webp", "VP8L"),
+}
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+@pytest.mark.parametrize("carrier", sorted(ESSENTIAL_CARRIERS))
+def test_coordinates_hidden_in_image_data_fail_verification(tmp_path, carrier, mode):
+    wrap, ext, tag = ESSENTIAL_CARRIERS[carrier]
+    verdict = _clean_fails(tmp_path, wrap(SECRET), ext, mode)
+    # Only the long signature fires: SECRET's bare b"GPS" is never searched in image data.
+    assert verdict.violations == [Finding(C.LOCATION, "ISO 6709 coordinates", None, tag)]
+
+
+LONG = {
+    b"Exif\x00\x00": (C.UNKNOWN, "EXIF header"),
+    b"<x:xmpmeta": (C.SOFTWARE, "XMP packet"),
+    b"http://ns.adobe.com/xap/1.0/": (C.SOFTWARE, "XMP namespace"),
+    b"jumdc2pa": (C.AI_PROVENANCE, "C2PA manifest box"),
+    b"+23.5505-046.6333": (C.LOCATION, "ISO 6709 coordinates"),
+}
+
+
+@pytest.mark.parametrize("signature", sorted(LONG), ids=lambda s: s.decode("latin-1"))
+def test_long_signatures_are_found_in_essential_spans(tmp_path, signature):
+    category, label = LONG[signature]
+    verdict = _clean_fails(tmp_path, _jpeg_before_eoi(b" " + signature + b" "), ".jpg", Mode.PRIVACY)
+    assert verdict.violations == [Finding(category, label, None, "SOS")]
+
+
+@pytest.mark.parametrize("signature", [b"GPS", b"jumb", b"c2pa", b"caBX"], ids=lambda s: s.decode())
+def test_short_signatures_are_not_searched_in_essential_spans(tmp_path, signature):
+    res, _ = _clean(tmp_path, _jpeg_before_eoi(b" " + signature + b" "), ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and res.verdict.violations == []
+
+
+def _icc_desc(text: str) -> bytes:
+    return make_icc(text, 2)  # v2 "desc": plain ASCII text inside the profile
+
+
+def test_kept_icc_profile_is_scanned_for_long_signatures_only(tmp_path):
+    profile = _icc_desc("GPS-calibrated display")  # a bare 3-byte "GPS" in a valid profile
+    res, out = _clean(tmp_path, _jpeg_after_soi(_segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + profile)), ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and profile in out
+
+
+def test_coordinates_split_across_icc_chunks_are_found_in_the_reassembled_profile(tmp_path):
+    profile = _icc_desc("Display GPS +23.5505-046.6333 office")
+    start = profile.index(b"+23.5505")
+    parts = [profile[: start + 3], profile[start + 3 : start + 9], profile[start + 9 :]]
+    chunks = b"".join(_segment(0xE2, b"ICC_PROFILE\x00" + bytes([i + 1, 3]) + p) for i, p in enumerate(parts))
+    data = _jpeg_after_soi(chunks)
+    assert b"+23.5505-046.6333" not in data  # no raw-byte scan can see it
+    verdict = _clean_fails(tmp_path, data, ".jpg", Mode.PRIVACY)
+    assert verdict.violations == [Finding(C.LOCATION, "ISO 6709 coordinates", None, "APP2:ICC")]
+
+
+def test_coordinates_inside_a_compressed_iccp_profile_are_found(tmp_path):
+    compressed = zlib.compress(_icc_desc("Display GPS +23.5505-046.6333 office"))
+    data = _bare_png(png_chunk(b"iCCP", b"ICC profile\x00\x00" + compressed))
+    assert b"+23.5505" not in data
+    verdict = _clean_fails(tmp_path, data, ".png", Mode.PRIVACY)
+    assert verdict.violations == [Finding(C.LOCATION, "ISO 6709 coordinates", None, "iCCP")]

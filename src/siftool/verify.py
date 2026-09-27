@@ -2,9 +2,11 @@
 
 `verify_file` re-parses a file with the same handlers used to clean it and
 never raises for a content problem: any read/parse failure degrades to
-`Verdict(FAILED, ...)`. It backs both the public `api.verify` (a direct
-check on any file) and `api.clean`'s "Verified Clean" seal, which calls it
-on the temporary output before ever replacing the destination.
+`Verdict(FAILED, ...)` with a note naming what could not be read
+(`"Cannot read file: ..."`, `"Cannot read original: ..."`). It backs both
+the public `api.verify` (a direct check on any file) and `api.clean`'s
+"Verified Clean" seal, which calls it on the temporary output before ever
+replacing the destination.
 
 `block_findings` (controller ruling R11, extended by R13) is the single
 place that decides what a `Block` "shows up as" for reporting/verification
@@ -19,14 +21,28 @@ Without this helper, either case would be invisible to `inspect`'s report,
 -- a removable-but-unremoved leftover block would otherwise silently pass
 as VERIFIED.
 
-Known limit (documented, not fixed here -- spec section 8's own "Limites"
-paragraph): verification covers metadata *structures* -- non-`ESSENTIAL`
-blocks, and whatever `scan_signatures` finds outside `ESSENTIAL` spans.
-Data hidden in the *values* of an otherwise-valid essential structure (a
-flag bit, a quantization value) or inside the compressed image data itself
-(steganography) is not detected; the "Verified Clean" seal guarantees the
-absence of non-standard metadata, not the absence of every hidden bit in
-the image itself.
+What the seal enforces (spec section 8, "Limites"; ruling R21):
+
+- Structures. Every handler validates the structures it trusts as
+  `ESSENTIAL` and rejects, drops or demotes to a scanned `UNKNOWN` block
+  whatever isn't in its standard shape (rulings R14-R20), so each
+  remaining non-`ESSENTIAL` block must show only findings the mode
+  allows; a block kept with a bad CRC (`Block.corrupt`) is a violation too.
+- Signatures (`scan_signatures`). Every non-`ESSENTIAL` block's bytes, and
+  any content a handler reassembled or inflated for it (`Block.logical`),
+  are searched for every entry of `SIGNATURES`. `ESSENTIAL` spans --
+  headers, tables and the compressed image data -- and kept ICC profiles
+  are searched for `LONG_SIGNATURES` only, where a 3- or 4-byte signature
+  would match by chance.
+
+Known limit: arbitrary text hidden in the values of a valid essential
+structure (a flag bit, a quantization value, an unused table) or in the
+compressed image data is not detected unless it contains one of the long
+signatures, and pixel-level steganography is not detected at all: the
+"Verified Clean" seal guarantees the absence of non-standard metadata
+structures and of the long signatures, not the absence of every hidden bit
+in the image itself. Follow-ups for M2: data after the end of a PNG's
+zlib stream (`unused_data`) and unreferenced JPEG DHT/DQT tables.
 """
 
 from __future__ import annotations
@@ -39,22 +55,41 @@ from .model import Block, Category, Container, Finding, Kind, Mode, Status, Verd
 from .modes import ALLOWED
 from .safe_io import load
 
-# spec section 8 step 4: byte signatures searched for outside of ESSENTIAL
-# spans, regardless of what a handler did or didn't classify there.
-SIGNATURES: list[tuple[bytes | re.Pattern[bytes], Category, str]] = [
+_Signature = tuple["bytes | re.Pattern[bytes]", Category, str]
+
+# spec section 8 step 4: byte signatures searched for regardless of what a
+# handler did or didn't classify there. The long ones are specific enough
+# never to match by chance in compressed image data (the review measured
+# 0 hits in 60.9 MiB of clean images), so they are searched everywhere,
+# ESSENTIAL spans and kept ICC profiles included (ruling R21).
+LONG_SIGNATURES: list[_Signature] = [
     (b"Exif\x00\x00", Category.UNKNOWN, "EXIF header"),
     (b"<x:xmpmeta", Category.SOFTWARE, "XMP packet"),
+    (b"http://ns.adobe.com/xap/1.0/", Category.SOFTWARE, "XMP namespace"),
+    (b"jumdc2pa", Category.AI_PROVENANCE, "C2PA manifest box"),
+    (re.compile(rb"[+-]\d{2}\.\d+[+-]\d{3}\.\d+"), Category.LOCATION, "ISO 6709 coordinates"),
+]
+
+# The short ones would match random bytes: searched only in the other,
+# non-ESSENTIAL blocks.
+SHORT_SIGNATURES: list[_Signature] = [
     (b"jumb", Category.AI_PROVENANCE, "JUMBF box"),
     (b"c2pa", Category.AI_PROVENANCE, "C2PA label"),
     (b"caBX", Category.AI_PROVENANCE, "C2PA chunk"),
-    (re.compile(rb"[+-]\d{2}\.\d+[+-]\d{3}\.\d+"), Category.LOCATION, "ISO 6709 coordinates"),
     (b"GPS", Category.LOCATION, "GPS marker"),
 ]
+
+SIGNATURES: list[_Signature] = LONG_SIGNATURES + SHORT_SIGNATURES
 
 # Block tags whose own job is to carry the EXIF header -- `scan_signatures`
 # never flags "EXIF header" found inside one of these, since that is
 # exactly where a legitimately-kept EXIF block's own signature belongs.
 EXIF_BLOCK_TAGS = frozenset({"APP1:Exif", "eXIf", "EXIF"})
+
+# Block tags of ICC profiles: when kept (METADATA), scanned -- raw bytes and
+# `Block.logical` alike -- for LONG_SIGNATURES only, since a large profile's
+# binary tables can hold a bare "GPS" by chance (ruling R20).
+ICC_BLOCK_TAGS = frozenset({"APP2:ICC", "iCCP", "ICCP"})
 
 
 def block_findings(block: Block) -> list[Finding]:
@@ -76,27 +111,37 @@ def block_findings(block: Block) -> list[Finding]:
     return [Finding(Category.UNKNOWN, block.label, None, block.tag, block.span.length)]
 
 
-def scan_signatures(container: Container) -> list[Finding]:
-    """Search every non-`ESSENTIAL` block's own bytes for a leftover `SIGNATURES` match.
+def _found(pattern: bytes | re.Pattern[bytes], data: bytes, start: int, end: int) -> bool:
+    """True if `pattern` occurs in `data[start:end]` (searched in place, never copied)."""
+    if isinstance(pattern, re.Pattern):
+        return pattern.search(data, start, end) is not None
+    return data.find(pattern, start, end) >= 0
 
-    A raw byte scan over `container.source[block.span.start:block.span.end]`
-    for every block that isn't `Kind.ESSENTIAL` -- independent of, and in
-    addition to, whatever a handler did or didn't classify there. The
-    `"EXIF header"` signature is ignored inside a block tagged
-    `EXIF_BLOCK_TAGS`, since that is a legitimately-kept EXIF block's own
-    header, not a leftover trace. Each match becomes a
+
+def scan_signatures(container: Container) -> list[Finding]:
+    """Search every block for a leftover signature (spec section 8 step 4, ruling R21).
+
+    A raw byte search, independent of, and in addition to, whatever a
+    handler did or didn't classify there, over each block's span in
+    `container.source` and over its `Block.logical` content when a handler
+    reassembled or inflated one (ruling R20). `ESSENTIAL` blocks and kept
+    ICC blocks (`ICC_BLOCK_TAGS`) are searched for `LONG_SIGNATURES` only;
+    every other block for all of `SIGNATURES`. The `"EXIF header"`
+    signature is ignored inside a block tagged `EXIF_BLOCK_TAGS`, since
+    that is a legitimately-kept EXIF block's own header, not a leftover
+    trace. Each signature found in a block becomes one
     `Finding(category, label, where=block.tag)`.
     """
     findings: list[Finding] = []
     for block in container.blocks:
-        if block.kind is Kind.ESSENTIAL:
-            continue
-        data = container.source[block.span.start : block.span.end]
-        for pattern, category, label in SIGNATURES:
+        long_only = block.kind is Kind.ESSENTIAL or (block.kind is Kind.METADATA and block.tag in ICC_BLOCK_TAGS)
+        regions = [(container.source, block.span.start, block.span.end)]
+        if block.logical is not None:
+            regions.append((block.logical, 0, len(block.logical)))
+        for pattern, category, label in LONG_SIGNATURES if long_only else SIGNATURES:
             if label == "EXIF header" and block.tag in EXIF_BLOCK_TAGS:
                 continue
-            matched = pattern.search(data) is not None if isinstance(pattern, re.Pattern) else pattern in data
-            if matched:
+            if any(_found(pattern, data, start, end) for data, start, end in regions):
                 findings.append(Finding(category, label, where=block.tag))
     return findings
 
@@ -108,14 +153,18 @@ def verify_file(path, mode: Mode = Mode.PRIVACY, original=None) -> Verdict:
     or `OSError` (unreadable, corrupt, unsupported, missing, ...) yields
     `Verdict(FAILED, [], [f"Cannot read file: {e}"])` rather than raising.
     Every remaining block's findings (via `block_findings`) whose category
-    isn't allowed by `mode` are violations; a signature match outside
-    `ESSENTIAL` spans (`scan_signatures`) is also a violation. A
-    non-removable `UNKNOWN` block left in place is not a violation but
-    produces a `f"Unrecognized structure kept: {tag}"` note instead. With
-    `original`, the two files' `essential_digest` are compared when (and
-    only when) they share the same format; a format mismatch is itself a
-    violation. Status is `FAILED` if there is any violation or the digests
-    differ, else `WARNINGS` if there is any note, else `VERIFIED`.
+    isn't allowed by `mode` are violations; so is every block kept with a
+    bad CRC (`Finding(UNKNOWN, "Corrupt structure", None, tag, size)`,
+    review M3) and every signature `scan_signatures` finds. A non-removable
+    `UNKNOWN` block left in place is not a violation but produces a
+    `f"Unrecognized structure kept: {tag}"` note instead. With `original`,
+    the two files' `essential_digest` are compared when (and only when)
+    they share the same format -- a mismatch adds the note `"Image data
+    differs from the original"`, and a format mismatch is itself a
+    violation; an original that can't be read ends the check with the note
+    `f"Cannot read original: {e}"` (ruling R23). Status is `FAILED` if
+    there is any violation, the digests differ or the original can't be
+    read, else `WARNINGS` if there is any note, else `VERIFIED`.
     """
     try:
         buf = load(path)
@@ -135,6 +184,8 @@ def verify_file(path, mode: Mode = Mode.PRIVACY, original=None) -> Verdict:
     # case: it is always Category.EXTRAS, which -- like UNKNOWN -- is never
     # allowed by any mode, so it is already caught by the same rule.
     for block in container.blocks:
+        if block.corrupt:
+            violations.append(Finding(Category.UNKNOWN, "Corrupt structure", None, block.tag, block.span.length))
         if block.kind is Kind.UNKNOWN and not block.removable:
             notes.append(f"Unrecognized structure kept: {block.tag}")
             continue
@@ -151,9 +202,12 @@ def verify_file(path, mode: Mode = Mode.PRIVACY, original=None) -> Verdict:
             ohandler = detect(obuf)
             ocontainer = ohandler.parse(obuf)
         except (SiftoolError, OSError) as e:
-            return Verdict(Status.FAILED, [], [f"Cannot read file: {e}"])
+            notes.append(f"Cannot read original: {e}")
+            return Verdict(Status.FAILED, violations, notes)
         if container.format == ocontainer.format:
             essential_match = handler.essential_digest(container) == ohandler.essential_digest(ocontainer)
+            if not essential_match:
+                notes.append("Image data differs from the original")
         else:
             essential_match = False
             violations.append(

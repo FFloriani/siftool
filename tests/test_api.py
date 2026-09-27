@@ -118,6 +118,33 @@ def _jpeg_with_app14(payload: bytes) -> bytes:
     base = base_jpeg()
     return base[:2] + segment + base[2:]
 
+# Ruling R23 (review I4, triage T9): a FAILED verdict always says why.
+
+def _flip_a_scan_bit(path):
+    data = bytearray(path.read_bytes()); i = len(data) - 10
+    while data[i] >= 0xFE or data[i - 1] == 0xFF: i -= 1   # não criar marcador falso no scan
+    data[i] ^= 0x01; path.write_bytes(bytes(data))
+
+def test_verify_notes_explain_every_failure(tmp_path):
+    src = write(tmp_path, "a.jpg", make_jpeg()); dst = tmp_path / "b.jpg"; siftool.clean(src, dst)
+    gif = write(tmp_path, "g.gif", b"GIF89a" + b"\x00" * 20)
+    v = siftool.verify(dst, original=gif)
+    assert (v.status, v.violations, v.notes) == (Status.FAILED, [], ["Cannot read original: GIF is not supported yet"])
+    v = siftool.verify(gif)
+    assert (v.status, v.violations, v.notes) == (Status.FAILED, [], ["Cannot read file: GIF is not supported yet"])
+    _flip_a_scan_bit(dst)
+    v = siftool.verify(dst, original=src)
+    assert (v.status, v.violations, v.notes) == (Status.FAILED, [], ["Image data differs from the original"])
+    assert v.essential_match is False
+
+def test_verify_fails_a_block_with_a_bad_crc(tmp_path):  # review M3
+    from fixtures.make_fixtures import png_chunk
+    png = make_png(icc=False, exif=False, xmp=False, ai_text=False, meta=False, c2pa=False, unknown_ancillary=False)
+    at = png.index(b"IDAT") - 4
+    bad = write(tmp_path, "crc.png", png[:at] + png_chunk(b"sRGB", b"\x00", bad_crc=True) + png[at:])
+    v = siftool.verify(bad)
+    assert (v.status, v.violations) == (Status.FAILED, [siftool.Finding(C.UNKNOWN, "Corrupt structure", None, "sRGB", 13)])
+
 def test_secret_in_oversize_adobe_segment_is_never_verified(tmp_path):
     standard = b"Adobe" + b"\x00\x64\x00\x00\x00\x00\x01"
     secret = b" GPS +23.5505-046.6333 owner=Felipe"
