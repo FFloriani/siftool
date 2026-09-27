@@ -17,6 +17,16 @@ def test_xmp_categories_and_generic_finding():
 def test_xmp_garbage_gives_only_generic():
     assert [f.label for f in xmp_findings(b"\xff\x00garbage", "x")] == ["XMP packet"]
 
+def test_xmp_detection_requires_exact_property_name():
+    bad = b"<rdf:Description><dc:creatorX>NotACreator</dc:creatorX></rdf:Description>"
+    assert not any(f.category is C.IDENTITY for f in xmp_findings(bad, "x"))
+    good = b"<rdf:Description><dc:creator>Felipe</dc:creator></rdf:Description>"
+    assert any(f.category is C.IDENTITY for f in xmp_findings(good, "x"))
+
+def test_xmp_attribute_after_tab_or_newline_is_detected():
+    packet = b'<rdf:Description\n\tdc:rights="(c) Felipe"/>'
+    assert any(f.category is C.IDENTITY for f in xmp_findings(packet, "x"))
+
 def test_c2pa_generator_and_ai_flag():
     [f] = c2pa_findings(make_c2pa_payload(), "APP11")
     assert f.category is C.AI_PROVENANCE and f.label == "C2PA manifest"

@@ -55,8 +55,20 @@ _AI_MARKERS = ("trainedAlgorithmicMedia", "compositeSynthetic", "algorithmicMedi
 
 
 def _present(text: str, prop: str) -> bool:
-    """True if `prop` appears as an element (`<prop`) or attribute (` prop=`)."""
-    return f"<{prop}" in text or f" {prop}=" in text
+    """True if `prop` appears as an exact element or attribute name.
+
+    Element form: `<` + `prop` immediately followed by whitespace, `/` or
+    `>` -- so `<dc:creatorX>` does not count as `dc:creator` present.
+    Attribute form: any whitespace character (space, tab, newline) before
+    `prop`, then optional whitespace and `=` -- so attributes separated by
+    a tab or newline are still found, while `dc:creatorX="..."` still does
+    not count as `dc:creator`.
+    """
+    escaped = re.escape(prop)
+    return bool(
+        re.search(r"<" + escaped + r"[\s/>]", text)
+        or re.search(r"\s" + escaped + r"\s*=", text)
+    )
 
 
 def _value(text: str, prop: str) -> str | None:
