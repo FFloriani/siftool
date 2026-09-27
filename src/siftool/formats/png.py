@@ -22,8 +22,9 @@ R19):
   colour type (and, for `tRNS` on a palette image, `PLTE`'s entry count).
 - Count and order (`_check_structure`): `IHDR` is the file's first chunk
   and appears exactly once; `acTL` at most once and before the first
-  `IDAT`; `fcTL`/`fdAT` only after an `acTL`; at least one `IDAT`, else
-  `CorruptFileError("missing image data")`.
+  `IDAT`; `fcTL`/`fdAT` only after an `acTL`. And a file reaching `IEND`
+  without any `IDAT` is `CorruptFileError("missing image data")`
+  (`_read_chunks`).
 - A palette image (colour type 3) has exactly one `PLTE`, before its first
   `IDAT`, holding a whole number of 3-byte entries, 1 to `2**bit_depth`
   (at most 256) of them (`_check_palette`, `"invalid PLTE"`). In any other
