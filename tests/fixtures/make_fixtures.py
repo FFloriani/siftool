@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import struct
 import warnings
+import zlib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -453,6 +454,134 @@ def make_jpeg(
         extra += b"\xff\xff"
 
     return head + app0 + bytes(extra) + rest + trailing
+
+
+# ---------------------------------------------------------------------------
+# PNG builders (Task 7)
+# ---------------------------------------------------------------------------
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_SIZE = 16
+
+
+def png_chunk(ctype: bytes, data: bytes, *, bad_crc: bool = False) -> bytes:
+    """Build one complete PNG chunk: length(4BE) + type(4) + data + CRC32(4BE).
+
+    `bad_crc=True` flips every bit of the correct CRC (bitwise complement),
+    which is always different from the correct value -- an easy,
+    deterministic way to make the chunk fail its CRC check.
+    """
+    crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+    if bad_crc:
+        crc ^= 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", crc)
+
+
+def _png_rows(width: int, height: int) -> bytes:
+    """One scanline per row, each prefixed with filter-type 0 (None): a
+    plain per-pixel gradient (R follows x, G follows y, B follows x+y),
+    same formula as `base_jpeg`'s, for a deterministic 8-bit RGB image."""
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            rows += bytes((
+                x * 255 // (width - 1),
+                y * 255 // (height - 1),
+                (x + y) * 255 // (width + height - 2),
+            ))
+    return bytes(rows)
+
+
+def _fctl(sequence_number: int, width: int, height: int) -> bytes:
+    """APNG `fcTL` data: sequence number + a full-canvas frame at (0,0)."""
+    return struct.pack(">IIIIIHHBB", sequence_number, width, height, 0, 0, 1, 1, 0, 0)
+
+
+def _corrupt_first(chunks: list[bytes], ctype: bytes) -> list[bytes]:
+    """Return `chunks` with the first chunk of type `ctype` CRC-corrupted."""
+    out = list(chunks)
+    for i, chunk in enumerate(out):
+        if chunk[4:8] == ctype:
+            crc = (int.from_bytes(chunk[-4:], "big") ^ 0xFFFFFFFF) & 0xFFFFFFFF
+            out[i] = chunk[:-4] + struct.pack(">I", crc)
+            break
+    return out
+
+
+def make_png(
+    *,
+    icc: bool = True,
+    exif: bool = True,
+    xmp: bool = True,
+    ai_text: bool = True,
+    meta: bool = True,
+    c2pa: bool = True,
+    unknown_ancillary: bool = True,
+    trailing: bytes = b"",
+    apng: bool = False,
+    bad_crc: str | None = None,
+    extra_chunks: list[bytes] = (),
+) -> bytes:
+    """Build a synthetic 16x16 RGB8 PNG exercising every chunk `PngHandler` classifies.
+
+    Layout: `IHDR`, then (if `icc`) `iCCP`/`sRGB`/`gAMA`/`cHRM`/`pHYs` (must
+    precede `IDAT`), then (if `apng`) `acTL` + a frame-0 `fcTL`, one `IDAT`
+    (a plain gradient, filter 0), then (if `apng`) a frame-1 `fcTL` + `fdAT`
+    (same pixels), then (if `exif`) `eXIf`, (if `xmp`) an iTXt `XML:com.
+    adobe.xmp`, (if `ai_text`) a `parameters` tEXt and a `Comment` zTXt
+    with a JSON `"prompt"`, (if `meta`) `Author`/`Software`/`Title` tEXt
+    plus `tIME`, (if `c2pa`) `caBX`, (if `unknown_ancillary`) a 9-byte
+    `vpAg`, then `extra_chunks` (already-complete chunks) and `IEND`.
+    `bad_crc="<type>"` corrupts the CRC of the first chunk of that type
+    (checked after `extra_chunks` are added, so it can target those too).
+    `trailing` is appended after `IEND`.
+    """
+    chunks: list[bytes] = [
+        png_chunk(b"IHDR", struct.pack(">IIBBBBB", _PNG_SIZE, _PNG_SIZE, 8, 2, 0, 0, 0))
+    ]
+
+    if icc:
+        chunks.append(png_chunk(b"iCCP", b"icc\x00\x00" + zlib.compress(make_icc("Display P3"))))
+        chunks.append(png_chunk(b"sRGB", bytes([0])))
+        chunks.append(png_chunk(b"gAMA", struct.pack(">I", 45455)))
+        chunks.append(png_chunk(b"cHRM", struct.pack(">8I", 31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000)))
+        chunks.append(png_chunk(b"pHYs", struct.pack(">IIB", 2835, 2835, 1)))
+
+    if apng:
+        chunks.append(png_chunk(b"acTL", struct.pack(">II", 2, 0)))
+        chunks.append(png_chunk(b"fcTL", _fctl(0, _PNG_SIZE, _PNG_SIZE)))
+
+    chunks.append(png_chunk(b"IDAT", zlib.compress(_png_rows(_PNG_SIZE, _PNG_SIZE))))
+
+    if apng:
+        chunks.append(png_chunk(b"fcTL", _fctl(1, _PNG_SIZE, _PNG_SIZE)))
+        chunks.append(png_chunk(b"fdAT", struct.pack(">I", 2) + zlib.compress(_png_rows(_PNG_SIZE, _PNG_SIZE))))
+
+    if exif:
+        chunks.append(png_chunk(b"eXIf", make_tiff_exif(">")))
+    if xmp:
+        chunks.append(png_chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + make_xmp()))
+    if ai_text:
+        chunks.append(png_chunk(b"tEXt", b"parameters\x00a cat, Steps: 20, Seed: 123456"))
+        chunks.append(png_chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(b'{"prompt": "a cat"}')))
+    if meta:
+        chunks.append(png_chunk(b"tEXt", b"Author\x00Felipe"))
+        chunks.append(png_chunk(b"tEXt", b"Software\x00TestSoftware"))
+        chunks.append(png_chunk(b"tEXt", b"Title\x00My title"))
+        chunks.append(png_chunk(b"tIME", struct.pack(">HBBBBB", 2026, 9, 26, 3, 30, 7)))
+    if c2pa:
+        chunks.append(png_chunk(b"caBX", make_c2pa_payload()))
+    if unknown_ancillary:
+        chunks.append(png_chunk(b"vpAg", b"\x00" * 9))
+
+    chunks.extend(extra_chunks)
+    chunks.append(png_chunk(b"IEND", b""))
+
+    if bad_crc is not None:
+        chunks = _corrupt_first(chunks, bad_crc.encode())
+
+    return PNG_SIGNATURE + b"".join(chunks) + trailing
 
 
 def decode_pixels(data: bytes) -> list[bytes]:
