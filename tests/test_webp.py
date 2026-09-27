@@ -20,8 +20,10 @@ def test_parse_extended_lossless():
 def test_privacy_updates_flags_and_riff_size():
     out = clean_bytes(make_webp("lossless", trailing=b"tail"))
     assert struct.unpack("<I", out[4:8])[0] == len(out) - 8
-    assert flags(out) & VP8X_ICC and not flags(out) & (VP8X_EXIF | VP8X_XMP)
-    assert {t for t, _ in riff_chunks(out)} <= {b"VP8X", b"VP8L", b"ICCP", b"ALPH"}
+    assert flags(out) & VP8X_ICC and flags(out) & VP8X_EXIF and not flags(out) & VP8X_XMP
+    assert {t for t, _ in riff_chunks(out)} <= {b"VP8X", b"VP8L", b"ICCP", b"ALPH", b"EXIF"}
+    [exif] = [b for b in H.parse(out).blocks if b.tag == "EXIF"]
+    assert {f.label for f in exif.findings} == {"Orientation", "ColorSpace"}
 
 def test_maximum_clears_icc_and_photographer_keeps_exif():
     assert not flags(clean_bytes(make_webp("lossy"), Mode.MAXIMUM)) & VP8X_ICC

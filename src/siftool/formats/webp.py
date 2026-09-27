@@ -20,16 +20,12 @@ way as JPEG/PNG's; `"XMP "` and `C2PA` are always removed in every mode
 (XMP's generic "software" finding and C2PA's `ai_provenance` are never in
 any mode's whitelist); anything else is unknown and removable.
 
-`EXIF`'s rewrite has one rule beyond JPEG/PNG's plain minimize-and-keep:
-if nothing beyond `appearance` (Orientation, ColorSpace) would survive the
-whitelist, the whole chunk is dropped rather than kept as a near-empty
-shell -- unlike JPEG/PNG, WEBP viewers don't act on those two EXIF tags,
-and a WEBP already carries `appearance` via `ICCP` independently, so an
-EXIF chunk reduced to just them adds bytes without adding anything a WEBP
-viewer would use (see `_rewrite_exif`; this mirrors the reasoning PNG's
-own EXIF rewrite used before commit 48592d8 corrected it for PNG
-specifically, where the opposite is true: PNG viewers *do* act on eXIf's
-Orientation).
+`EXIF` follows the same minimize-and-keep rule as JPEG/PNG (spec section 6:
+`appearance` -- orientation, color -- is kept by every mode except MAXIMUM,
+for WEBP exactly as for the other two formats): `rewrite` keeps whatever
+`build_minimal_exif` returns for the mode's whitelist, dropping the chunk
+only when nothing at all is left to keep. Mode policy lives entirely in
+`modes.ALLOWED` and the planner, never inside this handler.
 
 `write` recomputes the RIFF size and rewrites `VP8X`'s one flags byte
 (the `ICC`/`EXIF`/`XMP` bits -- `VP8X_ICC`/`VP8X_EXIF`/`VP8X_XMP`) to match
@@ -239,15 +235,13 @@ def _patched_vp8x(source: bytes, block: Block, extra_flags: int) -> bytes:
 def _rewrite_exif(block: Block, allowed: frozenset[Category]) -> bytes | None:
     """`b"EXIF" + size(4LE) + build_minimal_exif(...) + pad`, or None.
 
-    Unlike JPEG/PNG, WEBP viewers do not act on an EXIF chunk's
-    Orientation or ColorSpace tags, and a WEBP already carries appearance
-    via its own `ICCP` -- so a trimmed EXIF chunk is only worth keeping
-    when something beyond `Category.APPEARANCE` survives into it (see the
-    module docstring).
+    Same semantics as JPEG's/PNG's EXIF rewrite (spec section 6:
+    `appearance` -- orientation, color -- is kept by every mode except
+    MAXIMUM, for WEBP exactly as for JPEG/PNG). Mode policy lives entirely
+    in `modes.ALLOWED` and the planner; this always keeps whatever
+    `allowed` permits.
     """
-    if allowed <= {Category.APPEARANCE}:
-        return None
-    minimal = build_minimal_exif(block.raw, allowed)
+    minimal = build_minimal_exif(strip_exif_header(block.raw), allowed)
     if minimal is None:
         return None
     pad = b"\x00" if len(minimal) % 2 else b""
