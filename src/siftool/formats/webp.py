@@ -42,6 +42,13 @@ own declared end, a RIFF size that runs past the actual file, or a `VP8X`/
 each is copied byte-for-byte and never signature-scanned by `verify`, spec
 section 8, so trusting either at the wrong size would let it smuggle
 anything) are all `CorruptFileError`, never an unguarded exception.
+
+Repeating a structure at its own legal size is just as unscanned and
+trusted as an oversize one, so count and order are enforced too (ruling
+R15): a `VP8X` is optional, but if present must be the container's very
+first chunk and appear at most once; an `ANIM` may appear at most once,
+and only when `VP8X`'s own animation flag (`VP8X_ANIM`, bit `0x02`) is set
+-- both `CorruptFileError` on violation (`_check_structure`).
 """
 
 from __future__ import annotations
@@ -65,6 +72,7 @@ from .base import copy_span
 VP8X_ICC = 0x20
 VP8X_EXIF = 0x08
 VP8X_XMP = 0x04
+VP8X_ANIM = 0x02
 _VP8X_META_MASK = VP8X_ICC | VP8X_EXIF | VP8X_XMP
 
 # Chunks that decode pixels, per spec table 7.3 -- copied byte-for-byte by
@@ -147,6 +155,11 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     RIFF's own declared end. Returns `(blocks, riff_end)`; the caller
     treats anything from `riff_end` to `len(buf)` as trailing data. Never
     raises anything but `CorruptFileError` on a malformed structure.
+
+    Tracks the cross-chunk state `_check_structure` (count/order, ruling
+    R15) needs: `index` (this chunk's position, for "`VP8X` must be
+    first"), and `VP8X`'s own flags byte once seen (for "`ANIM` only when
+    the animation flag is set").
     """
     n = len(buf)
     if buf[:4] != b"RIFF" or buf[8:12] != b"WEBP":
@@ -159,6 +172,9 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
 
     blocks: list[Block] = []
     p = 12
+    index = 0
+    vp8x_flags: int | None = None
+    seen_anim = False
     while p < riff_end:
         if p + 8 > riff_end:
             raise CorruptFileError("truncated WEBP chunk header")
@@ -170,10 +186,37 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
             raise CorruptFileError(f"chunk {fourcc!r} exceeds RIFF end")
         pad = 1 if size % 2 and data_end + 1 <= riff_end else 0
         chunk_end = data_end + pad
+        payload = buf[data_start:data_end]
 
-        blocks.append(_classify_chunk(Span(p, chunk_end), fourcc, buf[data_start:data_end]))
+        _check_structure(fourcc, index, vp8x_flags, seen_anim)
+        blocks.append(_classify_chunk(Span(p, chunk_end), fourcc, payload))
+
+        if fourcc == b"VP8X" and len(payload) == 10:
+            vp8x_flags = payload[0]
+        elif fourcc == b"ANIM":
+            seen_anim = True
+
+        index += 1
         p = chunk_end
     return blocks, riff_end
+
+
+def _check_structure(fourcc: bytes, index: int, vp8x_flags: int | None, seen_anim: bool) -> None:
+    """Count/order rules for `VP8X`/`ANIM` (ruling R15).
+
+    `VP8X` is optional, but if present must be the container's very first
+    top-level chunk (so "at most once" follows for free: any later `VP8X`
+    is already caught by not being first). `ANIM` may appear at most once,
+    and only once a `VP8X` with its animation flag set has already been
+    seen. `CorruptFileError("invalid <TYPE>")` on violation -- the same
+    message a wrong size would raise, since both are the same underlying
+    problem: a structure trusted as `ESSENTIAL` (and so never
+    signature-scanned) that isn't actually what it claims to be.
+    """
+    if fourcc == b"VP8X" and index != 0:
+        raise CorruptFileError("invalid VP8X")
+    if fourcc == b"ANIM" and (seen_anim or vp8x_flags is None or not vp8x_flags & VP8X_ANIM):
+        raise CorruptFileError("invalid ANIM")
 
 
 def _classify_chunk(span: Span, fourcc: bytes, payload: bytes) -> Block:

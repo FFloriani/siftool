@@ -4,19 +4,38 @@ A JPEG is a sequence of marker segments starting with `SOI` (`0xFFD8`) and
 ending with `EOI` (`0xFFD9`); anything after `EOI` is a `TRAILING` block
 (Motion Photo video, an MPF secondary image, a Samsung SEFT trailer, ...).
 Segments that define how pixels decode (`DQT`/`DHT`/`SOF`/`SOS` plus its
-entropy-coded data/`EOI`/a standard, exactly-12-byte Adobe `APP14`
-color-transform marker) are `ESSENTIAL`: `write` always copies them
-byte-for-byte from the source, so `essential_digest` is unchanged by
-cleaning -- the "bit-for-bit" proof behind the Verified Clean seal.
-Everything else is metadata, classified into privacy categories per spec
-table 7.1 and either kept, dropped, or (EXIF, and JFIF carrying a
+entropy-coded data/`EOI`/`DRI`/`DNL`/the FIRST standard, exactly-12-byte
+Adobe `APP14` color-transform marker) are `ESSENTIAL`: `write` always
+copies them byte-for-byte from the source, so `essential_digest` is
+unchanged by cleaning -- the "bit-for-bit" proof behind the Verified Clean
+seal. Everything else is metadata, classified into privacy categories per
+spec table 7.1 and either kept, dropped, or (EXIF, and JFIF carrying a
 thumbnail) rewritten by the planner.
 
-An `APP14` starting with `b"Adobe"` at any size other than that one fixed
-12 bytes is kept -- dropping it would shift a CMYK JPEG's colors -- but as
-a non-removable `UNKNOWN` block instead of `ESSENTIAL` (Task 9b), so it is
-covered by `verify`'s signature scan (spec section 8) rather than trusted
-unscanned like a real Adobe marker.
+Every one of those ESSENTIAL structures is copied byte-for-byte and never
+reached by `verify`'s signature scan (spec section 8), so each is only
+trusted at exactly the shape a decoder actually needs, never merely "close
+enough" (ruling R15, closing gaps a first pass at Task 9b left open):
+
+- `DRI`/`DNL` must be exactly 2 bytes (their one field), `CorruptFileError`
+  otherwise.
+- An `APP14` starting with `b"Adobe"` is ESSENTIAL only the FIRST time it
+  appears, and only at that one fixed 12-byte payload. Repeating it --
+  even at that same legal size, which is how a first pass at this task's
+  fix could still be bypassed -- or any size mismatch, demotes it (and
+  every later Adobe-signature `APP14`) to a non-removable `UNKNOWN` block
+  tagged plainly `"APP14"`; it's kept (dropping it would shift a CMYK
+  JPEG's colors) but now covered by `verify`'s signature scan rather than
+  trusted unscanned like the one real Adobe marker.
+- `SOF0`-`SOF15`/`SOS`/`DQT`/`DHT`'s declared length must equal what their
+  own content implies (`SOF`: `8 + 3*Nf`; `SOS`: `6 + 2*Ns`; `DQT`: the sum
+  over its tables of 65 or 129 bytes each, 8-/16-bit precision; `DHT`: the
+  sum over its tables of `17 + sum(16 code-length counts)`). Unlike a
+  count/order or DRI/DNL/VP8X-family violation, this one does NOT raise --
+  dropping or rejecting the segment would break decoding -- it demotes the
+  segment (bytes unchanged) to a non-removable `UNKNOWN` block tagged
+  `f"{NAME}?"` (e.g. `"DQT?"`), so it's kept but signature-scanned instead
+  of trusted unscanned.
 
 Fill bytes (extra `0xFF` before a marker) are tolerated on read and, since
 they are folded into the following block's span, reproduced unchanged
@@ -194,8 +213,17 @@ def _scan_to_next_marker(data: bytes, p: int) -> int:
 
 
 def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
-    """Convert raw segments into `Block`s, merging multi-segment ICC profiles."""
+    """Convert raw segments into `Block`s, merging multi-segment ICC profiles.
+
+    Tracks `seen_standard_adobe` across the whole file: only the FIRST
+    Adobe-signature `APP14` can become the `ESSENTIAL` `"APP14:Adobe"`
+    (ruling R15 -- a repeat, even at the same legal 12-byte size, is not
+    trusted). This one piece of cross-segment state is why the Adobe
+    `APP14` case is intercepted here rather than left inside `_classify`/
+    `_classify_app`, which are otherwise stateless per segment.
+    """
     blocks: list[Block] = []
+    seen_standard_adobe = False
     i = 0
     while i < len(segments):
         span, code, payload = segments[i]
@@ -211,6 +239,11 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
         elif code == 0xE2 and payload.startswith(_ICC_SIG):
             block, i = _classify_icc_run(segments, i)
             blocks.append(block)
+        elif code == 0xEE and payload.startswith(_ADOBE_SIG):
+            block = _classify_adobe(span, payload, seen_standard_adobe)
+            seen_standard_adobe = seen_standard_adobe or block.kind is Kind.ESSENTIAL
+            blocks.append(block)
+            i += 1
         else:
             blocks.append(_classify(code, span, payload))
             i += 1
@@ -218,21 +251,43 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]]) -> list[Block]:
 
 
 def _classify(code: int, span: Span, payload: bytes) -> Block:
-    """Classify one non-SOI/EOI/RST/ICC segment into its `Block`."""
+    """Classify one non-SOI/EOI/RST/ICC/Adobe-APP14 segment into its `Block`.
+
+    `SOF`/`SOS`/`DQT`/`DHT` additionally check that the declared length
+    (`len(payload)`, i.e. the segment's own length field minus itself)
+    matches what the payload's content implies (ruling R15); a mismatch
+    demotes the segment to a scanned, non-removable `UNKNOWN` block
+    instead of raising -- `_demoted`. `DRI`/`DNL` must be exactly 2 bytes,
+    `CorruptFileError` otherwise -- same as any other fixed-size essential
+    structure at the wrong size (Task 9b).
+    """
     if code in _SOF_CODES:
         n = code - 0xC0
-        return Block(Kind.ESSENTIAL, span, f"Start of Frame {n}", f"SOF{n}")
+        name = f"SOF{n}"
+        if not _sof_payload_len_ok(payload):
+            return _demoted(span, name, payload)
+        return Block(Kind.ESSENTIAL, span, f"Start of Frame {n}", name)
     if code == 0xC4:
+        if not _dht_payload_len_ok(payload):
+            return _demoted(span, "DHT", payload)
         return Block(Kind.ESSENTIAL, span, "Huffman Table", "DHT")
     if code == 0xCC:
         return Block(Kind.ESSENTIAL, span, "Arithmetic Coding Conditioning", "DAC")
     if code == 0xDB:
+        if not _dqt_payload_len_ok(payload):
+            return _demoted(span, "DQT", payload)
         return Block(Kind.ESSENTIAL, span, "Quantization Table", "DQT")
     if code == 0xDD:
+        if len(payload) != 2:
+            raise CorruptFileError("invalid DRI")
         return Block(Kind.ESSENTIAL, span, "Restart Interval", "DRI")
     if code == 0xDC:
+        if len(payload) != 2:
+            raise CorruptFileError("invalid DNL")
         return Block(Kind.ESSENTIAL, span, "Number of Lines", "DNL")
     if code == 0xDA:
+        if not _sos_payload_len_ok(payload):
+            return _demoted(span, "SOS", payload)
         return Block(Kind.ESSENTIAL, span, "Start of Scan", "SOS")
     if 0xE0 <= code <= 0xEF:
         return _classify_app(code, span, payload)
@@ -248,12 +303,80 @@ def _classify(code: int, span: Span, payload: bytes) -> Block:
     return Block(Kind.UNKNOWN, span, f"Unknown marker 0x{code:02X}", f"UNK:0x{code:02X}", removable=True)
 
 
+def _sof_payload_len_ok(payload: bytes) -> bool:
+    """`SOF`: precision(1) + height(2) + width(2) + Nf(1) + Nf*3 bytes."""
+    if len(payload) < 6:
+        return False
+    nf = payload[5]
+    return len(payload) == 6 + 3 * nf
+
+
+def _sos_payload_len_ok(payload: bytes) -> bool:
+    """`SOS` header: Ns(1) + Ns*2 bytes + Ss(1) + Se(1) + AhAl(1).
+
+    Only the header is checked -- `payload` here never includes the
+    entropy-coded scan data that follows (`_read_segments` keeps that in
+    the same segment's span, but not in `payload`).
+    """
+    if len(payload) < 1:
+        return False
+    ns = payload[0]
+    return len(payload) == 4 + 2 * ns
+
+
+def _dqt_payload_len_ok(payload: bytes) -> bool:
+    """`DQT`: one or more back-to-back tables, each Pq/Tq(1) + 64 values
+    (1 byte each if Pq=0, 2 if Pq=1) -- 65 or 129 bytes."""
+    pos, n = 0, len(payload)
+    while pos < n:
+        pq = payload[pos] >> 4
+        table_size = 1 + (128 if pq else 64)
+        if pos + table_size > n:
+            return False
+        pos += table_size
+    return pos == n
+
+
+def _dht_payload_len_ok(payload: bytes) -> bool:
+    """`DHT`: one or more back-to-back tables, each Tc/Th(1) + 16 code-length
+    counts + sum(counts) values -- `17 + sum(counts)` bytes."""
+    pos, n = 0, len(payload)
+    while pos < n:
+        if pos + 17 > n:
+            return False
+        table_size = 17 + sum(payload[pos + 1 : pos + 17])
+        if pos + table_size > n:
+            return False
+        pos += table_size
+    return pos == n
+
+
+def _demoted(span: Span, name: str, payload: bytes) -> Block:
+    """A `SOF`/`SOS`/`DQT`/`DHT` segment whose declared length disagrees
+    with what its own content implies (ruling R15): kept, byte-for-byte,
+    since dropping or rejecting it would break decoding -- but demoted to
+    a non-removable `UNKNOWN` block tagged `f"{name}?"`, so `verify`'s
+    signature scan (spec section 8) covers it instead of trusting it
+    unscanned like a real, internally-consistent one.
+    """
+    tag = f"{name}?"
+    label = f"Non-standard {name} segment"
+    return Block(
+        Kind.UNKNOWN, span, label, tag,
+        findings=[Finding(Category.UNKNOWN, label, None, tag, len(payload))],
+        removable=False,
+    )
+
+
 def _classify_app(code: int, span: Span, payload: bytes) -> Block:
     """Classify an APP0-APP15 segment by its content signature.
 
     Any APPn whose payload doesn't match a known signature (including
-    every APP3-APP10) falls back to an `UNKNOWN`, removable block tagged
-    `f"APP{n}"` -- table 7.1's "Demais APPn -> unknown removivel".
+    every APP3-APP10, and an APP14 that doesn't start with `b"Adobe"`)
+    falls back to an `UNKNOWN`, removable block tagged `f"APP{n}"` --
+    table 7.1's "Demais APPn -> unknown removivel". An Adobe-signature
+    APP14 never reaches here: `_classify_segments` intercepts it directly,
+    since classifying it needs cross-segment state (`_classify_adobe`).
     """
     n = code - 0xE0
     if code == 0xE0 and payload.startswith(_JFIF_SIG):
@@ -296,23 +419,25 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
             Kind.METADATA, span, "Photoshop IRB", "APP13:IRB",
             findings=iptc_findings(payload, "APP13/IRB"),
         )
-    if code == 0xEE and payload.startswith(_ADOBE_SIG):
-        return _classify_adobe(span, payload)
     return Block(Kind.UNKNOWN, span, f"Unknown APP{n}", f"APP{n}", removable=True)
 
 
-def _classify_adobe(span: Span, payload: bytes) -> Block:
-    """APP14 `Adobe`: `ESSENTIAL` only at its one fixed 12-byte payload.
+def _classify_adobe(span: Span, payload: bytes, already_have_standard: bool) -> Block:
+    """APP14 `Adobe`: `ESSENTIAL` only for the FIRST occurrence, and only at
+    its one fixed 12-byte payload (ruling R15: a *repeated* Adobe APP14,
+    even at that same legal size, is not trusted either -- only the first
+    one is what any real decoder honors, and a reviewer showed that six
+    12-byte Adobe segments could each carry a slice of a hidden secret
+    while every one of them passed a size-only check).
 
-    Any other size is kept -- dropping it would shift a CMYK JPEG's colors
-    -- but demoted to a non-removable `UNKNOWN` block (Task 9b: a reviewer
-    hid a secret inside an oversize one and it came back "verified", since
-    an `ESSENTIAL` block is copied byte-for-byte and never reaches
-    `verify`'s signature scan). Tagged plainly `"APP14"`, not
-    `"APP14:Adobe"`, so it reads as the same non-standard-and-unscanned
-    structure regardless of which way its size is wrong.
+    Any other size, or any Adobe APP14 after the first standard one, is
+    kept -- dropping it would shift a CMYK JPEG's colors -- but demoted to
+    a non-removable `UNKNOWN` block tagged plainly `"APP14"`, not
+    `"APP14:Adobe"`, so it reads as the same non-standard structure either
+    way and is covered by `verify`'s signature scan (spec section 8)
+    rather than trusted unscanned like the one real Adobe marker.
     """
-    if len(payload) == _ADOBE_PAYLOAD_LEN:
+    if not already_have_standard and len(payload) == _ADOBE_PAYLOAD_LEN:
         return Block(Kind.ESSENTIAL, span, "Adobe color transform", "APP14:Adobe")
     label = "Non-standard Adobe segment"
     return Block(

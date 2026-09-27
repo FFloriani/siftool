@@ -11,11 +11,20 @@ metadata, classified into privacy categories per spec table 7.2 and either
 kept, dropped, or (`eXIf`) rewritten by the planner.
 
 `IHDR`/`IEND`/`acTL`/`fcTL` additionally have a payload size fixed by the
-format itself (13/0/8/26 bytes); any other size is `CorruptFileError`
-(Task 9b) -- an `ESSENTIAL` chunk is copied byte-for-byte and never
+format itself (13/0/8/26 bytes), and `tRNS`/`sBIT`'s payload size is fixed
+by `IHDR`'s own colour type (and, for `tRNS` on an indexed image, `PLTE`'s
+entry count); any size outside what's allowed is `CorruptFileError` (Task
+9b) -- an `ESSENTIAL` chunk is copied byte-for-byte and never
 signature-scanned by `verify` (spec section 8), so trusting one at a size
 it was never meant to have would let it smuggle anything. `PLTE`/`IDAT`/
-`tRNS`/`sBIT`/`fdAT` are legitimately variable-length and keep no such check.
+`fdAT` are legitimately variable-length and keep no size check.
+
+Repeating a structure at its own legal size is just as unscanned and
+trusted as an oversize one, so count and order are enforced too (ruling
+R15): `IHDR` must be the file's first chunk and appear exactly once; `acTL`
+at most once and before the first `IDAT`; `fcTL`/`fdAT` only after an
+`acTL`. Violating any of these is the same `CorruptFileError` as a wrong
+size (`_check_structure`).
 
 A chunk type's first letter's case is the PNG spec's own critical/ancillary
 flag: an unrecognized chunk starting with an uppercase letter is critical
@@ -58,9 +67,14 @@ _ESSENTIAL_TYPES = frozenset(
 )
 
 # Essential chunks whose payload size the format itself fixes (Task 9b):
-# any other size is CorruptFileError. PLTE/IDAT/tRNS/sBIT/fdAT are
-# legitimately variable-length and are not in this table.
+# any other size is CorruptFileError. tRNS/sBIT's size instead depends on
+# IHDR's colour type -- see _trns_size_ok / _SBIT_SIZE_BY_COLOUR_TYPE.
+# PLTE/IDAT/fdAT are legitimately variable-length and are not size-checked.
 _FIXED_ESSENTIAL_SIZES: dict[bytes, int] = {b"IHDR": 13, b"IEND": 0, b"acTL": 8, b"fcTL": 26}
+
+# sBIT's payload size by IHDR colour type (0/2/3/4/6 -- 1/5 don't exist).
+_SBIT_SIZE_BY_COLOUR_TYPE: dict[int, int] = {0: 1, 2: 3, 3: 3, 4: 2, 6: 4}
+
 _APPEARANCE_TYPES = frozenset({b"iCCP", b"sRGB", b"gAMA", b"cHRM", b"cICP", b"mDCV", b"cLLI", b"pHYs"})
 _AI_PROVENANCE_TYPES = frozenset({b"caBX", b"cPRV"})
 _TEXT_TYPES = frozenset({b"tEXt", b"zTXt", b"iTXt"})
@@ -143,6 +157,12 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     file order -- is what gets raised. Returns `(blocks, iend_end)`; the
     caller treats anything from `iend_end` to `len(buf)` as trailing data.
     Never raises anything but `CorruptFileError`/`UnsafeFileError`.
+
+    Tracks the handful of pieces of cross-chunk state `_check_structure`
+    (count/order, ruling R15) and the `tRNS`/`sBIT` size check need:
+    `index` (this chunk's position, for "`IHDR` must be first"), whether an
+    `acTL`/`IDAT` has already been seen, `IHDR`'s own colour type, and
+    `PLTE`'s entry count.
     """
     n = len(buf)
     if buf[:8] != _SIGNATURE:
@@ -150,6 +170,11 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
 
     blocks: list[Block] = []
     p = 8
+    index = 0
+    seen_actl = False
+    seen_idat = False
+    colour_type: int | None = None
+    plte_entries: int | None = None
     while True:
         if p + 8 > n:
             raise CorruptFileError("truncated PNG (missing IEND)")
@@ -163,13 +188,51 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
         data = buf[data_start:data_end]
         crc = int.from_bytes(buf[data_end:crc_end], "big")
 
-        blocks.append(_classify_chunk(Span(p, crc_end), ctype, data, crc))
+        _check_structure(ctype, index, seen_actl, seen_idat)
+        blocks.append(_classify_chunk(Span(p, crc_end), ctype, data, crc, colour_type, plte_entries))
+
+        if ctype == b"IHDR":
+            colour_type = data[9]
+        elif ctype == b"PLTE":
+            plte_entries = len(data) // 3
+        elif ctype == b"acTL":
+            seen_actl = True
+        elif ctype == b"IDAT":
+            seen_idat = True
+
+        index += 1
         p = crc_end
         if ctype == b"IEND":
             return blocks, p
 
 
-def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
+def _check_structure(ctype: bytes, index: int, seen_actl: bool, seen_idat: bool) -> None:
+    """Count/order rules for `IHDR`/`acTL`/`fcTL`/`fdAT` (ruling R15).
+
+    `IHDR` must be the very first chunk and appear exactly once (checking
+    both "the first chunk is IHDR" and "IHDR is only ever the first chunk"
+    together catches every way to violate either half); `acTL` at most
+    once and before the first `IDAT`; `fcTL`/`fdAT` only once an `acTL` has
+    already been seen. Each violation is `CorruptFileError("invalid
+    <TYPE>")` -- the same message a wrong size would raise, since both are
+    the same underlying problem: a structure trusted as `ESSENTIAL` (and so
+    never signature-scanned) that isn't actually what it claims to be.
+    """
+    if index == 0:
+        if ctype != b"IHDR":
+            raise CorruptFileError("invalid IHDR")
+        return
+    if ctype == b"IHDR":
+        raise CorruptFileError("invalid IHDR")
+    if ctype == b"acTL" and (seen_actl or seen_idat):
+        raise CorruptFileError("invalid acTL")
+    if ctype in (b"fcTL", b"fdAT") and not seen_actl:
+        raise CorruptFileError(f"invalid {ctype.decode('ascii')}")
+
+
+def _classify_chunk(
+    span: Span, ctype: bytes, data: bytes, crc: int, colour_type: int | None, plte_entries: int | None
+) -> Block:
     """Classify one chunk into its `Block`, per spec table 7.2.
 
     A CRC mismatch on an `ESSENTIAL` chunk is `CorruptFileError` right
@@ -179,8 +242,13 @@ def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
     to the output at all, verbatim via KEEP or rebuilt via REWRITE).
 
     An `IHDR`/`IEND`/`acTL`/`fcTL` at any size other than its one fixed
-    length is `CorruptFileError` too (Task 9b), regardless of a valid CRC
-    -- `_FIXED_ESSENTIAL_SIZES`.
+    length, or a `tRNS`/`sBIT` at a size `colour_type` (and, for `tRNS`,
+    `plte_entries`) doesn't allow, is `CorruptFileError` too (Task 9b),
+    regardless of a valid CRC -- `_FIXED_ESSENTIAL_SIZES` / `_trns_size_ok`
+    / `_SBIT_SIZE_BY_COLOUR_TYPE`. `colour_type` is always already known
+    here: `_check_structure` guarantees `IHDR` was the first chunk read,
+    and classifying it (below) always sets it before any later chunk is
+    reached.
     """
     tag = ctype.decode("ascii", errors="replace")
     valid_crc = (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
@@ -191,11 +259,30 @@ def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
         fixed_size = _FIXED_ESSENTIAL_SIZES.get(ctype)
         if fixed_size is not None and len(data) != fixed_size:
             raise CorruptFileError(f"invalid {tag}")
+        if ctype == b"tRNS" and not _trns_size_ok(colour_type, plte_entries, len(data)):
+            raise CorruptFileError("invalid tRNS")
+        if ctype == b"sBIT" and len(data) != _SBIT_SIZE_BY_COLOUR_TYPE.get(colour_type, -1):
+            raise CorruptFileError("invalid sBIT")
         return Block(Kind.ESSENTIAL, span, _ESSENTIAL_LABELS.get(ctype, tag), tag)
 
     block = _classify_non_essential(span, tag, ctype, data)
     block.corrupt = not valid_crc
     return block
+
+
+def _trns_size_ok(colour_type: int | None, plte_entries: int | None, size: int) -> bool:
+    """`tRNS`'s payload size depends on `IHDR`'s colour type (Task 9b/R15):
+    grayscale (0) is 2 bytes, truecolor (2) is 6, indexed (3) is 1 up to
+    the palette's own entry count; grayscale+alpha (4) and RGBA (6) already
+    carry alpha, so `tRNS` is never valid there at all.
+    """
+    if colour_type == 0:
+        return size == 2
+    if colour_type == 2:
+        return size == 6
+    if colour_type == 3:
+        return 1 <= size <= (plte_entries or 0)
+    return False
 
 
 def _classify_non_essential(span: Span, tag: str, ctype: bytes, data: bytes) -> Block:

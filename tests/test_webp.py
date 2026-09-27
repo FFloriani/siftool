@@ -1,7 +1,7 @@
 import io, struct, pytest
 from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
-from siftool.formats.webp import WebpHandler, VP8X_ICC, VP8X_EXIF, VP8X_XMP
+from siftool.formats.webp import WebpHandler, VP8X_ICC, VP8X_EXIF, VP8X_XMP, VP8X_ANIM
 from siftool.errors import CorruptFileError
 from fixtures.make_fixtures import make_webp, riff_chunks, decode_pixels
 
@@ -73,10 +73,45 @@ def test_oversize_vp8x_is_corrupt():
     vp8x = dict(riff_chunks(src))[b"VP8X"]
     secret = b" GPS +23.5505-046.6333 owner=Felipe"
     bad = _rebuild_with_chunk(src, b"VP8X", vp8x + secret)
-    with pytest.raises(CorruptFileError): H.parse(bad)
+    with pytest.raises(CorruptFileError, match="invalid VP8X"): H.parse(bad)
 
 def test_oversize_anim_is_corrupt():
     src = make_webp("animated")
     anim = dict(riff_chunks(src))[b"ANIM"]
     bad = _rebuild_with_chunk(src, b"ANIM", anim + b"\x00")
-    with pytest.raises(CorruptFileError): H.parse(bad)
+    with pytest.raises(CorruptFileError, match="invalid ANIM"): H.parse(bad)
+
+# ---------------------------------------------------------------------------
+# Controller ruling R15 (Task 9b fix round 1): the size rules alone are not
+# enough -- a REPEATED VP8X/ANIM at its own legal size, a VP8X that isn't
+# the first chunk, or an ANIM present without VP8X's own animation flag,
+# are just as unscanned and byte-for-byte-trusted as an oversize one.
+# ---------------------------------------------------------------------------
+
+def _append_chunk(data: bytes, fourcc: bytes, payload: bytes) -> bytes:
+    """Rebuild a WEBP RIFF with an extra top-level chunk of type `fourcc`
+    appended after every existing one, fixing up the RIFF size field."""
+    riff_size = int.from_bytes(data[4:8], "little")
+    trailing = data[8 + riff_size :]
+    pad = b"\x00" if len(payload) % 2 else b""
+    body = data[12 : 8 + riff_size] + fourcc + struct.pack("<I", len(payload)) + payload + pad
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body + trailing
+
+def test_second_vp8x_is_corrupt():
+    src = make_webp("lossless")
+    vp8x = dict(riff_chunks(src))[b"VP8X"]
+    bad = _append_chunk(src, b"VP8X", vp8x)
+    with pytest.raises(CorruptFileError, match="invalid VP8X"): H.parse(bad)
+
+def test_repeated_anim_is_corrupt():
+    src = make_webp("animated")
+    anim = dict(riff_chunks(src))[b"ANIM"]
+    bad = _append_chunk(src, b"ANIM", anim)
+    with pytest.raises(CorruptFileError, match="invalid ANIM"): H.parse(bad)
+
+def test_anim_without_animation_flag_is_corrupt():
+    src = make_webp("animated")
+    vp8x = bytearray(dict(riff_chunks(src))[b"VP8X"])
+    vp8x[0] &= ~VP8X_ANIM & 0xFF  # clear the flag; the ANIM chunk itself stays present
+    bad = _rebuild_with_chunk(src, b"VP8X", bytes(vp8x))
+    with pytest.raises(CorruptFileError, match="invalid ANIM"): H.parse(bad)

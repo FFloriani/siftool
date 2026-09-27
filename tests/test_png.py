@@ -1,4 +1,4 @@
-import io, zlib, pytest
+import io, struct, zlib, pytest
 from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.png import PngHandler, AI_TEXT_KEYWORDS
@@ -99,15 +99,46 @@ def _rebuild_with_chunk(data: bytes, ctype: bytes, payload: bytes) -> bytes:
 
 def test_oversize_ihdr_is_corrupt():
     bad = _rebuild_with_chunk(make_png(), b"IHDR", b"\x00" * 14)
-    with pytest.raises(CorruptFileError): H.parse(bad)
+    with pytest.raises(CorruptFileError, match="invalid IHDR"): H.parse(bad)
 
 def test_iend_with_payload_is_corrupt():
     secret = b" GPS +23.5505-046.6333 owner=Felipe"
     bad = _rebuild_with_chunk(make_png(), b"IEND", secret)
-    with pytest.raises(CorruptFileError): H.parse(bad)
+    with pytest.raises(CorruptFileError, match="invalid IEND"): H.parse(bad)
 
 def test_apng_control_chunks_must_have_fixed_size():
-    with pytest.raises(CorruptFileError):
+    with pytest.raises(CorruptFileError, match="invalid acTL"):
         H.parse(_rebuild_with_chunk(make_png(apng=True), b"acTL", b"\x00" * 9))
-    with pytest.raises(CorruptFileError):
+    with pytest.raises(CorruptFileError, match="invalid fcTL"):
         H.parse(_rebuild_with_chunk(make_png(apng=True), b"fcTL", b"\x00" * 25))
+
+# ---------------------------------------------------------------------------
+# Controller ruling R15 (Task 9b fix round 1): the size rules alone are not
+# enough -- a REPEATED or misplaced structure at its own legal size (a
+# second IHDR, a second/late acTL, an fcTL with no acTL at all) is just as
+# unscanned and byte-for-byte-trusted as an oversize one. Also: tRNS/sBIT
+# have a payload size fixed by IHDR's own colour type, not a single
+# constant, and were not size-checked at all before this round.
+# ---------------------------------------------------------------------------
+
+def test_second_ihdr_is_corrupt():
+    bad = make_png(extra_chunks=[png_chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))])
+    with pytest.raises(CorruptFileError, match="invalid IHDR"): H.parse(bad)
+
+def test_repeated_actl_is_corrupt():
+    bad = make_png(apng=True, extra_chunks=[png_chunk(b"acTL", b"\x00" * 8)])
+    with pytest.raises(CorruptFileError, match="invalid acTL"): H.parse(bad)
+
+def test_fctl_without_actl_is_corrupt():
+    bad = make_png(apng=False, extra_chunks=[png_chunk(b"fcTL", b"\x00" * 26)])
+    with pytest.raises(CorruptFileError, match="invalid fcTL"): H.parse(bad)
+
+def test_oversize_trns_is_corrupt():
+    # default make_png() is colour type 2 (RGB): tRNS must be exactly 6 bytes.
+    bad = make_png(extra_chunks=[png_chunk(b"tRNS", b"\x00" * 35)])
+    with pytest.raises(CorruptFileError, match="invalid tRNS"): H.parse(bad)
+
+def test_oversize_sbit_is_corrupt():
+    # default make_png() is colour type 2 (RGB): sBIT must be exactly 3 bytes.
+    bad = make_png(extra_chunks=[png_chunk(b"sBIT", b"\x00" * 35)])
+    with pytest.raises(CorruptFileError, match="invalid sBIT"): H.parse(bad)

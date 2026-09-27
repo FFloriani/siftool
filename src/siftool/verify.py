@@ -18,6 +18,15 @@ Without this helper, either case would be invisible to `inspect`'s report,
 `clean`'s removed/kept split and, worst of all, `verify`'s violation check
 -- a removable-but-unremoved leftover block would otherwise silently pass
 as VERIFIED.
+
+Known limit (documented, not fixed here -- spec section 8's own "Limites"
+paragraph): verification covers metadata *structures* -- non-`ESSENTIAL`
+blocks, and whatever `scan_signatures` finds outside `ESSENTIAL` spans.
+Data hidden in the *values* of an otherwise-valid essential structure (a
+flag bit, a quantization value) or inside the compressed image data itself
+(steganography) is not detected; the "Verified Clean" seal guarantees the
+absence of non-standard metadata, not the absence of every hidden bit in
+the image itself.
 """
 
 from __future__ import annotations

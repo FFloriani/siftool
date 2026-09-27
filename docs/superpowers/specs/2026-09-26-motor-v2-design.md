@@ -382,6 +382,16 @@ Nenhum deslocamento absoluto muda.
    - senão, alguma nota de ressalva → `WARNINGS`;
    - senão → `VERIFIED`.
 
+### Limites
+
+A verificação cobre estruturas de metadados: blocos não ESSENTIAL e a busca
+de assinaturas (passo 4) fora dos spans ESSENTIAL. Dado escondido nos
+VALORES de uma estrutura essencial válida (um bit de flag, um valor de
+quantização) ou dentro dos próprios dados de imagem comprimidos
+(esteganografia) não é detectado. O selo "Verified Clean" garante a
+ausência de metadados fora do padrão nas estruturas do arquivo, não a
+ausência de qualquer bit de informação escondido na imagem em si.
+
 ## 9. Erros, caminhos e memória
 
 - `clean` recusa destino igual à origem (`SameFileError`, comparando por `os.path.samefile` quando existir e pelo caminho normalizado).
