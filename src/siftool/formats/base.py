@@ -42,7 +42,11 @@ class FormatHandler(Protocol):
         """Return `block` rewritten to keep only `allowed` categories.
 
         Returns None if the block cannot be rewritten to satisfy `allowed`
-        (the caller then falls back to dropping or zeroing it).
+        (the caller then falls back to dropping or zeroing it). The planner
+        calls this for every `rewritable` block, even one whose findings
+        are all allowed (ruling R18), so the result must be canonical:
+        rewriting it again yields the same bytes, and a second clean stays
+        byte-identical.
         """
         ...
 

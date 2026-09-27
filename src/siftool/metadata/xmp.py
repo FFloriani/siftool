@@ -10,11 +10,13 @@ else -- or nothing else -- is found inside it (removal itself is decided
 elsewhere, by the planner).
 
 Read-only and best-effort: this module never parses XML structurally.
-Each property is detected by a plain substring search (`<prop` for the
-element form, ` prop=` for the attribute form -- exactly as the spec
-describes it) and its value by a small pair of regexes, so malformed,
-truncated or simply non-XML input degrades gracefully to "no properties
-found" (i.e. just the generic Finding) instead of raising.
+Each property is detected by a small regex anchored to its exact name
+(`_present`, ruling R7: the element form `<prop` followed by whitespace,
+`/` or `>`; the attribute form `prop` after any whitespace and before an
+optional-whitespace `=`) and its value by another pair of regexes
+(`_value`), so malformed, truncated or simply non-XML input degrades
+gracefully to "no properties found" (i.e. just the generic Finding)
+instead of raising.
 """
 
 from __future__ import annotations
