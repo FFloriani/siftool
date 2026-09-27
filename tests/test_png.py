@@ -49,7 +49,8 @@ def test_apng_chunks_are_essential_and_frames_survive():
 
 def test_privacy_output_keeps_appearance_and_digest():
     src = make_png(trailing=b"junk"); out = H.parse(clean_bytes(src))
-    assert {b.tag for b in out.blocks if b.kind is not Kind.ESSENTIAL} <= {"iCCP", "sRGB", "gAMA", "cHRM", "pHYs"}
+    assert {b.tag for b in out.blocks if b.kind is not Kind.ESSENTIAL} <= {"iCCP", "sRGB", "gAMA", "cHRM", "pHYs", "eXIf"}
+    assert {f.label for b in by_tag(out, "eXIf") for f in b.findings} == {"Orientation", "ColorSpace"}
     assert H.essential_digest(out) == H.essential_digest(H.parse(src))
 
 def test_photographer_rewrites_exif():

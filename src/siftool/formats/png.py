@@ -339,14 +339,12 @@ def _trailing_block(source: bytes, start: int, end: int) -> Block:
 def _rewrite_exif(block: Block, allowed: frozenset[Category]) -> bytes | None:
     """`png_chunk(b"eXIf", build_minimal_exif(...))`, or None.
 
-    Unlike JPEG, PNG viewers do not act on an eXIf chunk's Orientation or
-    ColorSpace tags, and PNG already has its own gAMA/cHRM/sRGB/iCCP for
-    appearance -- so a trimmed EXIF chunk is only worth keeping when
-    something beyond `Category.APPEARANCE` survives into it.
+    Same semantics as JPEG's EXIF rewrite (spec section 6: `appearance` --
+    orientation, color -- is kept by every mode except MAXIMUM, for PNG
+    exactly as for JPEG). Mode policy lives entirely in `modes.ALLOWED`
+    and the planner; this always keeps whatever `allowed` permits.
     """
-    if allowed <= {Category.APPEARANCE}:
-        return None
-    minimal = build_minimal_exif(block.raw, allowed)
+    minimal = build_minimal_exif(strip_exif_header(block.raw), allowed)
     if minimal is None:
         return None
     return _build_chunk(b"eXIf", minimal)
