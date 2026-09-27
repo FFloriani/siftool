@@ -21,6 +21,7 @@ import siftool
 from siftool import Category as C, Finding, Mode, Status
 from fixtures.make_fixtures import (
     base_jpeg,
+    decode_pixels,
     make_png,
     make_tiff_exif,
     make_webp,
@@ -220,3 +221,82 @@ def test_unfollowable_sub_ifd_pointer_is_seen_by_inspect_and_verify(tmp_path):
     assert unfollowed in siftool.inspect(src).findings
     verdict = siftool.verify(src, Mode.PRIVACY)
     assert verdict.status is Status.FAILED and unfollowed in verdict.violations
+
+
+# ---------------------------------------------------------------------------
+# C2, C3, I2 / ruling R19 (WEBP) and I1 / ruling R20 (WEBP ICCP).
+# ---------------------------------------------------------------------------
+
+XMP_SECRET = (b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description>'
+              b"<dc:creator>Felipe Floriani</dc:creator></rdf:Description></rdf:RDF></x:xmpmeta>")
+
+
+def _animated_with_extra_in_first_frame(extra: bytes) -> bytes:
+    """The fixture animation with `extra` sub-chunks appended inside its first ANMF."""
+    chunks = riff_chunks(make_webp("animated", meta=False, c2pa=False, unknown_chunk=False))
+    first = next(i for i, (t, _) in enumerate(chunks) if t == b"ANMF")
+    chunks[first] = (b"ANMF", chunks[first][1] + extra)
+    return _riff(b"".join(_riff_chunk(t, p) for t, p in chunks))
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_webp_anmf_with_metadata_subchunks_fails_verification(tmp_path, mode):
+    data = _animated_with_extra_in_first_frame(
+        _riff_chunk(b"XMP ", XMP_SECRET) + _riff_chunk(b"EXIF", b"MM\x00*" + SECRET)
+    )
+    dst = tmp_path / "out.webp"
+    with pytest.raises(siftool.VerificationFailedError) as e:
+        siftool.clean(write(tmp_path, "a.webp", data), dst, mode)
+    assert {(f.label, f.where) for f in e.value.verdict.violations} == {
+        ("XMP packet", "ANMF?"), ("ISO 6709 coordinates", "ANMF?"), ("GPS marker", "ANMF?"),
+    }
+    assert "Unrecognized structure kept: ANMF?" in e.value.verdict.notes and not dst.exists()
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_webp_anmf_with_unknown_subchunk_is_kept_with_warnings(tmp_path, mode):
+    data = _animated_with_extra_in_first_frame(_riff_chunk(b"ABCD", QUIET_SECRET))
+    res, out = _clean(tmp_path, data, ".webp", mode)
+    assert res.verdict.status is Status.WARNINGS
+    assert res.verdict.notes == ["Unrecognized structure kept: ANMF?"]
+    assert out.count(QUIET_SECRET) == 1  # kept inside the non-removable, signature-scanned ANMF?
+    assert len(decode_pixels(out)) == 3
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_webp_second_top_level_vp8l_is_dropped(tmp_path, mode):
+    data = _riff(_riff_chunk(b"VP8L", _vp8l()) + _riff_chunk(b"VP8L", QUIET_SECRET))
+    res, out = _clean(tmp_path, data, ".webp", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_webp_alph_after_vp8l_is_dropped(tmp_path, mode):
+    data = _riff(_riff_chunk(b"VP8X", _vp8x(0)) + _riff_chunk(b"VP8L", _vp8l()) + _riff_chunk(b"ALPH", QUIET_SECRET))
+    res, out = _clean(tmp_path, data, ".webp", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out
+
+
+@pytest.mark.parametrize("declared", [0, 4, 22])
+def test_webp_riff_size_that_hides_the_image_is_corrupt(tmp_path, declared):
+    good = _riff(_riff_chunk(b"VP8X", _vp8x(0)) + _riff_chunk(b"VP8L", _vp8l()))
+    src = write(tmp_path, "a.webp", good[:4] + struct.pack("<I", declared) + good[8:])
+    with pytest.raises(siftool.CorruptFileError, match="^missing image data$"):
+        siftool.clean(src, tmp_path / "out.webp", Mode.PRIVACY)
+    assert not (tmp_path / "out.webp").exists()
+
+
+def test_webp_with_only_an_unknown_chunk_is_corrupt(tmp_path):
+    src = write(tmp_path, "a.webp", _riff(_riff_chunk(b"ABCD", b"junk")))
+    with pytest.raises(siftool.CorruptFileError, match="^missing image data$"):
+        siftool.clean(src, tmp_path / "out.webp", Mode.MAXIMUM)
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_webp_iccp_carrying_identity_text_is_dropped(tmp_path, mode):
+    data = _riff(_riff_chunk(b"VP8X", _vp8x(0x20)) + _riff_chunk(b"ICCP", QUIET_SECRET) + _riff_chunk(b"VP8L", _vp8l()))
+    res, out = _clean(tmp_path, data, ".webp", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out
+    assert dict(riff_chunks(out))[b"VP8X"][0] == 0  # ICC flag cleared with the chunk
+    span = 8 + len(QUIET_SECRET) + len(QUIET_SECRET) % 2
+    assert Finding(C.UNKNOWN, "Invalid ICC profile", None, "ICCP", span) in res.removed

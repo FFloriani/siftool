@@ -1,4 +1,4 @@
-"""ICC color profile reading for reporting.
+"""ICC color profile reading for reporting, and structural validation.
 
 `icc_description` extracts the human-readable name of an embedded ICC
 profile (e.g. "sRGB IEC61966-2.1", "Display P3") from its `desc` tag, so
@@ -11,7 +11,12 @@ ICC profiles come in two tag encodings for the same "desc" tag, per the
 version this module supports: ICC v2's `desc` (textDescriptionType, a
 plain ASCII string) and ICC v4's `mluc` (multiLocalizedUnicodeType, a
 table of language-tagged UTF-16BE strings). Both are read directly from
-the profile's tag table; nothing here writes or validates a profile.
+the profile's tag table; nothing here writes a profile.
+
+`icc_profile_valid` is the structural gate every handler applies before
+it keeps a profile as `appearance` (ruling R20): a "profile" that fails it
+-- identity text, a split signature, anything but an ICC profile -- is
+dropped instead of trusted.
 """
 
 from __future__ import annotations
@@ -60,6 +65,29 @@ def _describe(profile: bytes) -> str | None:
         return text.decode("utf-16-be", errors="replace") or None
 
     return None
+
+
+def icc_profile_valid(profile: bytes) -> bool:
+    """True if `profile` is a structurally valid ICC profile (ruling R20).
+
+    Its header's own size field (bytes 0-3, big-endian) equals
+    `len(profile)`, `acsp` sits at offset 36, and the tag table at offset
+    128 -- a 4-byte tag count, then 12 bytes per tag (signature, offset,
+    size) -- as well as every tag's data (`offset + size`) lies within the
+    profile. Tag contents are not interpreted. Never raises.
+    """
+    n = len(profile)
+    entries_start = _TAG_TABLE_OFFSET + 4
+    if n < entries_start or int.from_bytes(profile[0:4], "big") != n or profile[36:40] != b"acsp":
+        return False
+    count = int.from_bytes(profile[_TAG_TABLE_OFFSET:entries_start], "big")
+    if entries_start + 12 * count > n:
+        return False
+    for i in range(count):
+        offset, size = struct.unpack_from(">II", profile, entries_start + 12 * i + 4)
+        if offset + size > n:
+            return False
+    return True
 
 
 def icc_description(profile: bytes) -> str | None:

@@ -313,13 +313,13 @@ def make_c2pa_payload(generator: str = "ChatGPT", ai: bool = True) -> bytes:
 
 
 def make_icc(description: str, version: int = 2) -> bytes:
-    """Build a minimal ICC profile with a single `desc` tag.
+    """Build a minimal, structurally valid ICC profile with a single `desc` tag.
 
-    128-byte header (`acsp` at offset 36, `version` as a single byte at
-    offset 8) + a 1-entry tag table at offset 128 + the tag's data. The
-    tag's own value type follows the real ICC split: `version < 4` writes
-    a v2 `desc` (textDescriptionType: 4-byte ASCII length at +8, ASCII
-    text at +12); `version >= 4` writes a v4 `mluc`
+    128-byte header (profile size at offset 0, `version` as a single byte
+    at offset 8, `acsp` at offset 36) + a 1-entry tag table at offset 128
+    + the tag's data. The tag's own value type follows the real ICC split:
+    `version < 4` writes a v2 `desc` (textDescriptionType: 4-byte ASCII
+    length at +8, ASCII text at +12); `version >= 4` writes a v4 `mluc`
     (multiLocalizedUnicodeType: one language/country record whose 3rd and
     4th fields are the length and offset of a UTF-16BE string).
     """
@@ -337,6 +337,7 @@ def make_icc(description: str, version: int = 2) -> bytes:
 
     tag_offset = 128 + 4 + 12  # header + tag count (4 bytes) + one 12-byte entry
     table = struct.pack(">I", 1) + b"desc" + struct.pack(">II", tag_offset, len(tag_data))
+    header[0:4] = struct.pack(">I", len(header) + len(table) + len(tag_data))
     return bytes(header) + table + tag_data
 
 

@@ -115,3 +115,153 @@ def test_anim_without_animation_flag_is_corrupt():
     vp8x[0] &= ~VP8X_ANIM & 0xFF  # clear the flag; the ANIM chunk itself stays present
     bad = _rebuild_with_chunk(src, b"VP8X", bytes(vp8x))
     with pytest.raises(CorruptFileError, match="invalid ANIM"): H.parse(bad)
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave. Ruling R19 (C2, C3, I2, triage T8/T9b): an ANMF is
+# trusted only as a 16-byte frame header + (ALPH? VP8 | VP8L); a still image
+# has exactly one bitstream (ALPH only right before a VP8); stray bitstream
+# chunks are dropped; a file with no image data is corrupt. Ruling R20 (I1):
+# an ICCP must be a structurally valid ICC profile.
+# ---------------------------------------------------------------------------
+
+import siftool
+from siftool import Finding, Status
+from fixtures.make_fixtures import make_icc, write
+from PIL import Image
+
+def _chunk(fourcc, payload):
+    return fourcc + struct.pack("<I", len(payload)) + payload + (b"\x00" if len(payload) % 2 else b"")
+
+def _riff(body):
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body
+
+def _vp8x(flags):
+    side = (32 - 1).to_bytes(3, "little")
+    return bytes([flags, 0, 0, 0]) + side + side
+
+def _pillow_webp(img, **kw):
+    buf = io.BytesIO(); img.save(buf, format="WEBP", **kw); return buf.getvalue()
+
+def _rgba():
+    return Image.new("RGBA", (32, 32), (255, 0, 0, 128))
+
+VP8L = dict(riff_chunks(make_webp("lossless", meta=False, c2pa=False, unknown_chunk=False)))[b"VP8L"]
+ALPH, VP8 = (dict(riff_chunks(_pillow_webp(_rgba(), lossless=False)))[t] for t in (b"ALPH", b"VP8 "))
+ODD_VP8L = dict(riff_chunks(_pillow_webp(_rgba(), lossless=True)))[b"VP8L"]  # 15 bytes: needs a pad byte
+ANIM_PAYLOAD = dict(riff_chunks(make_webp("animated", meta=False, c2pa=False, unknown_chunk=False)))[b"ANIM"]
+FRAME_HEADER = bytes(6) + (31).to_bytes(3, "little") * 2 + (100).to_bytes(3, "little") + b"\x00"
+
+def _animated(*anmf_payloads, extra=b""):
+    body = _chunk(b"VP8X", _vp8x(VP8X_ANIM)) + _chunk(b"ANIM", ANIM_PAYLOAD)
+    return _riff(body + b"".join(_chunk(b"ANMF", p) for p in anmf_payloads) + extra)
+
+def layout(data):
+    return [(b.tag, b.kind, b.removable) for b in H.parse(data).blocks]
+
+E, U = Kind.ESSENTIAL, Kind.UNKNOWN
+
+def test_anmf_frames_from_real_encoders_are_essential(tmp_path):
+    frames = [Image.new("RGBA", (32, 32), c) for c in ((255, 0, 0, 128), (0, 255, 0, 255), (0, 0, 255, 60))]
+    for lossless in (True, False):  # VP8L frames; ALPH+VP8 and bare VP8 frames
+        buf = io.BytesIO()
+        frames[0].save(buf, format="WEBP", save_all=True, append_images=frames[1:], lossless=lossless, duration=100)
+        data = buf.getvalue()
+        assert [t for t, k, _ in layout(data)] == ["VP8X", "ANIM", "ANMF", "ANMF", "ANMF"]
+        assert all(k is E for _, k, _ in layout(data))
+        for mode in Mode:
+            res = siftool.clean(write(tmp_path, f"a{lossless}.webp", data), tmp_path / f"o{lossless}{mode.value}.webp", mode)
+            assert res.verdict.status is Status.VERIFIED
+            assert decode_pixels((tmp_path / f"o{lossless}{mode.value}.webp").read_bytes()) == decode_pixels(data)
+
+def test_alpha_still_image_from_real_encoder_is_verified(tmp_path):
+    data = _pillow_webp(_rgba(), lossless=False)
+    assert layout(data) == [("VP8X", E, True), ("ALPH", E, True), ("VP8", E, True)]
+    res = siftool.clean(write(tmp_path, "a.webp", data), tmp_path / "o.webp")
+    assert res.verdict.status is Status.VERIFIED and (tmp_path / "o.webp").read_bytes() == data
+
+def _frame(*subchunks):
+    return FRAME_HEADER + b"".join(subchunks)
+
+NON_STANDARD_ANMF = {
+    "unknown-subchunk": _frame(_chunk(b"VP8L", VP8L), _chunk(b"ABCD", b"junk")),
+    "xmp-subchunk": _frame(_chunk(b"VP8L", VP8L), _chunk(b"XMP ", b"<x:xmpmeta/>")),
+    "vp8l-then-alph": _frame(_chunk(b"VP8L", VP8L), _chunk(b"ALPH", ALPH)),
+    "alph-then-vp8l": _frame(_chunk(b"ALPH", ALPH), _chunk(b"VP8L", VP8L)),
+    "two-vp8l": _frame(_chunk(b"VP8L", VP8L), _chunk(b"VP8L", VP8L)),
+    "alph-only": _frame(_chunk(b"ALPH", ALPH)),
+    "size-overrun": _frame(b"VP8L" + struct.pack("<I", len(VP8L) + 9) + VP8L),
+    "missing-pad": _frame(b"VP8L" + struct.pack("<I", len(ODD_VP8L)) + ODD_VP8L),
+    "trailing-byte": _frame(_chunk(b"VP8L", VP8L)) + b"\x00",
+    "header-only": FRAME_HEADER,
+    "short-header": FRAME_HEADER[:10],
+}
+
+@pytest.mark.parametrize("case", sorted(NON_STANDARD_ANMF))
+def test_non_standard_anmf_is_demoted_not_trusted(case):
+    assert len(ODD_VP8L) % 2  # "missing-pad" relies on an odd-sized VP8L
+    payload = NON_STANDARD_ANMF[case]
+    good = _frame(_chunk(b"VP8L", VP8L))
+    c = H.parse(_animated(good, payload))
+    [demoted] = [b for b in c.blocks if b.tag == "ANMF?"]
+    assert demoted.kind is U and demoted.removable is False
+    assert demoted.findings == [Finding(C.UNKNOWN, "Non-standard ANMF chunk", None, "ANMF?", len(payload))]
+    assert [b.tag for b in c.blocks] == ["VP8X", "ANIM", "ANMF", "ANMF?"]
+
+STRAY_LAYOUTS = {
+    "second-vp8l": (_riff(_chunk(b"VP8L", VP8L) + _chunk(b"VP8L", VP8L)),
+                    [("VP8L", E, True), ("VP8L", U, True)]),
+    "alph-after-vp8l": (_riff(_chunk(b"VP8X", _vp8x(0x10)) + _chunk(b"VP8L", VP8L) + _chunk(b"ALPH", ALPH)),
+                        [("VP8X", E, True), ("VP8L", E, True), ("ALPH", U, True)]),
+    "alph-before-vp8l": (_riff(_chunk(b"VP8X", _vp8x(0x10)) + _chunk(b"ALPH", ALPH) + _chunk(b"VP8L", VP8L)),
+                         [("VP8X", E, True), ("ALPH", U, True), ("VP8L", E, True)]),
+    "two-alph-before-vp8": (_riff(_chunk(b"VP8X", _vp8x(0x10)) + _chunk(b"ALPH", ALPH) + _chunk(b"ALPH", ALPH)
+                                  + _chunk(b"VP8 ", VP8)),
+                            [("VP8X", E, True), ("ALPH", U, True), ("ALPH", E, True), ("VP8", E, True)]),
+    "alph-not-adjacent": (_riff(_chunk(b"VP8X", _vp8x(0x30)) + _chunk(b"ALPH", ALPH)
+                                + _chunk(b"ICCP", make_icc("Display P3")) + _chunk(b"VP8 ", VP8)),
+                          [("VP8X", E, True), ("ALPH", U, True), ("ICCP", Kind.METADATA, True), ("VP8", E, True)]),
+    "alph-after-vp8": (_riff(_chunk(b"VP8X", _vp8x(0x10)) + _chunk(b"ALPH", ALPH) + _chunk(b"VP8 ", VP8)
+                             + _chunk(b"ALPH", ALPH)),
+                       [("VP8X", E, True), ("ALPH", E, True), ("VP8", E, True), ("ALPH", U, True)]),
+    "bitstream-in-animation": (_animated(_frame(_chunk(b"VP8L", VP8L)), extra=_chunk(b"VP8L", VP8L)),
+                               [("VP8X", E, True), ("ANIM", E, True), ("ANMF", E, True), ("VP8L", U, True)]),
+    "anmf-in-still-image": (_riff(_chunk(b"VP8X", _vp8x(0)) + _chunk(b"VP8L", VP8L)
+                                  + _chunk(b"ANMF", _frame(_chunk(b"VP8L", VP8L)))),
+                            [("VP8X", E, True), ("VP8L", E, True), ("ANMF", U, True)]),
+}
+
+@pytest.mark.parametrize("case", sorted(STRAY_LAYOUTS))
+def test_stray_bitstream_chunks_are_removable_unknown(case):
+    data, expected = STRAY_LAYOUTS[case]
+    assert layout(data) == expected
+    for block in H.parse(data).blocks:
+        if block.kind is U:
+            assert block.label == f"Unused {block.tag} chunk" and block.findings == []
+    out = H.parse(clean_bytes(data, Mode.PRIVACY))
+    assert [(b.tag, b.kind) for b in out.blocks] == [(t, k) for t, k, _ in expected if k is not U]
+
+MISSING_IMAGE = {
+    "riff-size-0": b"RIFF" + struct.pack("<I", 0) + b"WEBP" + _chunk(b"VP8L", VP8L),
+    "riff-size-4": b"RIFF" + struct.pack("<I", 4) + b"WEBP" + _chunk(b"VP8L", VP8L),
+    "riff-ends-after-vp8x": b"RIFF" + struct.pack("<I", 22) + b"WEBP" + _chunk(b"VP8X", _vp8x(0)) + _chunk(b"VP8L", VP8L),
+    "only-unknown-chunk": _riff(_chunk(b"ABCD", b"junk")),
+    "still-without-bitstream": _riff(_chunk(b"VP8X", _vp8x(0x20)) + _chunk(b"ICCP", make_icc("Display P3"))),
+    "animation-without-frames": _animated(),
+}
+
+@pytest.mark.parametrize("case", sorted(MISSING_IMAGE))
+def test_webp_without_image_data_is_corrupt(case):
+    with pytest.raises(CorruptFileError, match="^missing image data$"):
+        H.parse(MISSING_IMAGE[case])
+
+def test_iccp_must_be_a_valid_icc_profile():
+    good = make_icc("Display P3", 4)
+    for profile, expected in ((good, (Kind.METADATA, "ICC color profile")),
+                              (b"not a profile at all", (U, "Invalid ICC profile")),
+                              (struct.pack(">I", len(good) + 2) + good[4:], (U, "Invalid ICC profile"))):
+        data = _riff(_chunk(b"VP8X", _vp8x(0x20)) + _chunk(b"ICCP", profile) + _chunk(b"VP8L", VP8L))
+        [iccp] = [b for b in H.parse(data).blocks if b.tag == "ICCP"]
+        assert (iccp.kind, iccp.label) == expected and iccp.removable
+    [iccp] = [b for b in H.parse(_riff(_chunk(b"VP8X", _vp8x(0x20)) + _chunk(b"ICCP", good) + _chunk(b"VP8L", VP8L))).blocks
+              if b.tag == "ICCP"]
+    assert iccp.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "ICCP", len(good))]

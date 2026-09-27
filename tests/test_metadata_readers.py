@@ -46,6 +46,20 @@ def test_icc_description_v2_v4_and_garbage():
     assert icc_description(make_icc("Display P3", 4)) == "Display P3"
     assert icc_description(b"not an icc profile") is None
 
+def test_icc_profile_structure_is_validated():  # ruling R20
+    import struct
+    from siftool.metadata.icc import icc_profile_valid
+
+    good = make_icc("Display P3", 4)
+    assert icc_profile_valid(good) and icc_profile_valid(make_icc("sRGB IEC61966-2.1", 2))
+    wrong_size_field = struct.pack(">I", len(good) + 1) + good[4:]
+    no_acsp = good[:36] + b"xxxx" + good[40:]
+    too_many_tags = good[:128] + struct.pack(">I", 1000) + good[132:]
+    tag_out_of_bounds = good[:136] + struct.pack(">I", len(good)) + good[140:]  # desc offset := profile end
+    for bad in (b"", b"not an icc profile", good[:131], wrong_size_field, no_acsp, too_many_tags, tag_out_of_bounds,
+                good + b"\x00"):
+        assert not icc_profile_valid(bad)
+
 def test_iptc_categories():
     fs = iptc_findings(make_iptc_irb(), "APP13")
     by = {f.detail: f.category for f in fs if f.detail}
