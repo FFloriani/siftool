@@ -584,6 +584,126 @@ def make_png(
     return PNG_SIGNATURE + b"".join(chunks) + trailing
 
 
+# ---------------------------------------------------------------------------
+# WEBP builders (Task 8)
+# ---------------------------------------------------------------------------
+
+
+def riff_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    """Walk a WEBP RIFF's top-level chunks up to its own declared size.
+
+    Returns `[(fourcc, payload), ...]` in file order; `fourcc` is exactly
+    the 4 bytes stored on disk (`b"VP8 "`/`b"XMP "` keep their padding
+    space -- callers compare against literal fourccs, not `WebpHandler`'s
+    space-stripped tags). Stops at `8 + declared RIFF size`, same as the
+    real parser treats anything beyond that as trailing, not a chunk.
+    """
+    riff_size = int.from_bytes(data[4:8], "little")
+    end = min(8 + riff_size, len(data))
+    chunks: list[tuple[bytes, bytes]] = []
+    pos = 12
+    while pos + 8 <= end:
+        fourcc = data[pos : pos + 4]
+        size = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        chunks.append((fourcc, data[pos + 8 : pos + 8 + size]))
+        pos += 8 + size + (size % 2)
+    return chunks
+
+
+def _riff_chunk(fourcc: bytes, payload: bytes) -> bytes:
+    """Build one complete RIFF chunk: fourcc(4) + size(4LE) + payload + pad."""
+    pad = b"\x00" if len(payload) % 2 else b""
+    return fourcc + struct.pack("<I", len(payload)) + payload + pad
+
+
+def _riff_container(body: bytes) -> bytes:
+    """Wrap `body` (everything right after the `WEBP` fourcc) in a RIFF header."""
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body
+
+
+def _webp_gradient(width: int, height: int) -> Image.Image:
+    """Same per-pixel gradient formula as `base_jpeg`/`_png_rows`, as an RGB Image."""
+    pixels = bytes(
+        value
+        for y in range(height)
+        for x in range(width)
+        for value in (
+            x * 255 // (width - 1),
+            y * 255 // (height - 1),
+            (x + y) * 255 // (width + height - 2),
+        )
+    )
+    return Image.frombytes("RGB", (width, height), pixels)
+
+
+def _simple_webp() -> bytes:
+    """A minimal RIFF hand-built from just the `VP8 ` chunk of a lossy Pillow save.
+
+    Pillow's own plain lossy WEBP output may already be exactly this (no
+    `VP8X` at all), but that is version-dependent -- extracting the `VP8 `
+    chunk and rebuilding the RIFF by hand guarantees a fixture with no
+    metadata and no extended-format chunk regardless of Pillow's choices.
+    """
+    buf = io.BytesIO()
+    _webp_gradient(32, 32).save(buf, format="WEBP", lossless=False)
+    vp8_payload = dict(riff_chunks(buf.getvalue()))[b"VP8 "]
+    return _riff_container(_riff_chunk(b"VP8 ", vp8_payload))
+
+
+def make_webp(
+    kind: str = "lossless",
+    *,
+    meta: bool = True,
+    c2pa: bool = True,
+    unknown_chunk: bool = True,
+    trailing: bytes = b"",
+) -> bytes:
+    """Build a synthetic WEBP exercising every chunk `WebpHandler` classifies.
+
+    `kind` (positional): `"lossless"`/`"lossy"` is a 32x32 gradient image
+    (same formula as `base_jpeg`), saved with `lossless=True`/`False`;
+    `"animated"` is 3 solid-color frames (red, green, blue), `duration=100`,
+    `loop=0`, saved lossless; `"simple"` is `_simple_webp()` -- no
+    metadata and no extra chunks, `meta`/`c2pa`/`unknown_chunk` do not
+    apply and are ignored (only `trailing` still is).
+
+    For every other `kind`, `meta=True` (the default) has Pillow itself
+    embed `icc_profile=make_icc("Display P3")`, `exif=make_tiff_exif(">")`
+    and `xmp=make_xmp()` -- this is what produces the `VP8X`/`ICCP`/`EXIF`/
+    `XMP ` chunks; it is Pillow's own WEBP muxer doing it, not manual
+    splicing. Afterwards, when set, a `C2PA` chunk (`make_c2pa_payload()`)
+    and a 5-byte `ABCD` chunk (odd size, exercising padding) are appended
+    by hand, the RIFF size is recalculated, and finally `trailing` is
+    appended after the (now correctly-sized) RIFF.
+    """
+    if kind == "simple":
+        return _simple_webp() + trailing
+
+    save_kwargs: dict = {"format": "WEBP", "lossless": kind in ("lossless", "animated")}
+    if meta:
+        save_kwargs["icc_profile"] = make_icc("Display P3")
+        save_kwargs["exif"] = make_tiff_exif(">")
+        save_kwargs["xmp"] = make_xmp()
+
+    buf = io.BytesIO()
+    if kind == "animated":
+        frames = [Image.new("RGB", (32, 32), color) for color in ((255, 0, 0), (0, 255, 0), (0, 0, 255))]
+        frames[0].save(buf, save_all=True, append_images=frames[1:], duration=100, loop=0, **save_kwargs)
+    else:
+        _webp_gradient(32, 32).save(buf, **save_kwargs)
+    data = buf.getvalue()
+
+    extra = bytearray()
+    if c2pa:
+        extra += _riff_chunk(b"C2PA", make_c2pa_payload())
+    if unknown_chunk:
+        extra += _riff_chunk(b"ABCD", b"junk!")
+    if extra:
+        data = _riff_container(data[12:] + bytes(extra))
+
+    return data + trailing
+
+
 def decode_pixels(data: bytes) -> list[bytes]:
     """Decode every frame of an image (via Pillow) into `RGBA` bytes, one per frame.
 
