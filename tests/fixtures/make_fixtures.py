@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import struct
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 
@@ -455,14 +456,24 @@ def make_jpeg(
 
 
 def decode_pixels(data: bytes) -> list[bytes]:
-    """Decode every frame of an image (via Pillow) into `RGBA` bytes, one per frame."""
-    img = Image.open(io.BytesIO(data))
-    try:
-        n_frames = img.n_frames
-    except AttributeError:
-        n_frames = 1
-    frames = []
-    for i in range(n_frames):
-        img.seek(i)
-        frames.append(img.convert("RGBA").tobytes())
-    return frames
+    """Decode every frame of an image (via Pillow) into `RGBA` bytes, one per frame.
+
+    Our synthetic `MPF\\x00`-only APP2 (`make_jpeg(mpf=True)`) is a stub, not
+    a real MP Index IFD, so Pillow's MPO probe warns before falling back to
+    plain JPEG decoding; that warning is expected and silenced here rather
+    than by changing the fixture bytes.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message="Image appears to be a malformed MPO file", category=UserWarning
+        )
+        img = Image.open(io.BytesIO(data))
+        try:
+            n_frames = img.n_frames
+        except AttributeError:
+            n_frames = 1
+        frames = []
+        for i in range(n_frames):
+            img.seek(i)
+            frames.append(img.convert("RGBA").tobytes())
+        return frames

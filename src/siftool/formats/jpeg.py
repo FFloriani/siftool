@@ -48,7 +48,11 @@ _XMP_EXT_SIG = b"http://ns.adobe.com/xmp/extension/\x00"
 _ICC_SIG = b"ICC_PROFILE\x00"
 _ICC_HEADER_LEN = len(_ICC_SIG) + 2  # + 1-byte chunk seq + 1-byte chunk count
 _MPF_SIG = b"MPF\x00"
-_JUMBF_SIG = b"JP\x00\x00"
+# ISO/IEC 19566-5 APP11 header: CI (b"JP") + En (2-byte box instance number,
+# chosen by the writer -- NOT part of the signature) + Z (4-byte sequence
+# number) + LBox/TBox. Match on CI only; the writer's own box instance
+# number must never gate whether a C2PA/JUMBF manifest is recognized.
+_JUMBF_CI = b"JP"
 _IPTC_SIG = b"Photoshop 3.0\x00"
 _ADOBE_SIG = b"Adobe"
 
@@ -269,7 +273,7 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
             Kind.METADATA, span, "MPF index", "APP2:MPF",
             findings=[Finding(Category.EXTRAS, "MPF index", size=len(payload))],
         )
-    if code == 0xEB and payload.startswith(_JUMBF_SIG):
+    if code == 0xEB and payload.startswith(_JUMBF_CI):
         return Block(
             Kind.METADATA, span, "JUMBF/C2PA manifest", "APP11:JUMBF",
             findings=c2pa_findings(payload, "APP11/JUMBF"),

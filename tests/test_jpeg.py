@@ -3,8 +3,10 @@ from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.jpeg import JpegHandler
 from siftool.errors import CorruptFileError
-from fixtures.make_fixtures import make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER
+from fixtures.make_fixtures import make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER, make_c2pa_payload
 import io
+import struct
+import warnings
 
 H = JpegHandler()
 def tags(c): return [b.tag for b in c.blocks]
@@ -35,7 +37,7 @@ def test_progressive_has_multiple_scans():
 def test_fill_bytes_are_tolerated():
     assert decode_pixels(clean_bytes(make_jpeg(fill_bytes=True))) == decode_pixels(make_jpeg(fill_bytes=True))
 
-@pytest.mark.parametrize("data", [b"\x00\x00not a jpeg", base_jpeg()[:-200]])
+@pytest.mark.parametrize("data", [b"\x00\x00not a jpeg", base_jpeg()[:-200]], ids=["no-soi", "truncated"])
 def test_missing_soi_or_truncated_is_corrupt(data):
     with pytest.raises(CorruptFileError): H.parse(data)
 
@@ -57,3 +59,20 @@ def test_digest_and_pixels_are_preserved():
 def test_jfif_thumbnail_is_rewritten_without_thumbnail():
     [app0] = by_tag(H.parse(clean_bytes(make_jpeg(jfif_thumbnail=True))), "APP0:JFIF")
     assert app0.span.length == 18 and {f.category for f in app0.findings} == {C.APPEARANCE}
+
+def test_app11_jumbf_with_nonzero_box_instance_is_c2pa():
+    base = make_jpeg(c2pa=False)
+    end = 4 + int.from_bytes(base[4:6], "big")  # right after Pillow's own APP0
+    payload = b"JP" + b"\x02\x11" + b"\x00\x00\x00\x01" + make_c2pa_payload()  # CI + En=0x0211 + Z=1
+    segment = b"\xff\xeb" + struct.pack(">H", len(payload) + 2) + payload
+    c = H.parse(base[:end] + segment + base[end:])
+    [app11] = by_tag(c, "APP11:JUMBF")
+    [finding] = app11.findings
+    assert finding.category is C.AI_PROVENANCE and finding.label == "C2PA manifest"
+    assert finding.detail == "generator: ChatGPT · AI-generated"
+
+def test_decode_pixels_of_mpf_fixture_is_silent():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        frames = decode_pixels(make_jpeg(mpf=True))
+    assert frames
