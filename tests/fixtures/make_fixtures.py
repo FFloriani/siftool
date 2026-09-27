@@ -11,9 +11,12 @@ deterministic byte-for-byte so tests can assert on exact `detail` strings.
 
 from __future__ import annotations
 
+import io
 import struct
 from pathlib import Path
 from typing import NamedTuple
+
+from PIL import Image
 
 _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
 
@@ -333,3 +336,133 @@ def make_iptc_irb(byline: str = "Felipe", city: str = "Sao Paulo", caption: str 
     """
     iim = _iim_dataset(2, 80, byline) + _iim_dataset(2, 90, city) + _iim_dataset(2, 120, caption)
     return b"Photoshop 3.0\x00" + _8bim_resource(0x0404, iim)
+
+
+# ---------------------------------------------------------------------------
+# JPEG builders (Task 6)
+# ---------------------------------------------------------------------------
+
+GPS_TEXT = b"+37.7749-122.4194/"
+MOTION_PHOTO_TRAILER = (
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 32 + GPS_TEXT
+)
+
+
+def base_jpeg(*, progressive: bool = False) -> bytes:
+    """Build a deterministic 64x48 RGB gradient JPEG via Pillow (`quality=90`).
+
+    A plain per-pixel gradient (R follows x, G follows y, B follows x+y),
+    encoded baseline or, with `progressive=True`, as a multi-scan
+    progressive JPEG (several `SOS` segments).
+    """
+    width, height = 64, 48
+    pixels = bytes(
+        value
+        for y in range(height)
+        for x in range(width)
+        for value in (
+            x * 255 // (width - 1),
+            y * 255 // (height - 1),
+            (x + y) * 255 // (width + height - 2),
+        )
+    )
+    img = Image.frombytes("RGB", (width, height), pixels)
+    buf = io.BytesIO()
+    save_kwargs: dict = {"quality": 90}
+    if progressive:
+        save_kwargs["progressive"] = True
+    img.save(buf, format="JPEG", **save_kwargs)
+    return buf.getvalue()
+
+
+def _after_app0(data: bytes) -> int:
+    """Return the offset right after `data`'s first segment (Pillow's own APP0)."""
+    length = int.from_bytes(data[4:6], "big")
+    return 4 + length
+
+
+def _segment(marker: int, payload: bytes) -> bytes:
+    """Build one complete marker segment: `0xFF` + `marker` + length + `payload`."""
+    return bytes([0xFF, marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+
+def make_jpeg(
+    *,
+    exif: bool = True,
+    xmp: bool = True,
+    icc: bool = True,
+    mpf: bool = False,
+    c2pa: bool = True,
+    iptc: bool = True,
+    comment: bool = True,
+    unknown_app: bool = True,
+    jfif_thumbnail: bool = False,
+    trailing: bytes = b"",
+    reserved_marker: bool = False,
+    reserved_payload: bytes = b"harmless",
+    fill_bytes: bool = False,
+    progressive: bool = False,
+) -> bytes:
+    """Build a synthetic JPEG exercising every segment `JpegHandler` classifies.
+
+    Starts from `base_jpeg()` and inserts, right after Pillow's own APP0,
+    each of the following (in this order) when its flag is set: APP1 Exif
+    (`make_tiff_exif("<")`), APP1 XMP, APP2 `ICC_PROFILE` (`make_icc("Display
+    P3")`), APP2 `MPF`, APP11 JUMBF/C2PA (`make_c2pa_payload()`), APP13
+    Photoshop IRB (`make_iptc_irb()`), an unrecognized APP15, a COM comment,
+    and a reserved 0xF0 marker carrying `reserved_payload`. `jfif_thumbnail`
+    replaces Pillow's plain APP0 with one carrying a 2x1 RGB thumbnail.
+    `fill_bytes` inserts `b"\\xff\\xff"` right before the first `DQT`.
+    `trailing` is appended after `EOI`.
+    """
+    base = base_jpeg(progressive=progressive)
+    app0_end = _after_app0(base)
+    head = base[:2]
+    app0 = base[2:app0_end]
+    rest = base[app0_end:]
+
+    if jfif_thumbnail:
+        thumbnail = b"\x00" * (3 * 2 * 1)  # 2x1 RGB, content irrelevant to tests
+        payload = (
+            b"JFIF\x00" + bytes([1, 1]) + b"\x00" + struct.pack(">HH", 1, 1) + bytes([2, 1]) + thumbnail
+        )
+        app0 = _segment(0xE0, payload)
+
+    extra = bytearray()
+    if exif:
+        extra += _segment(0xE1, b"Exif\x00\x00" + make_tiff_exif("<"))
+    if xmp:
+        extra += _segment(0xE1, b"http://ns.adobe.com/xap/1.0/\x00" + make_xmp())
+    if icc:
+        extra += _segment(0xE2, b"ICC_PROFILE\x00" + bytes([1, 1]) + make_icc("Display P3"))
+    if mpf:
+        extra += _segment(0xE2, b"MPF\x00" + b"\x00" * 8)
+    if c2pa:
+        extra += _segment(0xEB, b"JP\x00\x00" + make_c2pa_payload())
+    if iptc:
+        extra += _segment(0xED, make_iptc_irb())
+    if unknown_app:
+        extra += _segment(0xEF, b"UNKNOWNDATA")
+    if comment:
+        extra += _segment(0xFE, b"secret comment")
+    if reserved_marker:
+        extra += _segment(0xF0, reserved_payload)
+
+    if fill_bytes:
+        extra += b"\xff\xff"
+
+    return head + app0 + bytes(extra) + rest + trailing
+
+
+def decode_pixels(data: bytes) -> list[bytes]:
+    """Decode every frame of an image (via Pillow) into `RGBA` bytes, one per frame."""
+    img = Image.open(io.BytesIO(data))
+    try:
+        n_frames = img.n_frames
+    except AttributeError:
+        n_frames = 1
+    frames = []
+    for i in range(n_frames):
+        img.seek(i)
+        frames.append(img.convert("RGBA").tobytes())
+    return frames
