@@ -142,3 +142,114 @@ def test_oversize_sbit_is_corrupt():
     # default make_png() is colour type 2 (RGB): sBIT must be exactly 3 bytes.
     bad = make_png(extra_chunks=[png_chunk(b"sBIT", b"\x00" * 35)])
     with pytest.raises(CorruptFileError, match="invalid sBIT"): H.parse(bad)
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave. Ruling R19 (C3, I2): a palette image needs exactly
+# one valid PLTE before its first IDAT; a PLTE in any other colour type is
+# dropped; a PNG without IDAT is corrupt. Ruling R20 (I1, triage T7): iCCP
+# must inflate to a valid ICC profile (exposed as Block.logical) and its
+# keyword is rewritten to "ICC profile"; the other appearance chunks must
+# have their exact sizes.
+# ---------------------------------------------------------------------------
+
+import siftool
+from siftool import Finding, Status
+from fixtures.make_fixtures import make_icc, write
+
+IDAT_16 = png_chunk(b"IDAT", zlib.compress(b"".join(b"\x00" + bytes(range(16)) for _ in range(16))))
+
+def _png(colour_type, bit_depth, *chunks, idat=IDAT_16):
+    ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, bit_depth, colour_type, 0, 0, 0))
+    return b"\x89PNG\r\n\x1a\n" + ihdr + b"".join(chunks) + idat + png_chunk(b"IEND", b"")
+
+def _palette(entries):
+    return png_chunk(b"PLTE", bytes(v for i in range(entries) for v in (i, 255 - i, i // 2)))
+
+def layout(data):
+    return [(b.tag, b.kind, b.removable) for b in H.parse(data).blocks]
+
+def test_palette_png_is_essential_and_verified(tmp_path):
+    data = _png(3, 8, _palette(16), png_chunk(b"tRNS", b"\x00\x80"))
+    assert [t for t, k, _ in layout(data)] == ["IHDR", "PLTE", "tRNS", "IDAT", "IEND"]
+    assert all(k is Kind.ESSENTIAL for _, k, _ in layout(data))
+    for mode in Mode:
+        res = siftool.clean(write(tmp_path, "p.png", data), tmp_path / f"o_{mode.value}.png", mode)
+        assert res.verdict.status is Status.VERIFIED and (tmp_path / f"o_{mode.value}.png").read_bytes() == data
+
+INVALID_PALETTES = {
+    "missing": _png(3, 8),
+    "two": _png(3, 8, _palette(16), _palette(16)),
+    "after-idat": _png(3, 8, idat=IDAT_16 + _palette(16)),
+    "not-multiple-of-3": _png(3, 8, png_chunk(b"PLTE", b"\x00" * 7)),
+    "empty": _png(3, 8, png_chunk(b"PLTE", b"")),
+    "over-bit-depth": _png(3, 1, _palette(3)),
+    "over-256": _png(3, 8, png_chunk(b"PLTE", b"\x00" * 3 * 257)),
+}
+
+@pytest.mark.parametrize("case", sorted(INVALID_PALETTES))
+def test_palette_png_needs_exactly_one_valid_plte_before_idat(case):
+    with pytest.raises(CorruptFileError, match="^invalid PLTE$"): H.parse(INVALID_PALETTES[case])
+
+@pytest.mark.parametrize("colour_type,bit_depth", [(0, 8), (2, 8), (4, 8), (6, 8)], ids=["gray", "rgb", "gray-alpha", "rgba"])
+def test_plte_outside_palette_images_is_unused(colour_type, bit_depth):
+    data = _png(colour_type, bit_depth, _palette(16))
+    assert layout(data) == [("IHDR", Kind.ESSENTIAL, True), ("PLTE", Kind.UNKNOWN, True),
+                            ("IDAT", Kind.ESSENTIAL, True), ("IEND", Kind.ESSENTIAL, True)]
+    [plte] = [b for b in H.parse(data).blocks if b.tag == "PLTE"]
+    assert (plte.label, plte.findings) == ("Unused PLTE chunk", [])
+    assert b"PLTE" not in clean_bytes(data, Mode.PRIVACY)
+
+@pytest.mark.parametrize("chunks", [[], [_palette(4)]], ids=["ihdr-iend", "palette-only"])
+def test_png_without_idat_is_corrupt(chunks):
+    with pytest.raises(CorruptFileError, match="^missing image data$"): H.parse(_png(3 if chunks else 2, 8, *chunks, idat=b""))
+
+APPEARANCE_SIZES = {b"gAMA": 4, b"sRGB": 1, b"cHRM": 32, b"pHYs": 9, b"cICP": 4, b"mDCV": 24, b"cLLI": 8}
+
+@pytest.mark.parametrize("ctype", sorted(APPEARANCE_SIZES), ids=lambda t: t.decode())
+def test_appearance_chunks_must_have_their_exact_size(ctype):
+    size = APPEARANCE_SIZES[ctype]
+    tag = ctype.decode()
+    for payload, expected in ((b"\x01" * size, (Kind.METADATA, C.APPEARANCE)),
+                              (b"\x01" * (size + 46), (Kind.UNKNOWN, None)),
+                              (b"\x01" * (size - 1), (Kind.UNKNOWN, None))):
+        [block] = [b for b in H.parse(_png(2, 8, png_chunk(ctype, payload))).blocks if b.tag == tag]
+        assert (block.kind, block.findings[0].category if block.findings else None) == expected
+        if block.kind is Kind.UNKNOWN:
+            assert block.removable and block.label == f"Invalid {tag} chunk"
+
+PROFILE = make_icc("Display P3", 4)
+
+def _iccp(keyword=b"icc", method=b"\x00", compressed=None):
+    return png_chunk(b"iCCP", keyword + b"\x00" + method + (zlib.compress(PROFILE) if compressed is None else compressed))
+
+def test_valid_iccp_is_rewritable_and_exposes_the_profile():
+    [iccp] = [b for b in H.parse(_png(2, 8, _iccp())).blocks if b.tag == "iCCP"]
+    assert (iccp.kind, iccp.rewritable, iccp.logical) == (Kind.METADATA, True, PROFILE)
+    assert iccp.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "iCCP", len(PROFILE))]
+
+def test_iccp_keyword_is_normalized_and_the_profile_copied_unchanged():
+    compressed = zlib.compress(PROFILE, 9)
+    data = _png(2, 8, _iccp(keyword=b"Felipe Floriani calibrated", compressed=compressed))
+    out = clean_bytes(data)
+    expected = png_chunk(b"iCCP", b"ICC profile\x00\x00" + compressed)
+    assert expected in out and b"Felipe" not in out
+    assert clean_bytes(out) == out  # idempotent: a second clean is byte-identical
+    assert H.essential_digest(H.parse(out)) == H.essential_digest(H.parse(data))
+    assert b"iCCP" not in clean_bytes(data, Mode.MAXIMUM)
+
+INVALID_ICCP = {
+    "no-keyword-terminator": png_chunk(b"iCCP", b"icc"),
+    "bad-method": _iccp(method=b"\x01"),
+    "not-zlib": _iccp(compressed=b"definitely not zlib"),
+    "truncated-stream": _iccp(compressed=zlib.compress(PROFILE)[:-6]),
+    "data-after-stream": _iccp(compressed=zlib.compress(PROFILE) + b" owner=Felipe"),
+    "not-a-profile": _iccp(compressed=zlib.compress(b"desc GPS +23.5505-046.6333 owner=Felipe")),
+    "over-4-mib": _iccp(compressed=zlib.compress(struct.pack(">I", (4 << 20) + 1) + PROFILE[4:] + bytes((4 << 20) + 1 - len(PROFILE)))),
+}
+
+@pytest.mark.parametrize("case", sorted(INVALID_ICCP))
+def test_invalid_iccp_is_dropped(case):
+    data = _png(2, 8, INVALID_ICCP[case])
+    [iccp] = [b for b in H.parse(data).blocks if b.tag == "iCCP"]
+    assert (iccp.kind, iccp.removable, iccp.label, iccp.findings) == (Kind.UNKNOWN, True, "Invalid ICC profile", [])
+    assert clean_bytes(data) == _png(2, 8)

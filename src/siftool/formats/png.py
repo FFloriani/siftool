@@ -3,28 +3,45 @@
 A PNG is a fixed 8-byte signature followed by a sequence of length-prefixed
 chunks (4-byte big-endian length, 4-byte type, `length` bytes of data, then
 a 4-byte CRC-32 of type+data), ending with `IEND`; anything after `IEND` is
-a `TRAILING` block. Chunks that define how pixels decode (`IHDR`, `PLTE`,
-`IDAT`, `IEND`, `tRNS`, `sBIT`, and the APNG animation chunks `acTL`/`fcTL`/
-`fdAT`) are `ESSENTIAL`: `write` always copies them byte-for-byte from the
-source, so `essential_digest` is unchanged by cleaning. Everything else is
-metadata, classified into privacy categories per spec table 7.2 and either
-kept, dropped, or (`eXIf`) rewritten by the planner.
+a `TRAILING` block. Chunks that define how pixels decode (`IHDR`, a palette
+image's `PLTE`, `IDAT`, `IEND`, `tRNS`, `sBIT`, and the APNG animation
+chunks `acTL`/`fcTL`/`fdAT`) are `ESSENTIAL`: `write` always copies them
+byte-for-byte from the source, so `essential_digest` is unchanged by
+cleaning. Everything else is metadata, classified into privacy categories
+per spec table 7.2 and either kept, dropped, or (`eXIf`, `iCCP`) rewritten
+by the planner.
 
-`IHDR`/`IEND`/`acTL`/`fcTL` additionally have a payload size fixed by the
-format itself (13/0/8/26 bytes), and `tRNS`/`sBIT`'s payload size is fixed
-by `IHDR`'s own colour type (and, for `tRNS` on an indexed image, `PLTE`'s
-entry count); any size outside what's allowed is `CorruptFileError` (Task
-9b) -- an `ESSENTIAL` chunk is copied byte-for-byte and never
-signature-scanned by `verify` (spec section 8), so trusting one at a size
-it was never meant to have would let it smuggle anything. `PLTE`/`IDAT`/
-`fdAT` are legitimately variable-length and keep no size check.
+An `ESSENTIAL` chunk is copied byte-for-byte and never gets `verify`'s full
+signature scan (spec section 8), so trusting one in a shape it was never
+meant to have would let it smuggle anything. Its shape is therefore
+checked, and any violation is `CorruptFileError` (Task 9b, rulings R15 and
+R19):
 
-Repeating a structure at its own legal size is just as unscanned and
-trusted as an oversize one, so count and order are enforced too (ruling
-R15): `IHDR` must be the file's first chunk and appear exactly once; `acTL`
-at most once and before the first `IDAT`; `fcTL`/`fdAT` only after an
-`acTL`. Violating any of these is the same `CorruptFileError` as a wrong
-size (`_check_structure`).
+- `IHDR`/`IEND`/`acTL`/`fcTL` have a payload size fixed by the format
+  itself (13/0/8/26 bytes); `tRNS`/`sBIT`'s size is fixed by `IHDR`'s
+  colour type (and, for `tRNS` on a palette image, `PLTE`'s entry count).
+- Count and order (`_check_structure`): `IHDR` is the file's first chunk
+  and appears exactly once; `acTL` at most once and before the first
+  `IDAT`; `fcTL`/`fdAT` only after an `acTL`; at least one `IDAT`, else
+  `CorruptFileError("missing image data")`.
+- A palette image (colour type 3) has exactly one `PLTE`, before its first
+  `IDAT`, holding a whole number of 3-byte entries, 1 to `2**bit_depth`
+  (at most 256) of them (`_check_palette`, `"invalid PLTE"`). In any other
+  colour type a `PLTE` is at most a suggestion decoders need not use: a
+  removable `UNKNOWN` block ("Unused PLTE chunk"), dropped.
+- `IDAT`/`fdAT` are variable-length compressed data and keep no size
+  check.
+
+The appearance chunks are only trusted in their own shape too (ruling
+R20): `gAMA`/`sRGB`/`cHRM`/`pHYs`/`cICP`/`mDCV`/`cLLI` at any size but their
+fixed one (`_APPEARANCE_SIZES`) become removable `UNKNOWN` blocks ("Invalid
+<TYPE> chunk"), and an `iCCP` is kept only if its zlib stream inflates --
+completely, within `_MAX_ICCP_PROFILE`, with nothing after it -- to a
+structurally valid ICC profile (`icc_profile_valid`), which is exposed as
+`Block.logical` for `verify` to scan. A kept `iCCP` is rewritten with the
+keyword `b"ICC profile"` (the compressed profile copied unchanged, the CRC
+recomputed), so a profile name can't carry identity text; an invalid one
+is dropped as "Invalid ICC profile".
 
 A chunk type's first letter's case is the PNG spec's own critical/ancillary
 flag: an unrecognized chunk starting with an uppercase letter is critical
@@ -47,7 +64,7 @@ from ..detect import register
 from ..errors import CorruptFileError, UnsafeFileError
 from ..metadata.c2pa import c2pa_findings
 from ..metadata.exif import build_minimal_exif, parse_exif, strip_exif_header
-from ..metadata.icc import icc_description
+from ..metadata.icc import icc_description, icc_profile_valid
 from ..metadata.xmp import xmp_findings
 from ..model import Action, Block, Category, Container, Finding, Kind, Plan, Span, TRAILING_TAG
 from .base import copy_span, sha256_spans
@@ -68,14 +85,23 @@ _ESSENTIAL_TYPES = frozenset(
 
 # Essential chunks whose payload size the format itself fixes (Task 9b):
 # any other size is CorruptFileError. tRNS/sBIT's size instead depends on
-# IHDR's colour type -- see _trns_size_ok / _SBIT_SIZE_BY_COLOUR_TYPE.
-# PLTE/IDAT/fdAT are legitimately variable-length and are not size-checked.
+# IHDR's colour type -- see _trns_size_ok / _SBIT_SIZE_BY_COLOUR_TYPE -- and
+# PLTE's on the palette rules (_check_palette). IDAT/fdAT are compressed
+# data of any length.
 _FIXED_ESSENTIAL_SIZES: dict[bytes, int] = {b"IHDR": 13, b"IEND": 0, b"acTL": 8, b"fcTL": 26}
+
+# The one size of each fixed-layout appearance chunk (PNG 3rd edition;
+# ruling R20): any other size is a removable UNKNOWN block, dropped.
+_APPEARANCE_SIZES: dict[bytes, int] = {
+    b"gAMA": 4, b"sRGB": 1, b"cHRM": 32, b"pHYs": 9, b"cICP": 4, b"mDCV": 24, b"cLLI": 8,
+}
+
+# The keyword every kept iCCP is rewritten with (ruling R20).
+_ICCP_KEYWORD = b"ICC profile"
 
 # sBIT's payload size by IHDR colour type (0/2/3/4/6 -- 1/5 don't exist).
 _SBIT_SIZE_BY_COLOUR_TYPE: dict[int, int] = {0: 1, 2: 3, 3: 3, 4: 2, 6: 4}
 
-_APPEARANCE_TYPES = frozenset({b"iCCP", b"sRGB", b"gAMA", b"cHRM", b"cICP", b"mDCV", b"cLLI", b"pHYs"})
 _AI_PROVENANCE_TYPES = frozenset({b"caBX", b"cPRV"})
 _TEXT_TYPES = frozenset({b"tEXt", b"zTXt", b"iTXt"})
 
@@ -141,6 +167,8 @@ class PngHandler:
     def rewrite(self, block: Block, allowed: frozenset[Category]) -> bytes | None:
         if block.tag == "eXIf":
             return _rewrite_exif(block, allowed)
+        if block.tag == "iCCP":
+            return _rewrite_iccp(block, allowed)
         return None
 
 
@@ -159,10 +187,12 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     Never raises anything but `CorruptFileError`/`UnsafeFileError`.
 
     Tracks the handful of pieces of cross-chunk state `_check_structure`
-    (count/order, ruling R15) and the `tRNS`/`sBIT` size check need:
-    `index` (this chunk's position, for "`IHDR` must be first"), whether an
-    `acTL`/`IDAT` has already been seen, `IHDR`'s own colour type, and
-    `PLTE`'s entry count.
+    (count/order, ruling R15), `_check_palette` (ruling R19) and the
+    `tRNS`/`sBIT` size check need: `index` (this chunk's position, for
+    "`IHDR` must be first"), whether an `acTL`/`PLTE`/`IDAT` has already
+    been seen, `IHDR`'s own colour type and bit depth, and `PLTE`'s entry
+    count. Reaching `IEND` without any `IDAT` is `CorruptFileError("missing
+    image data")`.
     """
     n = len(buf)
     if buf[:8] != _SIGNATURE:
@@ -172,8 +202,10 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     p = 8
     index = 0
     seen_actl = False
+    seen_plte = False
     seen_idat = False
     colour_type: int | None = None
+    bit_depth = 0
     plte_entries: int | None = None
     while True:
         if p + 8 > n:
@@ -189,11 +221,13 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
         crc = int.from_bytes(buf[data_end:crc_end], "big")
 
         _check_structure(ctype, index, seen_actl, seen_idat)
+        _check_palette(ctype, data, colour_type, bit_depth, seen_plte, seen_idat)
         blocks.append(_classify_chunk(Span(p, crc_end), ctype, data, crc, colour_type, plte_entries))
 
         if ctype == b"IHDR":
-            colour_type = data[9]
-        elif ctype == b"PLTE":
+            bit_depth, colour_type = data[8], data[9]
+        elif ctype == b"PLTE" and colour_type == 3:
+            seen_plte = True
             plte_entries = len(data) // 3
         elif ctype == b"acTL":
             seen_actl = True
@@ -203,6 +237,8 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
         index += 1
         p = crc_end
         if ctype == b"IEND":
+            if not seen_idat:
+                raise CorruptFileError("missing image data")
             return blocks, p
 
 
@@ -216,7 +252,7 @@ def _check_structure(ctype: bytes, index: int, seen_actl: bool, seen_idat: bool)
     already been seen. Each violation is `CorruptFileError("invalid
     <TYPE>")` -- the same message a wrong size would raise, since both are
     the same underlying problem: a structure trusted as `ESSENTIAL` (and so
-    never signature-scanned) that isn't actually what it claims to be.
+    never fully signature-scanned) that isn't actually what it claims to be.
     """
     if index == 0:
         if ctype != b"IHDR":
@@ -228,6 +264,28 @@ def _check_structure(ctype: bytes, index: int, seen_actl: bool, seen_idat: bool)
         raise CorruptFileError("invalid acTL")
     if ctype in (b"fcTL", b"fdAT") and not seen_actl:
         raise CorruptFileError(f"invalid {ctype.decode('ascii')}")
+
+
+def _check_palette(
+    ctype: bytes, data: bytes, colour_type: int | None, bit_depth: int, seen_plte: bool, seen_idat: bool
+) -> None:
+    """A palette image's `PLTE` rules (ruling R19); no-op for other colour types.
+
+    Colour type 3 needs exactly one `PLTE`, before the first `IDAT`, whose
+    length is a whole number of 3-byte entries, 1 to `2**bit_depth` of
+    them and never more than 256. A second or late `PLTE`, a malformed one,
+    or an `IDAT` reached with no `PLTE` yet is `CorruptFileError("invalid
+    PLTE")`: the palette is `ESSENTIAL` there, so it is never trusted in
+    any other shape.
+    """
+    if colour_type != 3:
+        return
+    if ctype == b"PLTE":
+        entries, rest = divmod(len(data), 3)
+        if seen_plte or seen_idat or rest or not 1 <= entries <= min(1 << bit_depth, 256):
+            raise CorruptFileError("invalid PLTE")
+    elif ctype == b"IDAT" and not seen_plte:
+        raise CorruptFileError("invalid PLTE")
 
 
 def _classify_chunk(
@@ -245,13 +303,20 @@ def _classify_chunk(
     length, or a `tRNS`/`sBIT` at a size `colour_type` (and, for `tRNS`,
     `plte_entries`) doesn't allow, is `CorruptFileError` too (Task 9b),
     regardless of a valid CRC -- `_FIXED_ESSENTIAL_SIZES` / `_trns_size_ok`
-    / `_SBIT_SIZE_BY_COLOUR_TYPE`. `colour_type` is always already known
-    here: `_check_structure` guarantees `IHDR` was the first chunk read,
-    and classifying it (below) always sets it before any later chunk is
-    reached.
+    / `_SBIT_SIZE_BY_COLOUR_TYPE`. A `PLTE` is `ESSENTIAL` only in a
+    palette image (its shape already checked by `_check_palette`); in any
+    other colour type it is a removable `UNKNOWN` "Unused PLTE chunk"
+    (ruling R19). `colour_type` is always already known here:
+    `_check_structure` guarantees `IHDR` was the first chunk read, and
+    `_read_chunks` records it before any later chunk is reached.
     """
     tag = ctype.decode("ascii", errors="replace")
     valid_crc = (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
+
+    if ctype == b"PLTE" and colour_type != 3:
+        # Only a palette image decodes through PLTE (ruling R19); elsewhere
+        # decoders may ignore it, so it is dropped rather than trusted.
+        return Block(Kind.UNKNOWN, span, "Unused PLTE chunk", tag, removable=True, corrupt=not valid_crc)
 
     if ctype in _ESSENTIAL_TYPES:
         if not valid_crc:
@@ -293,11 +358,14 @@ def _classify_non_essential(span: Span, tag: str, ctype: bytes, data: bytes) -> 
     this never actually returns a `Block` for those; only ancillary
     unknown chunks fall through to a `Kind.UNKNOWN` `Block`.
     """
-    if ctype in _APPEARANCE_TYPES:
-        finding = _iccp_finding(data) if ctype == b"iCCP" else Finding(
-            Category.APPEARANCE, _APPEARANCE_LABELS.get(ctype, tag), where=tag, size=len(data)
-        )
-        return Block(Kind.METADATA, span, finding.label, tag, findings=[finding])
+    if ctype == b"iCCP":
+        return _classify_iccp(span, tag, data)
+
+    if ctype in _APPEARANCE_SIZES:
+        if len(data) != _APPEARANCE_SIZES[ctype]:
+            return Block(Kind.UNKNOWN, span, f"Invalid {tag} chunk", tag, removable=True)
+        label = _APPEARANCE_LABELS[ctype]
+        return Block(Kind.METADATA, span, label, tag, findings=[Finding(Category.APPEARANCE, label, None, tag, len(data))])
 
     if ctype == b"eXIf":
         tiff = strip_exif_header(data)
@@ -320,25 +388,43 @@ def _classify_non_essential(span: Span, tag: str, ctype: bytes, data: bytes) -> 
     return Block(Kind.UNKNOWN, span, f"Unknown chunk {tag}", tag, removable=True)
 
 
-def _iccp_finding(data: bytes) -> Finding:
-    """iCCP: `keyword\\0 compression_method(1) compressed_profile` -> `appearance`.
+def _classify_iccp(span: Span, tag: str, data: bytes) -> Block:
+    """iCCP: `keyword\\0 compression_method(1) zlib(profile)` (ruling R20).
 
-    Decompression is capped at 4 MiB (the brief's ceiling for the
-    description). Never raises: any structural problem (no keyword
-    terminator, bad zlib stream, unreadable profile) degrades to
-    `detail=None` rather than propagating.
+    A valid profile (`_iccp_profile`) makes a rewritable `appearance` block
+    exposing the inflated profile as `logical`; the rewrite only
+    normalizes the keyword (`_rewrite_iccp`). Anything else is a removable
+    `UNKNOWN` "Invalid ICC profile" block: the broken profile is dropped.
     """
-    description = None
-    size = len(data)
+    profile = _iccp_profile(data)
+    if profile is None:
+        return Block(Kind.UNKNOWN, span, "Invalid ICC profile", tag, removable=True)
+    finding = Finding(Category.APPEARANCE, "ICC profile", icc_description(profile), tag, len(profile))
+    return Block(
+        Kind.METADATA, span, "ICC profile", tag, findings=[finding], rewritable=True, raw=data, logical=profile
+    )
+
+
+def _iccp_profile(data: bytes) -> bytes | None:
+    """The ICC profile an iCCP chunk's data holds, or None if it holds no valid one.
+
+    The keyword's NUL terminator must be followed by compression method 0
+    (zlib/deflate) and a zlib stream that inflates completely, within
+    `_MAX_ICCP_PROFILE`, with no byte after its end -- nothing may hide
+    behind the stream -- to a structurally valid profile
+    (`icc_profile_valid`). Never raises.
+    """
+    i = data.find(b"\x00")
+    if i < 0 or data[i + 1 : i + 2] != b"\x00":
+        return None
+    inflater = zlib.decompressobj()
     try:
-        i = data.index(b"\x00")
-        compressed = data[i + 2 :]  # skip the NUL and the 1-byte compression method
-        profile = zlib.decompressobj().decompress(compressed, _MAX_ICCP_PROFILE)
-        description = icc_description(profile)
-        size = len(profile)
-    except Exception:
-        pass
-    return Finding(Category.APPEARANCE, "ICC profile", description, "iCCP", size=size)
+        profile = inflater.decompress(data[i + 2 :], _MAX_ICCP_PROFILE)
+    except zlib.error:
+        return None
+    if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+        return None
+    return profile if icc_profile_valid(profile) else None
 
 
 def _time_finding(data: bytes) -> Finding:
@@ -441,7 +527,7 @@ def _trailing_block(source: bytes, start: int, end: int) -> Block:
 
 
 # ---------------------------------------------------------------------------
-# Rewriting: eXIf -> a reduced replacement chunk
+# Rewriting: eXIf -> a reduced replacement chunk; iCCP -> its normalized keyword
 # ---------------------------------------------------------------------------
 
 
@@ -457,6 +543,20 @@ def _rewrite_exif(block: Block, allowed: frozenset[Category]) -> bytes | None:
     if minimal is None:
         return None
     return _build_chunk(b"eXIf", minimal)
+
+
+def _rewrite_iccp(block: Block, allowed: frozenset[Category]) -> bytes | None:
+    """The iCCP chunk with its keyword normalized to `_ICCP_KEYWORD` (ruling R20), or None.
+
+    The compression method and the compressed profile are copied byte for
+    byte and the CRC is recomputed, so the rewrite is idempotent and the
+    profile itself never changes. The profile is `appearance` and nothing
+    else, so the chunk is dropped (None) when `allowed` excludes it.
+    """
+    if Category.APPEARANCE not in allowed:
+        return None
+    keyword_end = block.raw.index(b"\x00")
+    return _build_chunk(b"iCCP", _ICCP_KEYWORD + block.raw[keyword_end:])
 
 
 def _build_chunk(ctype: bytes, data: bytes) -> bytes:

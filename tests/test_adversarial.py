@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import io
 import struct
+import zlib
 
 import pytest
 from PIL import Image
@@ -22,6 +23,7 @@ from siftool import Category as C, Finding, Mode, Status
 from fixtures.make_fixtures import (
     base_jpeg,
     decode_pixels,
+    make_icc,
     make_png,
     make_tiff_exif,
     make_webp,
@@ -361,3 +363,62 @@ def test_jpeg_signature_split_across_three_icc_chunks_is_dropped(tmp_path, mode)
     chunks = b"".join(_segment(0xE2, b"ICC_PROFILE\x00" + bytes([i + 1, 3]) + p) for i, p in enumerate(parts))
     res, out = _clean(tmp_path, _jpeg_after_soi(chunks), ".jpg", mode)
     assert res.verdict.status is Status.VERIFIED and b"05-046.6333" not in out and out == base_jpeg()
+
+
+# ---------------------------------------------------------------------------
+# C3, I2 / ruling R19 (PNG) and I1 / ruling R20 (PNG iCCP and the fixed-size
+# appearance chunks).
+# ---------------------------------------------------------------------------
+
+
+def _bare_png(*chunks: bytes) -> bytes:
+    """The fixture's 16x16 RGB PNG with only IHDR/IDAT/IEND, plus `chunks` right before its IDAT."""
+    png = make_png(**_BARE_PNG)
+    at = png.index(b"IDAT") - 4
+    return png[:at] + b"".join(chunks) + png[at:]
+
+
+_SUGGESTED_PALETTE = QUIET_SECRET + b"\x00" * (-len(QUIET_SECRET) % 3)
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_png_suggested_palette_carrying_text_is_dropped(tmp_path, mode):
+    res, out = _clean(tmp_path, _bare_png(png_chunk(b"PLTE", _SUGGESTED_PALETTE)), ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out and out == make_png(**_BARE_PNG)
+
+
+@pytest.mark.parametrize("mode", list(Mode))
+def test_png_two_palettes_in_a_truecolor_image_are_dropped(tmp_path, mode):
+    plte = png_chunk(b"PLTE", _SUGGESTED_PALETTE)
+    res, out = _clean(tmp_path, _bare_png(plte, plte), ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out and out == make_png(**_BARE_PNG)
+
+
+def test_png_without_idat_is_corrupt(tmp_path):
+    png = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + png_chunk(b"IEND", b"")
+    src = write(tmp_path, "a.png", png)
+    with pytest.raises(siftool.CorruptFileError, match="^missing image data$"):
+        siftool.clean(src, tmp_path / "out.png", Mode.MAXIMUM)
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_png_iccp_hiding_coordinates_in_its_zlib_stream_is_dropped(tmp_path, mode):
+    compressed = zlib.compress(b"desc " + SECRET)
+    res, out = _clean(tmp_path, _bare_png(png_chunk(b"iCCP", b"icc\x00\x00" + compressed)), ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and compressed not in out and out == make_png(**_BARE_PNG)
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_png_iccp_keyword_carrying_identity_is_rewritten(tmp_path, mode):
+    compressed = zlib.compress(make_icc("Display P3"))
+    data = _bare_png(png_chunk(b"iCCP", b"Felipe Floriani calibrated\x00\x00" + compressed))
+    res, out = _clean(tmp_path, data, ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and b"Felipe Floriani" not in out
+    assert out == _bare_png(png_chunk(b"iCCP", b"ICC profile\x00\x00" + compressed))
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+def test_png_oversize_gama_carrying_text_is_dropped(tmp_path, mode):
+    data = _bare_png(png_chunk(b"gAMA", struct.pack(">I", 45455) + QUIET_SECRET))
+    res, out = _clean(tmp_path, data, ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and QUIET_SECRET not in out and out == make_png(**_BARE_PNG)
