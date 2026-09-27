@@ -17,6 +17,7 @@ def test_parse_classifies_chunks():
     assert by_tag(c, "caBX")[0].findings[0].category is C.AI_PROVENANCE
     assert by_tag(c, "eXIf")[0].rewritable and by_tag(c, "tIME")[0].findings[0].category is C.TIME
     assert by_tag(c, "vpAg")[0].kind is Kind.UNKNOWN and c.blocks[-1].tag == "TRAILING"
+    assert all(f.where for b in c.blocks for f in b.findings)
 
 @pytest.mark.parametrize("kw", sorted(AI_TEXT_KEYWORDS))
 def test_ai_keywords(kw):
@@ -29,10 +30,16 @@ def test_comment_json_prompt_is_ai_and_other_keywords():
     assert by_label["Comment"] is C.AI_PROVENANCE and by_label["Author"] is C.IDENTITY
     assert by_label["Software"] is C.SOFTWARE and by_label["Title"] is C.TEXT
 
+def test_comment_with_bare_prompt_word_is_not_ai_provenance():
+    c = H.parse(make_png(ai_text=False, extra_chunks=[png_chunk(b"tEXt", b'Comment\x00{"note": "impromptu"}')]))
+    assert by_tag(c, "tEXt")[-1].findings[0].category is C.TEXT
+
 def test_ztxt_decompression_is_bounded():
     z = zlib.compressobj(); bomb = b"".join(z.compress(b"\x00" * (1 << 20)) for _ in range(50)) + z.flush()
     c = H.parse(make_png(extra_chunks=[png_chunk(b"zTXt", b"Title\x00\x00" + bomb)]))
-    assert len(by_tag(c, "zTXt")[-1].findings[0].detail or "") <= 80
+    finding = by_tag(c, "zTXt")[-1].findings[0]
+    assert finding.size <= 1 << 20
+    assert len(finding.detail or "") <= 80
 
 def test_unknown_critical_chunk_is_unsafe():
     with pytest.raises(UnsafeFileError): H.parse(make_png(extra_chunks=[png_chunk(b"ABCD", b"x")]))
@@ -41,6 +48,11 @@ def test_bad_crc_rules():
     with pytest.raises(CorruptFileError): H.parse(make_png(bad_crc="IDAT"))
     clean_bytes(make_png(bad_crc="tEXt"))
     with pytest.raises(CorruptFileError): clean_bytes(make_png(bad_crc="iCCP"))
+
+def test_bad_crc_on_rewrite_raises_except_in_maximum():
+    with pytest.raises(CorruptFileError): clean_bytes(make_png(bad_crc="eXIf"), Mode.PRIVACY)
+    with pytest.raises(CorruptFileError): clean_bytes(make_png(bad_crc="eXIf"), Mode.PHOTOGRAPHER)
+    clean_bytes(make_png(bad_crc="eXIf"), Mode.MAXIMUM)
 
 def test_apng_chunks_are_essential_and_frames_survive():
     src = make_png(apng=True); c = H.parse(src)

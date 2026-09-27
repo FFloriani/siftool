@@ -103,6 +103,8 @@ class PngHandler:
                     raise CorruptFileError(f"cannot keep {block.tag} chunk: invalid CRC")
                 copy_span(container.source, block.span, out)
             elif action == Action.REWRITE:
+                if block.corrupt:
+                    raise CorruptFileError(f"cannot rewrite {block.tag} chunk: invalid CRC")
                 out.write(plan.replacements[index])
             # DROP: write nothing. ZERO never occurs for PNG (positional=False).
 
@@ -161,7 +163,8 @@ def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
     A CRC mismatch on an `ESSENTIAL` chunk is `CorruptFileError` right
     away; on any other chunk it just marks `Block.corrupt = True` (the
     chunk is still classified normally -- CRC validity doesn't affect
-    what it means, only whether it's safe to keep verbatim later).
+    what it means, only whether it's safe for `write` to send its bytes
+    to the output at all, verbatim via KEEP or rebuilt via REWRITE).
     """
     tag = ctype.decode("ascii", errors="replace")
     valid_crc = (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
@@ -260,7 +263,7 @@ def _classify_text(span: Span, tag: str, data: bytes) -> Block:
         return Block(Kind.METADATA, span, "XMP packet", tag, findings=xmp_findings(raw, tag))
 
     text = raw.decode("utf-8" if tag == "iTXt" else "latin-1", errors="replace")
-    finding = Finding(_text_category(keyword, text), keyword, text, tag)
+    finding = Finding(_text_category(keyword, text), keyword, text, tag, size=len(raw))
     return Block(Kind.METADATA, span, keyword or tag, tag, findings=[finding])
 
 
@@ -312,7 +315,7 @@ def _text_category(keyword: str, text: str) -> Category:
     """Spec 7.2's tEXt/zTXt/iTXt keyword table."""
     if keyword in AI_TEXT_KEYWORDS:
         return Category.AI_PROVENANCE
-    if keyword == "Comment" and text.startswith("{") and "prompt" in text:
+    if keyword == "Comment" and text.startswith("{") and '"prompt"' in text:
         return Category.AI_PROVENANCE
     if keyword in ("Author", "Copyright"):
         return Category.IDENTITY
@@ -327,7 +330,7 @@ def _trailing_block(source: bytes, start: int, end: int) -> Block:
     label = "Data after end of image"
     return Block(
         Kind.METADATA, Span(start, end), label, TRAILING_TAG,
-        findings=[Finding(Category.EXTRAS, label, size=end - start)],
+        findings=[Finding(Category.EXTRAS, label, where=TRAILING_TAG, size=end - start)],
     )
 
 
