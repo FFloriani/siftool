@@ -37,9 +37,11 @@ changes the digest.
 
 Robustness is a hard requirement, same as every other handler: a
 truncated chunk header, a chunk whose declared size runs past the RIFF's
-own declared end, a RIFF size that runs past the actual file, or a `VP8X`
-shorter than its fixed 10-byte payload are all `CorruptFileError`, never
-an unguarded exception.
+own declared end, a RIFF size that runs past the actual file, or a `VP8X`/
+`ANIM` at any size other than its one fixed length (10/6 bytes, Task 9b --
+each is copied byte-for-byte and never signature-scanned by `verify`, spec
+section 8, so trusting either at the wrong size would let it smuggle
+anything) are all `CorruptFileError`, never an unguarded exception.
 """
 
 from __future__ import annotations
@@ -77,6 +79,11 @@ _ESSENTIAL_LABELS: dict[bytes, str] = {
     b"ANMF": "Animation frame",
 }
 _ESSENTIAL_TYPES = frozenset(_ESSENTIAL_LABELS)
+
+# Essential chunks whose payload size the format itself fixes (Task 9b):
+# any other size is CorruptFileError. VP8L/VP8 /ALPH/ANMF are legitimately
+# variable-length and are not in this table.
+_FIXED_ESSENTIAL_SIZES: dict[bytes, int] = {b"VP8X": 10, b"ANIM": 6}
 
 # tag (space-stripped) -> the VP8X bit it controls, for recomputing flags.
 _FLAG_BY_TAG: dict[str, int] = {"ICCP": VP8X_ICC, "EXIF": VP8X_EXIF, "XMP": VP8X_XMP}
@@ -170,12 +177,17 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
 
 
 def _classify_chunk(span: Span, fourcc: bytes, payload: bytes) -> Block:
-    """Classify one top-level RIFF chunk into its `Block`, per spec table 7.3."""
+    """Classify one top-level RIFF chunk into its `Block`, per spec table 7.3.
+
+    A `VP8X`/`ANIM` at any size other than its one fixed length is
+    `CorruptFileError` (Task 9b) -- `_FIXED_ESSENTIAL_SIZES`.
+    """
     tag = fourcc.decode("ascii", errors="replace").rstrip(" ")
 
     if fourcc in _ESSENTIAL_TYPES:
-        if fourcc == b"VP8X" and len(payload) < 10:
-            raise CorruptFileError("VP8X chunk shorter than its 10-byte payload")
+        fixed_size = _FIXED_ESSENTIAL_SIZES.get(fourcc)
+        if fixed_size is not None and len(payload) != fixed_size:
+            raise CorruptFileError(f"invalid {tag}")
         return Block(Kind.ESSENTIAL, span, _ESSENTIAL_LABELS[fourcc], tag)
 
     if fourcc == b"ICCP":

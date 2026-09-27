@@ -76,3 +76,28 @@ def test_decode_pixels_of_mpf_fixture_is_silent():
         warnings.simplefilter("error")
         frames = decode_pixels(make_jpeg(mpf=True))
     assert frames
+
+# ---------------------------------------------------------------------------
+# Task 9b: APP14 "Adobe" is only ESSENTIAL at its one fixed 12-byte payload
+# (write() copies an ESSENTIAL block byte-for-byte and verify() never
+# signature-scans it, so an oversize one could otherwise smuggle a secret
+# past both). Any other size is kept -- dropping it would shift CMYK
+# colors -- but as a non-removable UNKNOWN block instead.
+# ---------------------------------------------------------------------------
+
+def _with_app14(payload: bytes) -> bytes:
+    """`base_jpeg()` with a raw APP14 segment carrying `payload` spliced in
+    right after SOI."""
+    segment = bytes([0xFF, 0xEE]) + struct.pack(">H", len(payload) + 2) + payload
+    base = base_jpeg()
+    return base[:2] + segment + base[2:]
+
+def test_standard_adobe_segment_is_essential():
+    payload = b"Adobe" + b"\x00\x64\x00\x00\x00\x00\x01"
+    [app14] = by_tag(H.parse(_with_app14(payload)), "APP14:Adobe")
+    assert app14.kind is Kind.ESSENTIAL
+
+def test_oversize_adobe_segment_is_kept_but_not_trusted():
+    payload = b"Adobe" + b"\x00\x64\x00\x00\x00\x00\x01" + b" GPS +23.5505-046.6333 owner=Felipe"
+    [app14] = by_tag(H.parse(_with_app14(payload)), "APP14")
+    assert app14.kind is Kind.UNKNOWN and app14.removable is False

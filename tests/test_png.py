@@ -69,3 +69,45 @@ def test_photographer_rewrites_exif():
     out = clean_bytes(make_png(), Mode.PHOTOGRAPHER)
     labels = {f.label for b in H.parse(out).blocks if b.tag == "eXIf" for f in b.findings}
     assert {"Make", "Model"} <= labels and not any(l.startswith("GPS") for l in labels)
+
+# ---------------------------------------------------------------------------
+# Task 9b: essential chunks whose payload size is fixed by the format must
+# actually be that size -- write() copies an ESSENTIAL chunk byte-for-byte
+# and verify() never signature-scans it, so an oversize IHDR/IEND/acTL/fcTL
+# could otherwise smuggle a secret past both.
+# ---------------------------------------------------------------------------
+
+def _rebuild_with_chunk(data: bytes, ctype: bytes, payload: bytes) -> bytes:
+    """Rebuild a PNG, replacing the first chunk of type `ctype` with one
+    carrying `payload` and a valid CRC; every other byte (signature, every
+    other chunk) is copied unchanged. Assumes no data after IEND."""
+    out = bytearray(data[:8])
+    p = 8
+    replaced = False
+    while p < len(data):
+        length = int.from_bytes(data[p : p + 4], "big")
+        this_type = data[p + 4 : p + 8]
+        end = p + 8 + length + 4
+        if this_type == ctype and not replaced:
+            out += png_chunk(ctype, payload)
+            replaced = True
+        else:
+            out += data[p:end]
+        p = end
+    assert replaced
+    return bytes(out)
+
+def test_oversize_ihdr_is_corrupt():
+    bad = _rebuild_with_chunk(make_png(), b"IHDR", b"\x00" * 14)
+    with pytest.raises(CorruptFileError): H.parse(bad)
+
+def test_iend_with_payload_is_corrupt():
+    secret = b" GPS +23.5505-046.6333 owner=Felipe"
+    bad = _rebuild_with_chunk(make_png(), b"IEND", secret)
+    with pytest.raises(CorruptFileError): H.parse(bad)
+
+def test_apng_control_chunks_must_have_fixed_size():
+    with pytest.raises(CorruptFileError):
+        H.parse(_rebuild_with_chunk(make_png(apng=True), b"acTL", b"\x00" * 9))
+    with pytest.raises(CorruptFileError):
+        H.parse(_rebuild_with_chunk(make_png(apng=True), b"fcTL", b"\x00" * 25))

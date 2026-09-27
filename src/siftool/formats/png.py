@@ -10,6 +10,13 @@ source, so `essential_digest` is unchanged by cleaning. Everything else is
 metadata, classified into privacy categories per spec table 7.2 and either
 kept, dropped, or (`eXIf`) rewritten by the planner.
 
+`IHDR`/`IEND`/`acTL`/`fcTL` additionally have a payload size fixed by the
+format itself (13/0/8/26 bytes); any other size is `CorruptFileError`
+(Task 9b) -- an `ESSENTIAL` chunk is copied byte-for-byte and never
+signature-scanned by `verify` (spec section 8), so trusting one at a size
+it was never meant to have would let it smuggle anything. `PLTE`/`IDAT`/
+`tRNS`/`sBIT`/`fdAT` are legitimately variable-length and keep no such check.
+
 A chunk type's first letter's case is the PNG spec's own critical/ancillary
 flag: an unrecognized chunk starting with an uppercase letter is critical
 (the file cannot be safely processed without understanding it, so parsing
@@ -49,6 +56,11 @@ AI_TEXT_KEYWORDS = frozenset(
 _ESSENTIAL_TYPES = frozenset(
     {b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"sBIT", b"acTL", b"fcTL", b"fdAT"}
 )
+
+# Essential chunks whose payload size the format itself fixes (Task 9b):
+# any other size is CorruptFileError. PLTE/IDAT/tRNS/sBIT/fdAT are
+# legitimately variable-length and are not in this table.
+_FIXED_ESSENTIAL_SIZES: dict[bytes, int] = {b"IHDR": 13, b"IEND": 0, b"acTL": 8, b"fcTL": 26}
 _APPEARANCE_TYPES = frozenset({b"iCCP", b"sRGB", b"gAMA", b"cHRM", b"cICP", b"mDCV", b"cLLI", b"pHYs"})
 _AI_PROVENANCE_TYPES = frozenset({b"caBX", b"cPRV"})
 _TEXT_TYPES = frozenset({b"tEXt", b"zTXt", b"iTXt"})
@@ -165,6 +177,10 @@ def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
     chunk is still classified normally -- CRC validity doesn't affect
     what it means, only whether it's safe for `write` to send its bytes
     to the output at all, verbatim via KEEP or rebuilt via REWRITE).
+
+    An `IHDR`/`IEND`/`acTL`/`fcTL` at any size other than its one fixed
+    length is `CorruptFileError` too (Task 9b), regardless of a valid CRC
+    -- `_FIXED_ESSENTIAL_SIZES`.
     """
     tag = ctype.decode("ascii", errors="replace")
     valid_crc = (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
@@ -172,6 +188,9 @@ def _classify_chunk(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
     if ctype in _ESSENTIAL_TYPES:
         if not valid_crc:
             raise CorruptFileError(f"invalid CRC in essential chunk {tag}")
+        fixed_size = _FIXED_ESSENTIAL_SIZES.get(ctype)
+        if fixed_size is not None and len(data) != fixed_size:
+            raise CorruptFileError(f"invalid {tag}")
         return Block(Kind.ESSENTIAL, span, _ESSENTIAL_LABELS.get(ctype, tag), tag)
 
     block = _classify_non_essential(span, tag, ctype, data)

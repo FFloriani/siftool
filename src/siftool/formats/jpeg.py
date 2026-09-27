@@ -4,12 +4,19 @@ A JPEG is a sequence of marker segments starting with `SOI` (`0xFFD8`) and
 ending with `EOI` (`0xFFD9`); anything after `EOI` is a `TRAILING` block
 (Motion Photo video, an MPF secondary image, a Samsung SEFT trailer, ...).
 Segments that define how pixels decode (`DQT`/`DHT`/`SOF`/`SOS` plus its
-entropy-coded data/`EOI`/the Adobe `APP14` color-transform marker) are
-`ESSENTIAL`: `write` always copies them byte-for-byte from the source, so
-`essential_digest` is unchanged by cleaning -- the "bit-for-bit" proof
-behind the Verified Clean seal. Everything else is metadata, classified
-into privacy categories per spec table 7.1 and either kept, dropped, or
-(EXIF, and JFIF carrying a thumbnail) rewritten by the planner.
+entropy-coded data/`EOI`/a standard, exactly-12-byte Adobe `APP14`
+color-transform marker) are `ESSENTIAL`: `write` always copies them
+byte-for-byte from the source, so `essential_digest` is unchanged by
+cleaning -- the "bit-for-bit" proof behind the Verified Clean seal.
+Everything else is metadata, classified into privacy categories per spec
+table 7.1 and either kept, dropped, or (EXIF, and JFIF carrying a
+thumbnail) rewritten by the planner.
+
+An `APP14` starting with `b"Adobe"` at any size other than that one fixed
+12 bytes is kept -- dropping it would shift a CMYK JPEG's colors -- but as
+a non-removable `UNKNOWN` block instead of `ESSENTIAL` (Task 9b), so it is
+covered by `verify`'s signature scan (spec section 8) rather than trusted
+unscanned like a real Adobe marker.
 
 Fill bytes (extra `0xFF` before a marker) are tolerated on read and, since
 they are folded into the following block's span, reproduced unchanged
@@ -55,6 +62,7 @@ _MPF_SIG = b"MPF\x00"
 _JUMBF_CI = b"JP"
 _IPTC_SIG = b"Photoshop 3.0\x00"
 _ADOBE_SIG = b"Adobe"
+_ADOBE_PAYLOAD_LEN = 12  # Adobe(5) + version(2) + flags0(2) + flags1(2) + transform(1)
 
 _MAX_EXIF_PAYLOAD = 65533  # 2-byte length field max (65535) minus itself
 
@@ -289,8 +297,29 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
             findings=iptc_findings(payload, "APP13/IRB"),
         )
     if code == 0xEE and payload.startswith(_ADOBE_SIG):
-        return Block(Kind.ESSENTIAL, span, "Adobe color transform", "APP14:Adobe")
+        return _classify_adobe(span, payload)
     return Block(Kind.UNKNOWN, span, f"Unknown APP{n}", f"APP{n}", removable=True)
+
+
+def _classify_adobe(span: Span, payload: bytes) -> Block:
+    """APP14 `Adobe`: `ESSENTIAL` only at its one fixed 12-byte payload.
+
+    Any other size is kept -- dropping it would shift a CMYK JPEG's colors
+    -- but demoted to a non-removable `UNKNOWN` block (Task 9b: a reviewer
+    hid a secret inside an oversize one and it came back "verified", since
+    an `ESSENTIAL` block is copied byte-for-byte and never reaches
+    `verify`'s signature scan). Tagged plainly `"APP14"`, not
+    `"APP14:Adobe"`, so it reads as the same non-standard-and-unscanned
+    structure regardless of which way its size is wrong.
+    """
+    if len(payload) == _ADOBE_PAYLOAD_LEN:
+        return Block(Kind.ESSENTIAL, span, "Adobe color transform", "APP14:Adobe")
+    label = "Non-standard Adobe segment"
+    return Block(
+        Kind.UNKNOWN, span, label, "APP14",
+        findings=[Finding(Category.UNKNOWN, label, None, "APP14", len(payload))],
+        removable=False,
+    )
 
 
 def _classify_jfif(span: Span, payload: bytes) -> Block:

@@ -42,3 +42,41 @@ def test_simple_without_metadata_is_byte_identical():
 def test_riff_size_beyond_file_is_corrupt():
     src = make_webp("lossy"); bad = src[:4] + struct.pack("<I", len(src) * 2) + src[8:]
     with pytest.raises(CorruptFileError): H.parse(bad)
+
+# ---------------------------------------------------------------------------
+# Task 9b: VP8X/ANIM's payload size is fixed by the format; write() copies
+# an ESSENTIAL chunk byte-for-byte and verify() never signature-scans it, so
+# an oversize VP8X/ANIM could otherwise smuggle a secret past both.
+# ---------------------------------------------------------------------------
+
+def _rebuild_with_chunk(data: bytes, fourcc: bytes, payload: bytes) -> bytes:
+    """Rebuild a WEBP RIFF, replacing the first top-level chunk of type
+    `fourcc` with one carrying `payload`, and fixing up the RIFF size field.
+    Every other chunk is copied unchanged; trailing data (if any) is kept."""
+    riff_size = int.from_bytes(data[4:8], "little")
+    trailing = data[8 + riff_size :]
+    body = bytearray()
+    replaced = False
+    for tag, chunk_payload in riff_chunks(data):
+        if tag == fourcc and not replaced:
+            chunk_payload = payload
+            replaced = True
+        body += tag + struct.pack("<I", len(chunk_payload)) + chunk_payload
+        if len(chunk_payload) % 2:
+            body += b"\x00"
+    assert replaced
+    body = bytes(body)
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body + trailing
+
+def test_oversize_vp8x_is_corrupt():
+    src = make_webp("lossless")
+    vp8x = dict(riff_chunks(src))[b"VP8X"]
+    secret = b" GPS +23.5505-046.6333 owner=Felipe"
+    bad = _rebuild_with_chunk(src, b"VP8X", vp8x + secret)
+    with pytest.raises(CorruptFileError): H.parse(bad)
+
+def test_oversize_anim_is_corrupt():
+    src = make_webp("animated")
+    anim = dict(riff_chunks(src))[b"ANIM"]
+    bad = _rebuild_with_chunk(src, b"ANIM", anim + b"\x00")
+    with pytest.raises(CorruptFileError): H.parse(bad)

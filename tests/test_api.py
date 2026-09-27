@@ -110,3 +110,24 @@ def test_clean_of_already_clean_file_is_byte_identical(tmp_path, name, data):
     siftool.clean(write(tmp_path, name, data), first)
     res = siftool.clean(first, second)
     assert second.read_bytes() == first.read_bytes() and res.verdict.status is Status.VERIFIED
+
+def _jpeg_with_app14(payload: bytes) -> bytes:
+    """A base JPEG with a raw APP14 segment carrying `payload`, spliced in
+    right after SOI (Task 9b: reproduce the oversize-Adobe-segment hole)."""
+    segment = bytes([0xFF, 0xEE]) + struct.pack(">H", len(payload) + 2) + payload
+    base = base_jpeg()
+    return base[:2] + segment + base[2:]
+
+def test_secret_in_oversize_adobe_segment_is_never_verified(tmp_path):
+    standard = b"Adobe" + b"\x00\x64\x00\x00\x00\x00\x01"
+    secret = b" GPS +23.5505-046.6333 owner=Felipe"
+    src = write(tmp_path, "a.jpg", _jpeg_with_app14(standard + secret))
+    dst = tmp_path / "a_clean.jpg"
+    with pytest.raises(VerificationFailedError):
+        siftool.clean(src, dst)
+    assert not dst.exists()
+
+    src2 = write(tmp_path, "b.jpg", _jpeg_with_app14(standard + b"\x00\x00\x00\x00"))
+    res = siftool.clean(src2, tmp_path / "b_clean.jpg")
+    assert res.verdict.status is Status.WARNINGS
+    assert "Unrecognized structure kept: APP14" in res.verdict.notes
