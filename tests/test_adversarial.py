@@ -510,3 +510,92 @@ def test_coordinates_inside_a_compressed_iccp_profile_are_found(tmp_path):
     assert b"+23.5505" not in data
     verdict = _clean_fails(tmp_path, data, ".png", Mode.PRIVACY)
     assert verdict.violations == [Finding(C.LOCATION, "ISO 6709 coordinates", None, "iCCP")]
+
+
+# ===========================================================================
+# Residual round (rulings R24-R26, R28): variants of C1 and I1 from the fix
+# wave's re-review (probes rr_attack.py and rr_attack2.py). A structure that
+# may appear once is trusted once: repeats are dropped, and what the first
+# instance keeps is bounded by its own standard size.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# R24: one entry per (IFD, tag) -- repeats are reported as UNKNOWN and never
+# written back -- and one EXIF block per file.
+# ---------------------------------------------------------------------------
+
+SECRET8 = [QUIET_SECRET[i:i + 8].ljust(8, b".") for i in range(0, len(QUIET_SECRET), 8)]  # one RATIONAL each
+
+
+def _rational_detail(value: bytes) -> str:
+    """How an 8-byte big-endian RATIONAL value reads back as a Finding detail."""
+    return f"{int.from_bytes(value[:4], 'big')}/{int.from_bytes(value[4:], 'big')}"
+
+
+def _tiff_repeated_rational(tag: int, pieces: list[bytes], *, orientation: bool = True) -> bytes:
+    """IFD0 = [Orientation] + one RATIONAL `tag` entry per piece, the values laid out back to back."""
+    first = [_orientation()] if orientation else []
+    vals_off = 8 + _ifd_len(len(first) + len(pieces))
+    entries = first + [(tag, 5, 1, struct.pack(">I", vals_off + 8 * k)) for k in range(len(pieces))]
+    return tiff_header() + tiff_ifd(entries) + b"".join(pieces)
+
+
+def _tiff_repeated_gamma_in_exif_ifd(pieces: list[bytes]) -> bytes:
+    """IFD0 = Orientation + ExifIFD pointer; the ExifIFD holds one Gamma (RATIONAL) entry per piece."""
+    exif_off = 8 + _ifd_len(2)
+    vals_off = exif_off + _ifd_len(len(pieces))
+    ifd0 = tiff_ifd([_orientation(), (0x8769, 4, 1, struct.pack(">I", exif_off))])
+    exif = tiff_ifd([(0xA500, 5, 1, struct.pack(">I", vals_off + 8 * k)) for k in range(len(pieces))])
+    return tiff_header() + ifd0 + exif + b"".join(pieces)
+
+
+def _ifd_findings(path, ifd: str) -> list[tuple[str, str | None]]:
+    """`(label, detail)` of every finding `inspect` reports inside the EXIF IFD named `ifd`."""
+    return [(f.label, f.detail) for f in siftool.inspect(path).findings if f.where.endswith("/" + ifd)]
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+@pytest.mark.parametrize("fmt", sorted(EXIF_CARRIERS))
+def test_repeated_xresolution_keeps_only_its_first_entry(tmp_path, fmt, mode):  # rr_attack E1
+    wrap, ext = EXIF_CARRIERS[fmt]
+    res, out = _clean(tmp_path, wrap(_tiff_repeated_rational(0x011A, SECRET8)), ext, mode)
+    assert res.verdict.status is Status.VERIFIED and not [p for p in SECRET8[1:] if p in out]
+    assert _ifd_findings(tmp_path / f"out_{mode.value}{ext}", "IFD0") == [
+        ("Orientation", "1"), ("XResolution", _rational_detail(SECRET8[0]))]
+
+
+def test_kilobytes_in_repeated_xresolution_are_not_carried_over(tmp_path):  # rr_attack E1b
+    blob = bytes(range(256)) * 28  # 7,168 bytes across 896 XResolution values
+    pieces = [blob[i:i + 8] for i in range(0, len(blob), 8)]
+    data = _exif_in_jpeg(_tiff_repeated_rational(0x011A, pieces, orientation=False))
+    res, out = _clean(tmp_path, data, ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and blob[8:] not in out
+    assert _ifd_findings(tmp_path / "out_privacy.jpg", "IFD0") == [("XResolution", _rational_detail(blob[:8]))]
+
+
+@pytest.mark.parametrize("fmt", sorted(EXIF_CARRIERS))
+def test_repeated_gamma_in_the_exif_ifd_keeps_only_its_first_entry(tmp_path, fmt):  # rr_attack E2
+    wrap, ext = EXIF_CARRIERS[fmt]
+    res, out = _clean(tmp_path, wrap(_tiff_repeated_gamma_in_exif_ifd(SECRET8)), ext, Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and not [p for p in SECRET8[1:] if p in out]
+    assert _ifd_findings(tmp_path / f"out_privacy{ext}", "ExifIFD") == [("Gamma", _rational_detail(SECRET8[0]))]
+
+
+def test_thumbnail_split_across_repeated_xresolution_is_removed(tmp_path):  # rr_attack2
+    buf = io.BytesIO()
+    Image.new("RGB", (24, 16), (200, 30, 30)).save(buf, format="JPEG", quality=50)
+    thumbnail = buf.getvalue() + b"\x00" * (-len(buf.getvalue()) % 8)
+    pieces = [thumbnail[i:i + 8] for i in range(0, len(thumbnail), 8)]
+    res, out = _clean(tmp_path, _exif_in_jpeg(_tiff_repeated_rational(0x011A, pieces)), ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and thumbnail[8:] not in out
+    assert [f.label for f in res.removed] == ["Duplicate tag 0x011A"] * (len(pieces) - 1)
+    again = siftool.clean(tmp_path / "out_privacy.jpg", tmp_path / "again.jpg", Mode.PRIVACY)
+    assert again.verdict.status is Status.VERIFIED and (tmp_path / "again.jpg").read_bytes() == out
+
+
+def test_repeated_tags_are_seen_by_inspect_and_verify(tmp_path):
+    src = write(tmp_path, "third_party.jpg", _exif_in_jpeg(_tiff_repeated_rational(0x011A, SECRET8)))
+    duplicates = [Finding(C.UNKNOWN, "Duplicate tag 0x011A", None, "APP1/Exif/IFD0", 8)] * (len(SECRET8) - 1)
+    assert [f for f in siftool.inspect(src).findings if f.category is C.UNKNOWN] == duplicates
+    verdict = siftool.verify(src, Mode.PRIVACY)
+    assert verdict.status is Status.FAILED and verdict.violations == duplicates

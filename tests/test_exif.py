@@ -260,6 +260,82 @@ def test_minimal_writer_keeps_ascii_only_up_to_its_first_nul():
     assert parse_exif(out, "x") == [Finding(C.DEVICE, "Make", "Canon", "x/IFD0")]
 
 
+# ---------------------------------------------------------------------------
+# Residual round, ruling R24 (C1 variant): one entry per (IFD, tag). TIFF
+# forbids repeating a tag in an IFD; the reader reports every repeat after
+# the first as an UNKNOWN "Duplicate tag" finding (so the block is never
+# all-allowed), and the minimal writer keeps only the first entry.
+# ---------------------------------------------------------------------------
+
+XRES_72 = struct.pack(">II", 72, 1)
+TEXT_PIECES = [b"owner=Fe", b"lipe Flo", b"riani; p"]  # 8 bytes each: one RATIONAL value apiece
+
+
+def test_repeated_tag_after_the_first_is_an_unknown_finding():
+    # IFD0: Orientation, XResolution x2, ExifIFD and GPS pointers; ExifIFD: ColorSpace x2; GPS: GPSLatitudeRef x2.
+    exif_off = 8 + _ifd_len(5)
+    gps_off = exif_off + _ifd_len(2)
+    vals_off = gps_off + _ifd_len(2)
+    ifd0 = tiff_ifd([ORIENTATION_1, (0x011A, 5, 1, struct.pack(">I", vals_off)),
+                     (0x011A, 5, 1, struct.pack(">I", vals_off + 8)),
+                     (0x8769, 4, 1, struct.pack(">I", exif_off)), (0x8825, 4, 1, struct.pack(">I", gps_off))])
+    exif = tiff_ifd([(0xA001, 3, 1, struct.pack(">HH", 1, 0)), (0xA001, 3, 1, struct.pack(">HH", 2, 0))])
+    gps = tiff_ifd([(1, 2, 2, b"S\x00\x00\x00"), (1, 2, 2, b"N\x00\x00\x00")])
+    tiff = tiff_header() + ifd0 + exif + gps + XRES_72 + TEXT_PIECES[0]
+    assert parse_exif(tiff, "x") == [
+        Finding(C.APPEARANCE, "Orientation", "1", "x/IFD0"),
+        Finding(C.APPEARANCE, "XResolution", "72/1", "x/IFD0"),
+        Finding(C.UNKNOWN, "Duplicate tag 0x011A", None, "x/IFD0", 8),
+        Finding(C.APPEARANCE, "ColorSpace", "1", "x/ExifIFD"),
+        Finding(C.UNKNOWN, "Duplicate tag 0xA001", None, "x/ExifIFD", 2),
+        Finding(C.LOCATION, "GPSLatitudeRef", "S", "x/GPS"),
+        Finding(C.UNKNOWN, "Duplicate tag 0x0001", None, "x/GPS", 2),
+    ]
+
+
+def test_repeated_sub_ifd_pointer_is_reported_not_followed():
+    first_gps = 8 + _ifd_len(3)
+    second_gps = first_gps + _ifd_len(1)
+    lat_off = second_gps + _ifd_len(2)
+    ifd0 = tiff_ifd([ORIENTATION_1, (0x8825, 4, 1, struct.pack(">I", first_gps)),
+                     (0x8825, 4, 1, struct.pack(">I", second_gps))])
+    gps_a = tiff_ifd([(1, 2, 2, b"S\x00\x00\x00")])
+    gps_b = tiff_ifd([(1, 2, 2, b"N\x00\x00\x00"), (2, 5, 3, struct.pack(">I", lat_off))])
+    assert parse_exif(tiff_header() + ifd0 + gps_a + gps_b + LAT, "x") == [
+        Finding(C.APPEARANCE, "Orientation", "1", "x/IFD0"),
+        Finding(C.LOCATION, "GPSLatitudeRef", "S", "x/GPS"),
+        Finding(C.UNKNOWN, "Duplicate tag 0x8825", None, "x/IFD0", 4),
+    ]
+
+
+def test_minimal_writer_keeps_only_the_first_entry_per_tag():
+    tiff = _ifd0_tiff([(0x0112, 3, 1, struct.pack(">H", 6)), (0x011A, 5, 1, XRES_72)]
+                      + [(0x011A, 5, 1, piece) for piece in TEXT_PIECES])
+    for allowed in (PRIVACY, PHOTOGRAPHER):
+        out = build_minimal_exif(tiff, allowed)
+        assert parse_exif(out, "x") == [Finding(C.APPEARANCE, "Orientation", "6", "x/IFD0"),
+                                        Finding(C.APPEARANCE, "XResolution", "72/1", "x/IFD0")]
+        assert not [piece for piece in TEXT_PIECES if piece in out]
+        assert build_minimal_exif(out, allowed) == out
+
+
+def test_minimal_writer_ignores_a_later_entry_even_when_the_first_is_dropped():
+    tiff = _ifd0_tiff([(0x011A, 2, 8, b"owner=F\x00"), (0x011A, 5, 1, XRES_72)])  # first: ASCII, not standard
+    assert build_minimal_exif(tiff, PRIVACY) is None
+
+
+def test_minimal_writer_follows_only_the_first_exif_ifd_pointer():
+    first_exif = 8 + _ifd_len(2)
+    second_exif = first_exif + _ifd_len(1)
+    gamma_off = second_exif + _ifd_len(1)
+    ifd0 = tiff_ifd([(0x8769, 4, 1, struct.pack(">I", first_exif)), (0x8769, 4, 1, struct.pack(">I", second_exif))])
+    exif_a = tiff_ifd([(0xA001, 3, 1, struct.pack(">HH", 1, 0))])
+    exif_b = tiff_ifd([(0xA500, 5, 1, struct.pack(">I", gamma_off))])  # Gamma whose RATIONAL is text
+    out = build_minimal_exif(tiff_header() + ifd0 + exif_a + exif_b + TEXT_PIECES[0], PRIVACY)
+    assert parse_exif(out, "x") == [Finding(C.APPEARANCE, "ColorSpace", "1", "x/ExifIFD")]
+    assert TEXT_PIECES[0] not in out
+
+
 @pytest.mark.parametrize(
     "type_code,count,head,expected",
     [

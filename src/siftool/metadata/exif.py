@@ -20,10 +20,14 @@ classic TIFF allows -- `LONG`, `SHORT` or `IFD` (type 13, TIFF Tech Note
 (any other type or count, an offset out of bounds, a loop, a sub-IFD that
 cannot be read) becomes `Finding(UNKNOWN, "Unfollowed sub-IFD pointer")`
 instead of being silently skipped, so a block holding one never reads as
-all-allowed (ruling R18).
+all-allowed (ruling R18). TIFF forbids repeating a tag in one IFD: every
+repeat after the first becomes `Finding(UNKNOWN, "Duplicate tag 0x....")`
+instead of a second description of the tag, so a block holding one never
+reads as all-allowed either (ruling R24).
 
 `build_minimal_exif` keeps an allowed tag only in its Exif-standard type
-and count (`STANDARD_FORMS`, ruling R18) and writes it canonically:
+and count (`STANDARD_FORMS`, ruling R18), only from its first entry in
+each IFD (ruling R24), and writes it canonically:
 big-endian, ASCII cut at its first NUL, sorted entries, fresh pointers and
 `ExifVersion`. Its output is therefore a fixed point
 (`build_minimal_exif(build_minimal_exif(x, a), a) == build_minimal_exif(x,
@@ -361,14 +365,27 @@ def _read_ifd(
     fails anywhere (out of bounds, a loop, too many entries, a value out
     of bounds) -- appends `Finding(UNKNOWN, UNFOLLOWED_POINTER, None,
     f"{where}/{ifd_name}", len(buf))` after whatever the sub-IFD yielded
-    before failing, and parsing goes on (ruling R18). Returns this IFD's
-    "next IFD" offset (0 if none), which the top-level `IFD0` uses to find
-    the thumbnail IFD1.
+    before failing, and parsing goes on (ruling R18). TIFF forbids a tag
+    twice in one IFD: every entry repeating a tag already seen in this IFD
+    -- a pointer or a structural tag included -- only appends
+    `Finding(UNKNOWN, f"Duplicate tag 0x{tag:04X}", None,
+    f"{where}/{ifd_name}", <its value's byte length>)` and is neither
+    described nor followed (ruling R24). Returns this IFD's "next IFD"
+    offset (0 if none), which the top-level `IFD0` uses to find the
+    thumbnail IFD1.
     """
     entries_start, count, next_offset = _read_ifd_header(buf, offset, order, visited)
+    seen: set[int] = set()
     for i in range(count):
         entry_off = entries_start + i * 12
         tag = _u16(buf, entry_off, order)
+
+        if tag in seen:
+            _, type_code, entry_count, _ = _read_entry_value(buf, entry_off, order, 0)  # bounds-checked all the same
+            size = entry_count * _TYPE_SIZES.get(type_code, 0)
+            findings.append(Finding(Category.UNKNOWN, f"Duplicate tag 0x{tag:04X}", None, f"{where}/{ifd_name}", size))
+            continue
+        seen.add(tag)
 
         sub_name = _POINTER_TARGETS.get(tag)
         if sub_name is not None:
@@ -414,7 +431,10 @@ def parse_exif(tiff: bytes, where: str) -> list[Finding]:
     else unreadable) yields `[Finding(Category.UNKNOWN, "EXIF (unreadable)",
     where=where, size=len(tiff))]` instead. A sub-IFD that cannot be
     followed does not spoil the rest: it adds one `Finding(Category.UNKNOWN,
-    "Unfollowed sub-IFD pointer", None, f"{where}/<IFD>", len(tiff))`.
+    "Unfollowed sub-IFD pointer", None, f"{where}/<IFD>", len(tiff))`. A tag
+    repeated in one IFD yields its first entry's finding, then one
+    `Finding(Category.UNKNOWN, f"Duplicate tag 0x{tag:04X}", None,
+    f"{where}/<IFD>", <value byte length>)` per repeat (ruling R24).
     """
     try:
         return _parse(tiff, where)
@@ -524,21 +544,28 @@ def _collect_allowed(
     whose type/count match `STANDARD_FORMS`, skipping every structural tag
     (`NO_FINDING_TAGS`); `exif_offset` is the ExifIFD pointer's value when
     `ifd_name` is `"IFD0"` and it holds one in a followable form
-    (`_pointer_offset`), else `None`. Every non-pointer value is
+    (`_pointer_offset`), else `None`. Only the FIRST entry of each tag
+    counts -- TIFF forbids repeating one in an IFD -- so every later entry
+    with the same tag is ignored, even when the first is not kept (ruling
+    R24: N copies of an allowed tag would otherwise carry N values of free
+    bytes). Every non-pointer value, a repeated one included, is
     bounds-checked exactly as `parse_exif` checks it, but no more than
     `_MAX_ASCII` bytes of it are copied -- no standard form is longer.
     """
     kept: list[_Entry] = []
     exif_offset: int | None = None
+    seen: set[int] = set()
     for i in range(count):
         entry_off = entries_start + i * 12
         tag = _u16(buf, entry_off, order)
+        first = tag not in seen
+        seen.add(tag)
         if tag in _POINTER_TARGETS:
-            if ifd_name == "IFD0" and tag == 0x8769:
+            if first and ifd_name == "IFD0" and tag == 0x8769:
                 exif_offset = _pointer_offset(buf, entry_off, order)
             continue
         _, type_code, entry_count, value_bytes = _read_entry_value(buf, entry_off, order, _MAX_ASCII)
-        if tag in NO_FINDING_TAGS or not value_bytes:
+        if not first or tag in NO_FINDING_TAGS or not value_bytes:
             continue
         _, category = _resolve(ifd_name, tag)
         if category in allowed:
@@ -623,10 +650,13 @@ def build_minimal_exif(tiff: bytes, allowed: frozenset[Category]) -> bytes | Non
     Only IFD0 and ExifIFD are ever emitted (GPS/Interop/the thumbnails --
     IFD1's or one referenced from IFD0 -- and any bytes no kept entry
     references are never carried over, regardless of `allowed`). An
-    allowed tag survives only in its `STANDARD_FORMS` type and count, in
-    canonical form (`_canonical_entry`); `ExifIFDPointer` and `ExifVersion`
-    are generated fresh, and any such tag in the source is ignored. The
-    output is a fixed point of this function for the same `allowed`.
+    allowed tag survives only from its first entry in its IFD (a repeat
+    is ignored, ruling R24) and only in its `STANDARD_FORMS` type and
+    count, in canonical form (`_canonical_entry`); the ExifIFD is the one
+    IFD0's first ExifIFD pointer leads to. `ExifIFDPointer` and
+    `ExifVersion` are generated fresh, and any such tag in the source is
+    ignored. The output is a fixed point of this function for the same
+    `allowed`.
     Returns `None` if nothing is left to keep, or if `tiff` is unreadable
     (including an ExifIFD that cannot be read).
     """
