@@ -158,19 +158,29 @@ class _ActionBar(QWidget):
         painter.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 21) if dark else QColor(0, 0, 0, 18))
 
 
+_PART_SEPARATORS = ("·", "—")  # between the parts of a message ("2 fotos ... · 1 com ressalvas · ...")
+
+
 def wrap_to_width(text: str, metrics: QFontMetrics, width: int) -> str:
-    """`text` with line breaks so that no line is wider than `width` px (a longer word keeps a line of its own)."""
+    """`text` with line breaks so that no line is wider than `width` px (a longer word keeps a line of its own).
+
+    A line breaks between the parts of a message when it can: the words
+    after the last "·" or "—" move down with the next word (when they fit
+    there), so "1 não limpou" is never split.
+    """
     lines: list[str] = []
     for paragraph in text.split("\n"):
-        line = ""
+        line: list[str] = []
         for word in paragraph.split(" "):
-            candidate = f"{line} {word}" if line else word
-            if line and metrics.horizontalAdvance(candidate) > width:
-                lines.append(line)
-                line = word
-            else:
-                line = candidate
-        lines.append(line)
+            if line and metrics.horizontalAdvance(" ".join([*line, word])) > width:
+                starts = [i + 1 for i, part in enumerate(line) if part in _PART_SEPARATORS]
+                cut = starts[-1] if starts else len(line)
+                if not 0 < cut < len(line) or metrics.horizontalAdvance(" ".join([*line[cut:], word])) > width:
+                    cut = len(line)
+                lines.append(" ".join(line[:cut]))
+                line = line[cut:]
+            line.append(word)
+        lines.append(" ".join(line))
     return "\n".join(lines)
 
 

@@ -59,6 +59,9 @@ THEME_TITLE = "Tema"
 THEME_CONTENT = "Claro, escuro ou igual ao do Windows"
 THEME_TEXTS = ["Claro", "Escuro", "Seguir o Windows"]
 
+SHOW_OPTIONS_TEXT = "Mostrar as opções"
+HIDE_OPTIONS_TEXT = "Esconder as opções"
+
 MAX_CONTENT_WIDTH = 960
 SIDE_MARGIN = 36
 TITLE_TOP = 28
@@ -116,6 +119,10 @@ class SettingsPage(ScrollArea):
 
         self._build_layout()
         self._show_folder()
+        for card in (self.mode_card, self.save_card, self.theme_card):
+            self._label_expand_button(card)
+            # Connected after the card's own toggle, so this sees the new state.
+            card.card.expandButton.clicked.connect(lambda *_, card=card: self._label_expand_button(card))
 
         _ResizeWatcher(self.folder_card, self._show_folder)  # its width decides how much of the path fits
         config.saveLocation.valueChanged.connect(self._show_folder)
@@ -148,6 +155,13 @@ class SettingsPage(ScrollArea):
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._center_column()
+
+    @staticmethod
+    def _label_expand_button(card: OptionsSettingCard) -> None:
+        """The chevron that opens a card's options is only an icon: it says what it does (spec 6)."""
+        text = HIDE_OPTIONS_TEXT if card.isExpand else SHOW_OPTIONS_TEXT
+        card.card.expandButton.setToolTip(text)
+        card.card.expandButton.setAccessibleName(f"{text}: {card.card.titleLabel.text()}")
 
     # -- the folder for the copies ---------------------------------------------------------
 
