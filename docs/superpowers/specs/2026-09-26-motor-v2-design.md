@@ -143,6 +143,7 @@ def verify(path, mode: Mode = Mode.PRIVACY, *, original=None) -> Verdict
 **Comportamento de cada função:**
 - `inspect` levanta essas exceções.
 - `clean` levanta essas exceções. Se a verificação pós-limpeza der `FAILED`, apaga o temporário e levanta `VerificationFailedError`: nenhum arquivo fica no destino. Com `VERIFIED` ou `WARNINGS`, grava o destino e retorna `CleanResult`.
+- Em `inspect` e `clean`, um `OSError` ao ler a origem ou ao gravar ao lado do destino (`FileNotFoundError`, `PermissionError` etc.) não vira `SiftoolError`: propaga sem mudança.
 - `verify` **nunca** levanta por problema de conteúdo. Arquivo ilegível, corrompido ou não suportado resulta em `Verdict(FAILED, ...)`.
 
 ### 5.2 Contrato dos formatos (`formats/base.py`)
@@ -186,9 +187,10 @@ Para cada bloco:
 | Tipo do bloco | Situação | Ação |
 |---|---|---|
 | `ESSENTIAL` | sempre | `KEEP` |
-| `METADATA` | todas as categorias permitidas pelo modo | `KEEP` |
-| `METADATA` | nenhuma categoria permitida | `DROP`, ou `ZERO` em HEIC/MP4 |
-| `METADATA` | mistura de categorias permitidas e proibidas | `REWRITE` se `rewritable`; senão `DROP`/`ZERO` (erra a favor da privacidade) e registra nota dizendo o que se perdeu |
+| `METADATA` `rewritable` | quaisquer categorias, inclusive todas permitidas | sempre passa pelo `rewrite`: bytes → `REWRITE`; `None` → `DROP`/`ZERO`. O bloco nunca é mantido verbatim, porque seus bytes podem conter mais do que os achados mostram; o `rewrite` é canônico (ponto fixo), então uma segunda limpeza fica idêntica byte a byte |
+| `METADATA` não `rewritable` | todas as categorias permitidas pelo modo | `KEEP` |
+| `METADATA` não `rewritable` | nenhuma categoria permitida | `DROP`, ou `ZERO` em HEIC/MP4 |
+| `METADATA` não `rewritable` | mistura de categorias permitidas e proibidas | `DROP`/`ZERO` (erra a favor da privacidade) e registra nota dizendo o que se perdeu |
 | `UNKNOWN` | `removable` | `DROP`/`ZERO` |
 | `UNKNOWN` | não removível | `KEEP` + nota (leva a `WARNINGS`) |
 | trailing | sempre | removido (categoria `extras`) |
@@ -375,12 +377,52 @@ Nenhum deslocamento absoluto muda.
 1. Identifica o formato e faz o `parse`. Formato não suportado ou erro de leitura dá `FAILED`.
 2. Aponta como violação cada `Finding` restante cuja categoria não é permitida pelo modo, e qualquer trailing.
 3. Blocos `UNKNOWN` não removíveis que restarem geram notas e levam a `WARNINGS`.
-4. Faz uma busca de assinaturas fora das áreas essenciais: `Exif\0\0` fora de bloco EXIF permitido, `<x:xmpmeta`, `jumb`, `c2pa`, `caBX`, padrão ISO 6709 (`[+-]\d{2}\.\d+[+-]\d{3}\.\d+`), `GPS`. Achado ali é violação.
+4. Faz uma busca de assinaturas nos bytes de cada bloco e no conteúdo que o handler remontou ou descomprimiu para ele (`Block.logical`, ex.: o perfil ICC reunido de vários APP2 ou descomprimido do `iCCP`). Nos blocos não essenciais, busca todas: `Exif\0\0` fora de bloco EXIF permitido, `<x:xmpmeta`, `http://ns.adobe.com/xap/1.0/`, `jumdc2pa`, `jumb`, `c2pa`, `caBX`, padrão ISO 6709 (`[+-]\d{2}\.\d+[+-]\d{3}\.\d+`), `GPS`. Nas áreas essenciais e nos perfis ICC mantidos, só as longas, que não aparecem por acaso em dados comprimidos: `Exif\0\0`, `<x:xmpmeta`, `http://ns.adobe.com/xap/1.0/`, `jumdc2pa` e o padrão ISO 6709. Achado é violação.
 5. Com `original`: compara o `essential_digest` de ambos. Se diferir, `FAILED`.
 6. O status final segue esta ordem:
    - qualquer violação ou erro → `FAILED`;
    - senão, alguma nota de ressalva → `WARNINGS`;
    - senão → `VERIFIED`.
+
+### Limites
+
+O selo "Verified Clean" garante exatamente isto:
+
+- Estruturas: cada handler valida as estruturas que trata como ESSENTIAL
+  (tamanho, contagem, ordem e conteúdo padrão) e rejeita, remove ou rebaixa
+  para bloco desconhecido verificado o que foge do padrão; todo bloco não
+  ESSENTIAL que resta precisa ter só achados permitidos pelo modo.
+- Metadados mantidos: o que o arquivo pode ter uma vez só é aceito uma vez.
+  Um bloco EXIF por arquivo, com uma entrada por tag, que o `clean` sempre
+  reescreve na forma canônica; um perfil ICC por arquivo, sem bytes fora dos
+  dados das suas tags além do alinhamento de 4 bytes; uma instância de cada
+  chunk PNG que a especificação permite uma vez, na posição legal; um APP0
+  JFIF no JPEG. A repetição ou o chunk fora de posição vira achado ou bloco
+  desconhecido removível: o `clean` remove, e o `verify` de um arquivo que
+  ainda o tenha dá `FAILED`.
+- Assinaturas (passo 4): os valores das estruturas essenciais válidas e os
+  dados de imagem comprimidos são verificados só com as assinaturas longas;
+  os demais blocos, com todas.
+
+Não é detectado:
+
+- texto sem assinatura longa nos dados essenciais: numa tabela DHT/DQT do
+  JPEG não referenciada, nos valores de uma estrutura essencial válida ou
+  nos dados de imagem comprimidos (por exemplo, após o fim do fluxo zlib do
+  PNG);
+- uma assinatura longa dividida entre vários chunks IDAT após o fim do fluxo
+  zlib do PNG;
+- poucos bytes livres dentro de cada valor válido que o modo mantém (um
+  RATIONAL de 8 bytes, o cabeçalho JFIF, um chunk PNG de tamanho fixo como o
+  `cHRM`, de 32 bytes), agora que nenhum deles pode se repetir;
+- texto dentro das tags de um perfil ICC válido (`desc`, `cprt`...; questão
+  de spec para o M2);
+- num arquivo que o `clean` não gerou, bytes de um bloco EXIF fora das suas
+  entradas (sobra, miniatura do IFD0), que o `clean` nunca mantém;
+- esteganografia nos pixels.
+
+Ficam para o M2: dados após o fim do fluxo zlib do PNG (`unused_data`), que
+fecha os dois casos do PNG, e tabelas DHT/DQT do JPEG não referenciadas.
 
 ## 9. Erros, caminhos e memória
 
@@ -401,8 +443,8 @@ opções comuns: --json
 
 **Nomes e pastas:**
 - A saída padrão é `<stem>_clean<ext>` ao lado do original, ou em `--out`.
-- Em caso de colisão sem `--overwrite`, usa `<stem>_clean (2)<ext>`, `(3)` etc.
-- Pastas são percorridas recursivamente e consideram as extensões `.jpg .jpeg .png .webp .heic .heif .mp4 .mov .m4v`. O conteúdo é conferido pelo `detect`.
+- Em caso de colisão sem `--overwrite`, usa `<stem>_clean (2)<ext>`, `(3)` etc. Uma execução nunca reusa um caminho de saída que ela mesma já produziu, nem com `--overwrite`: `viagem1/IMG_0001.jpg` e `viagem2/IMG_0001.jpg` com `--out` viram `IMG_0001_clean.jpg` e `IMG_0001_clean (2).jpg`.
+- Pastas são percorridas recursivamente e consideram as extensões `.jpg .jpeg .png .webp .heic .heif .mp4 .mov .m4v`, mais as que os handlers registrarem (hoje `.apng .jfif .jpe`). O conteúdo é conferido pelo `detect`, então um formato ainda sem handler (HEIC, vídeo) é listado como "não suportado" em vez de ignorado.
 - Arquivos cujo stem termina em `_clean` são ignorados em pastas, mas não quando passados explicitamente.
 
 **Saída:**
@@ -428,7 +470,7 @@ opções comuns: --json
 }
 ```
 
-Arquivos com erro aparecem com `"status": "failed"`, `"output": null` e `"error": "<mensagem>"`.
+Arquivos com erro aparecem com `"status": "failed"`, `"output": null`, `"removed": []`, `"kept": []`, `"notes"`, `"error": "<mensagem>"` e `"violations"`. Quando a verificação falhou, `violations` traz as violações do veredito (no mesmo formato de `removed`/`kept`) e `notes` as notas dele; em qualquer outro erro, as duas listas vêm vazias. Na saída de texto, elas aparecem abaixo da linha do arquivo, como `  violation: <label> (<category>)` e `  note: <nota>`.
 
 **Código de saída:** o pior caso do lote:
 - `0`: tudo verificado;
