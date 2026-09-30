@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import json
 
-from qfluentwidgets import Theme
+import pytest
+from qfluentwidgets import QConfig, Theme, isDarkTheme, qconfig, setTheme
 
 from siftool.model import Mode
 
-from siftool_gui.settings import default_mode, load_config, output_dir
+from siftool_gui.settings import SiftoolConfig, default_mode, load_config, output_dir
+
+
+@pytest.fixture
+def theme_guard():
+    before = qconfig.get(qconfig.themeMode)
+    yield
+    setTheme(before)
 
 
 def test_defaults_without_file(tmp_path):
@@ -55,3 +63,29 @@ def test_output_dir_rules(tmp_path):
 
     cfg.set(cfg.saveLocation, "beside")
     assert output_dir(cfg) is None  # "beside" wins even with a folder configured
+
+
+def test_set_theme_still_switches_after_load_config(tmp_path, theme_guard):
+    # Ruling P8: the config must keep QFluentWidgets' own `themeMode` item, or
+    # `setTheme()` (which sets `qconfig.themeMode`) no longer reaches the theme.
+    # Loading first makes this independent of which test ran before.
+    load_config(tmp_path / "cfg.json")
+
+    setTheme(Theme.DARK)
+    assert isDarkTheme()
+    setTheme(Theme.LIGHT)
+    assert not isDarkTheme()
+
+
+def test_theme_is_qfluentwidgets_item_and_persists(tmp_path, theme_guard):
+    assert SiftoolConfig.themeMode is QConfig.themeMode
+
+    path = tmp_path / "cfg.json"
+    cfg = load_config(path)
+    assert cfg.get(cfg.themeMode) is Theme.AUTO
+    cfg.set(cfg.themeMode, Theme.DARK)
+    assert isDarkTheme()
+
+    reloaded = load_config(path)
+    assert reloaded.get(reloaded.themeMode) is Theme.DARK
+    assert load_config(tmp_path / "other.json").get(cfg.themeMode) is Theme.AUTO  # a fresh file: the default

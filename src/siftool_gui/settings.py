@@ -13,7 +13,6 @@ from pathlib import Path
 
 from qfluentwidgets import (
     ConfigItem,
-    EnumSerializer,
     OptionsConfigItem,
     OptionsValidator,
     QConfig,
@@ -25,7 +24,15 @@ from siftool.model import Mode
 
 
 class SiftoolConfig(QConfig):
-    """The GUI's persistent settings (spec section 5.6)."""
+    """The GUI's persistent settings (spec section 5.6).
+
+    The theme is QFluentWidgets' own `QConfig.themeMode` item, inherited on
+    purpose, never redefined (ruling P8): `setTheme()` and `qconfig.set()`
+    only switch the theme when the item they are given *is*
+    `qconfig._cfg.themeMode`, and `setTheme()` always passes
+    `QConfig.themeMode`. Its library default is `Theme.LIGHT`; `load_config`
+    makes it `Theme.AUTO` (spec 5.1) before reading the file.
+    """
 
     defaultMode = OptionsConfigItem(
         "Cleaning", "DefaultMode", "privacy", OptionsValidator(["privacy", "photographer", "maximum"])
@@ -33,9 +40,6 @@ class SiftoolConfig(QConfig):
     saveLocation = OptionsConfigItem("Cleaning", "SaveLocation", "beside", OptionsValidator(["beside", "folder"]))
     outputFolder = ConfigItem("Cleaning", "OutputFolder", "")
     windowGeometry = ConfigItem("Window", "Geometry", "")  # base64 of QWidget.saveGeometry()
-    themeMode = OptionsConfigItem(
-        "QFluentWidgets", "ThemeMode", Theme.AUTO, OptionsValidator(Theme), EnumSerializer(Theme)
-    )
 
 
 def default_config_path() -> Path:
@@ -58,7 +62,9 @@ def load_config(path: Path | None = None) -> SiftoolConfig:
     process (an earlier test, or a previous call here with a different
     `path`) would leak into what should be a fresh load -- `path` having
     no such key is not the same as `path` saying "use the default".
-    Every item is therefore reset to its `defaultValue` first.
+    Every item is therefore reset to its `defaultValue` first -- and then
+    the inherited `themeMode` to `Theme.AUTO`, the GUI's default (its
+    library default is `Theme.LIGHT`; see `SiftoolConfig`).
 
     `qconfig` itself (the module-level singleton most QFluentWidgets
     widgets read `theme`/`themeChanged` from) is a plain `QConfig`, with
@@ -79,6 +85,7 @@ def load_config(path: Path | None = None) -> SiftoolConfig:
         item = getattr(SiftoolConfig, name)
         if isinstance(item, ConfigItem):
             item.value = item.defaultValue
+    cfg.themeMode.value = Theme.AUTO
 
     qconfig.load(str(path or default_config_path()), cfg)
     return cfg
