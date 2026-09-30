@@ -30,8 +30,7 @@ def create_window(config_path: Path | None = None) -> "MainWindow":
     from siftool_gui.settings import load_config
     from siftool_gui.window import MainWindow
 
-    load_config(config_path)
-    return MainWindow()
+    return MainWindow(load_config(config_path))
 
 
 def main(argv: list[str] | None = None) -> int:
