@@ -6,7 +6,7 @@
   <p>A premium, offline, byte-level privacy utility for Windows</p>
 
   [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue?style=flat-square)](https://www.python.org/)
-  [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+  [![License](https://img.shields.io/badge/license-GPLv3-blue?style=flat-square)](LICENSE)
   [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)](https://www.microsoft.com/windows)
   [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-ffdd00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/1b9hbqniv1)
 </div>
@@ -136,6 +136,30 @@ python siftool.py
 
 ---
 
+## ✦ Instalar (Windows)
+
+O programa novo vem de duas formas. Nenhuma precisa de Python.
+
+*   **Instalador** (`Siftool-<versão>-setup.exe`): instala só para o seu usuário, sem pedir senha de administrador, em `%LOCALAPPDATA%\Programs\Siftool`. Cria o atalho no menu Iniciar e, se você deixar a opção marcada, põe **Limpar com Siftool** no clique direito das fotos JPG, PNG e WEBP e **Limpar fotos com Siftool** no clique direito das pastas (no Windows 11, em **Mostrar mais opções**). O Windows esconde **Limpar com Siftool** quando mais de 15 arquivos estão selecionados: para muitas fotos de uma vez, use o item da pasta ou arraste as fotos para a janela do Siftool. Para remover, vá em Configurações → Aplicativos → Siftool → Desinstalar. As suas configurações ficam guardadas.
+*   **Portátil** (`Siftool-<versão>-portable.zip`): extraia a pasta `Siftool` para um caminho **curto**, perto da raiz do disco (por exemplo `C:\Siftool`, `D:\Siftool` ou um pendrive), e abra o `Siftool.exe`. Não a deixe dentro de pastas fundas, como as do OneDrive: com o caminho da pasta perto de 200 caracteres ou mais, o programa não abre. Nada é instalado no computador: as configurações ficam na pasta `dados`, dentro dela. Em um pendrive protegido contra gravação o Siftool abre normalmente, mas avisa que não consegue salvar as configurações. Para remover, apague a pasta.
+
+Na primeira vez, o Windows pode mostrar **O Windows protegeu o computador** (o SmartScreen), porque o Siftool ainda não tem assinatura digital. Clique em **Mais informações** e depois em **Executar assim mesmo**.
+
+No Windows 11 com o **Controle inteligente de aplicativos** (*Smart App Control*) ligado, o Windows pode bloquear de vez os programas sem assinatura digital, e nesse caso não oferece o **Executar assim mesmo**. O instalador do Siftool ainda não é assinado (nem o programa portátil), então isso pode acontecer com ele. Isso só deixa de acontecer quando o Siftool tiver assinatura digital, ou se você desligar esse recurso em Segurança do Windows → Controle de aplicativos e do navegador. A decisão é sua: em algumas versões do Windows 11 não dá para ligá-lo de novo depois.
+
+### Gerar o instalador e o ZIP a partir do código
+
+O programa novo é gerado pelo `packaging\build.py`, com o [Inno Setup 6](https://jrsoftware.org/isinfo.php) instalado e, no `.venv`, o programa com as dependências de compilação (PyInstaller):
+```cmd
+.venv\Scripts\python.exe -m pip install -e ".[gui,build]"
+.venv\Scripts\python.exe packaging\build.py
+```
+Ele apaga o que uma compilação anterior deixou (`build\pyinstaller`, `dist\Siftool` e o instalador e o ZIP antigos), gera a pasta `dist\Siftool`, testa o programa pronto, e deixa o instalador e o ZIP em `dist\`. Não mexe em `dist\legacy`.
+
+Atenção: o `build.bat` da raiz gera o programa **antigo** (Tkinter), em `dist\legacy\siftool`. Não serve para o programa novo.
+
+---
+
 ## ✦ Programa novo (prévia)
 
 O Siftool v2 tem um programa novo, em português, sobre o motor novo. Ele ainda é uma prévia: o `siftool.py` antigo continua existindo até a versão final.
@@ -156,7 +180,9 @@ Também dá para abrir com `python -m siftool_gui`, mas **fora da pasta raiz do 
 
 ## ✦ Standalone Executable Build (.exe)
 
-You can package Siftool into a standalone directory containing a portable `.exe` binary that does not require Python on the host machine.
+> `build.bat` builds the **OLD** Tkinter program (`siftool.py`). The new program is built with `.venv\Scripts\python.exe packaging\build.py` (see *Instalar (Windows)*, above), which needs `pip install -e ".[gui,build]"`.
+
+You can package the old Siftool into a standalone directory containing a portable `.exe` binary that does not require Python on the host machine.
 
 Double-click or run:
 ```cmd
@@ -165,7 +191,9 @@ build.bat
 
 This runs PyInstaller with the custom configuration in `siftool.spec`, embedding the premium `siftool.ico` branding and extracting the native `tkinterdnd2` binary assets. The compiled program will be located in:
 
-`dist\siftool\siftool.exe`
+`dist\legacy\siftool\siftool.exe`
+
+(Not in `dist\siftool`: Windows paths ignore case, so that is `dist\Siftool`, the folder of the new program.)
 
 ---
 
@@ -194,4 +222,8 @@ If Siftool helped you protect your privacy or streamline your developer workflow
 
 ## ✦ License
 
-This project is licensed under the MIT License.
+Siftool is free software, licensed under the **GNU General Public License, version 3 (GPLv3)**: see [LICENSE](LICENSE).
+
+The new interface is built on [QFluentWidgets](https://qfluentwidgets.com) (Community edition), which is distributed under the GPLv3, and a program that uses it has to be GPLv3 as well. That is why Siftool is GPLv3 (earlier versions of this README said MIT, but no license file was ever published).
+
+The other components the program carries (Qt for Python, QFluentWidgets' own dependencies, PyInstaller's bootloader...) and their licenses are listed in [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt). The installer and the portable ZIP carry it as `THIRD-PARTY-NOTICES.txt`, beside `LICENSE.txt`.

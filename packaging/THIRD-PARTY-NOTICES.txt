@@ -1,0 +1,102 @@
+Siftool - third-party notices
+Avisos sobre os componentes de terceiros que acompanham o Siftool
+=================================================================
+
+Siftool is free software: you can redistribute it and modify it under the terms of
+the GNU General Public License, version 3 (GPLv3). The full text is in LICENSE.txt,
+next to this file. Source code: https://github.com/FFloriani/siftool
+
+The program folder also carries the components below, each under its own license.
+The versions are the ones this release was built with.
+
+
+PySide6 and Qt (Qt for Python)
+  Versions:  PySide6 6.11.2 (with shiboken6), on Qt 6.11.2
+  Authors:   The Qt Company and the Qt Project
+  License:   GNU Lesser General Public License, version 3 (LGPLv3). Siftool uses
+             Qt under the LGPLv3. Text: https://www.gnu.org/licenses/lgpl-3.0.html
+  Source:    Qt 6.11.2: https://download.qt.io/official_releases/qt/6.11/6.11.2/single/
+             PySide6:   https://code.qt.io/cgit/pyside/pyside-setup.git/
+  Notes:     Qt is used as shared libraries: the Qt6*.dll files and the PySide6
+             modules are separate files in the _internal\PySide6 folder, and can be
+             replaced by another build of Qt 6.11. Siftool's source code and the
+             script that builds the program (packaging\build.py) are at
+             https://github.com/FFloriani/siftool. Qt itself includes third-party
+             code under other licenses:
+             https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+PySide6-Fluent-Widgets (QFluentWidgets)
+  Version:   1.11.3, Community edition
+  Author:    zhiyiYo
+  License:   GNU General Public License, version 3 (GPLv3). This is why Siftool is
+             licensed under the GPLv3 as well.
+  Source:    https://github.com/zhiyiYo/PyQt-Fluent-Widgets/tree/PySide6
+             (https://qfluentwidgets.com)
+
+PySideSix-Frameless-Window
+  Version:   0.8.2 (the qframelesswindow module, used by PySide6-Fluent-Widgets)
+  Author:    zhiyiYo
+  License:   GNU Lesser General Public License, version 3 (LGPLv3).
+             Text: https://www.gnu.org/licenses/lgpl-3.0.html
+  Source:    https://github.com/zhiyiYo/PyQt-Frameless-Window/tree/PySide6
+
+darkdetect
+  Version:   0.8.0
+  Author:    Alberto Sottile
+  License:   BSD 3-Clause, below.
+  Source:    https://github.com/albertosottile/darkdetect
+
+    Copyright (c) 2019, Alberto Sottile
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+        * Redistributions of source code must retain the above copyright
+          notice, this list of conditions and the following disclaimer.
+        * Redistributions in binary form must reproduce the above copyright
+          notice, this list of conditions and the following disclaimer in the
+          documentation and/or other materials provided with the distribution.
+        * Neither the name of "darkdetect" nor the
+          names of its contributors may be used to endorse or promote products
+          derived from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL "Alberto Sottile" BE LIABLE FOR ANY
+    DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+    ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+PyInstaller (the bootloader)
+  Version:   6.22.3. Siftool.exe is PyInstaller's bootloader with the program's
+             Python code attached.
+  Authors:   PyInstaller Development Team
+  License:   GNU General Public License, version 2 or later, with the Bootloader
+             Exception. Copyright (c) 2010-2023, PyInstaller Development Team;
+             copyright (c) 2005-2009, Giovanni Bajo; based on previous work under
+             copyright (c) 2002 McMillan Enterprises, Inc.
+  Source:    https://github.com/pyinstaller/pyinstaller
+
+    Bootloader Exception: In addition to the permissions in the GNU General Public
+    License, the authors give you unlimited permission to link or embed compiled
+    bootloader and related files into combinations with other programs, and to
+    distribute those combinations without any restriction coming from the use of
+    those files. (The General Public License restrictions do apply in other
+    respects; for example, they cover modification of the files, and distribution
+    when not linked into a combined executable.)
+
+Python, and the libraries that come with it
+  Python:    Python 3.14 (python314.dll and the standard library), under the
+             Python Software Foundation License. Copyright (c) 2001 Python
+             Software Foundation; All Rights Reserved.
+             https://docs.python.org/3/license.html
+  Libraries: bzip2, libffi, liblzma, mpdecimal, zstd and the like, which Python's
+             modules load, under their permissive licenses (BSD, MIT, public
+             domain).
+  Microsoft: the Visual C++ runtime (vcruntime140*.dll, msvcp140.dll) and the
+             Universal C runtime (api-ms-win-crt-*.dll), which Microsoft allows
+             to be redistributed with programs built for Windows.

@@ -1,4 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
+# The OLD Tkinter program (siftool.py). Build it with build.bat, which passes `--distpath dist\legacy`: the result is
+# dist\legacy\siftool\siftool.exe. Never into the default dist\siftool -- Windows paths ignore case, so that is
+# dist\Siftool, the folder of the new program (packaging\build.py), which it would mix up with this one.
 import os
 import sys
 from pathlib import Path

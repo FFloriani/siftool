@@ -35,11 +35,16 @@ The one exception is the spec's own: an `OSError` other than "not found"
 or "no permission" shows the system's message (spec 5.5) -- its `strerror`
 alone, without the error number and the path `str()` adds, and a full disk
 in Portuguese.
+
+The one text here that is not about a file is the program's version
+(`display_version`): the page "Sobre" shows "2.0.0 beta 1", as the
+installer and Siftool.exe do, not PEP 440's "2.0.0b1" (distribution spec 2).
 """
 
 from __future__ import annotations
 
 import errno
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
@@ -418,3 +423,47 @@ def batch_message(verified: int, warnings: int, failed: int) -> str:
     if failed:
         text += " — clique na linha para ver o motivo." if failed == 1 else " — clique em cada linha para ver o motivo."
     return text
+
+
+# -- the version, as people read it -----------------------------------------------------------------
+
+
+# PEP 440's forms -- N(.N)*, then aN / bN / rcN, .postN, .devN -- which is also what file names and tags
+# spell with dashes ("2.0.0-beta.1"): any of those separators, upper or lower case, reads the same.
+_VERSION = re.compile(
+    r"""
+    v?(?P<release>\d+(?:\.\d+)*)
+    (?:[-_.]?(?P<pre>alpha|beta|a|b|rc)[-_.]?(?P<pre_number>\d+))?
+    (?:[-_.]?post[-_.]?(?P<post>\d+))?
+    (?:[-_.]?dev[-_.]?(?P<dev>\d+))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_PRE_RELEASE_WORDS = {"a": "alpha", "alpha": "alpha", "b": "beta", "beta": "beta", "rc": "rc"}
+
+
+def display_version(version: str) -> str:
+    """A version as people read it: "2.0.0b1" becomes "2.0.0 beta 1".
+
+    The words the installer and `Siftool.exe` (their ProductVersion, made
+    by `packaging/build.py`) use for the same version, so "Sobre" and the
+    file's Properties agree; a test holds the two equal. A final release
+    reads as it is ("2.0.0"); a release candidate "2.0.0 rc 2"; a
+    development or post release "2.0.0 dev 4" / "2.0.0 post 1" (and "2.0.0
+    beta 1 dev 2" when both apply).
+
+    What it cannot read -- a local version ("2.0.0+abc"), a word, the empty
+    string -- comes back as it is: a version is never lost, and showing
+    one never raises.
+    """
+    match = _VERSION.fullmatch(version)
+    if match is None:
+        return version
+    words = [".".join(str(int(part)) for part in match["release"].split("."))]
+    if match["pre"]:
+        words += [_PRE_RELEASE_WORDS[match["pre"].lower()], str(int(match["pre_number"]))]
+    if match["post"]:
+        words += ["post", str(int(match["post"]))]
+    if match["dev"]:
+        words += ["dev", str(int(match["dev"]))]
+    return " ".join(words)

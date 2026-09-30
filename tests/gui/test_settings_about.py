@@ -10,13 +10,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QSize
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel
-from qfluentwidgets import ScrollArea, SettingCardGroup, Theme, TitleLabel, isDarkTheme, qconfig, setTheme
+from qfluentwidgets import InfoBar, ScrollArea, SettingCardGroup, Theme, TitleLabel, isDarkTheme, qconfig, setTheme
 
 import siftool
 from siftool.model import Mode
@@ -24,7 +25,8 @@ from siftool.model import Mode
 from siftool_gui import app as app_module
 from siftool_gui.app import create_window
 from siftool_gui.pages.about_page import AboutPage
-from siftool_gui.pages.settings_page import SettingsPage
+from siftool_gui.pages.settings_page import NOT_SAVED_CONTENT, NOT_SAVED_TITLE, SettingsPage
+from siftool_gui.presentation import display_version
 from siftool_gui.settings import default_mode, load_config, output_dir
 from siftool_gui.window import DEFAULT_SIZE, MINIMUM_SIZE
 
@@ -155,6 +157,89 @@ def test_theme_card_applies_theme(settings_page, config, qtbot, theme_guard):
     assert load_config(config.file).get(config.themeMode) is Theme.LIGHT  # saved
 
 
+# -- a settings folder that cannot be written (release prep: a portable copy on read-only media) ------------------
+
+
+def _bars(page) -> list[InfoBar]:
+    return page.findChildren(InfoBar)
+
+
+def test_a_setting_changed_in_an_unwritable_folder_still_applies_and_says_so_once(
+    qtbot, unwritable_config, theme_guard
+):
+    config = load_config(unwritable_config)
+    page = SettingsPage(config)
+    qtbot.addWidget(page)
+
+    with qtbot.waitSignal(qconfig.themeChangedFinished, timeout=5000):  # the theme switches, as it always does
+        _choose(page.theme_card, "Escuro")
+    assert isDarkTheme() and config.get(config.themeMode) is Theme.DARK
+    assert page.theme_card.choiceLabel.text() == "Escuro"
+
+    (bar,) = _bars(page)  # and one message says the choice will not outlast this run
+    assert bar.title == NOT_SAVED_TITLE == "Não foi possível salvar as configurações nesta pasta."
+    assert bar.content == NOT_SAVED_CONTENT
+    assert bar.closeButton.toolTip() == "Fechar" and bar.closeButton.accessibleName() == "Fechar mensagem"
+
+    _choose(page.mode_card, "Máximo")
+    _choose(page.save_card, "Numa pasta que eu escolher")
+    assert len(_bars(page)) == 1  # one message for the whole run of failures
+    assert default_mode(config) is Mode.MAXIMUM and config.get(config.saveLocation) == "folder"
+
+
+def test_the_folder_chosen_in_an_unwritable_folder_is_used_anyway(qtbot, unwritable_config, monkeypatch, tmp_path):
+    config = load_config(unwritable_config)
+    page = SettingsPage(config)
+    qtbot.addWidget(page)
+    chosen = tmp_path / "cópias"
+    chosen.mkdir()
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(chosen))
+    _choose(page.save_card, "Numa pasta que eu escolher")
+
+    page.folder_card.button.click()
+
+    assert output_dir(config) == chosen  # this run copies there
+    assert page.folder_card.contentLabel.text() == str(chosen)
+    assert len(_bars(page)) == 1
+
+
+def test_a_closed_message_does_not_come_back_while_saving_keeps_failing(qtbot, unwritable_config):
+    config = load_config(unwritable_config)
+    page = SettingsPage(config)
+    qtbot.addWidget(page)
+    _choose(page.mode_card, "Máximo")
+    (bar,) = _bars(page)
+
+    bar.close()
+    qtbot.waitUntil(lambda: not _bars(page), timeout=5000)
+    _choose(page.mode_card, "Fotógrafo")
+
+    assert _bars(page) == []  # the same failure, already told
+    assert default_mode(config) is Mode.PHOTOGRAPHER
+
+
+def test_a_writable_folder_shows_no_message(qtbot, config):
+    page = SettingsPage(config)
+    qtbot.addWidget(page)
+
+    _choose(page.mode_card, "Máximo")
+
+    assert _bars(page) == []
+
+
+def test_a_window_on_an_unwritable_folder_closes_without_a_word(qtbot, unwritable_config):
+    window = create_window(unwritable_config)
+    qtbot.addWidget(window)
+    window.show()
+    window.switchTo(window.settings_page)
+    window.resize(760, 600)
+
+    assert window.close()  # remembering the size fails: no error, and no message on a window that is going
+
+    assert _bars(window.settings_page) == []
+    assert window.config.save_failed
+
+
 # -- Sobre ------------------------------------------------------------------------------
 
 
@@ -166,9 +251,10 @@ def test_about_page_texts(qtbot):
     assert isinstance(page.title_label, TitleLabel) and page.title_label.text() == "Sobre o Siftool"
 
     texts = [label.text() for label in page.findChildren(QLabel)]
+    shown = display_version(siftool.__version__)  # "2.0.0 beta 1", as people read it (not PEP 440's "2.0.0b1")
     expected = [
-        f"Versão {siftool.__version__}",
-        f"Motor de limpeza {siftool.__version__}",  # spec 5.7: the program's and the engine's versions
+        f"Versão {shown}",
+        f"Motor de limpeza {shown}",  # spec 5.7: the program's and the engine's versions
         "Funciona 100% offline.",
         "Nunca altera o arquivo original.",
         "Nunca recomprime a imagem.",
@@ -181,6 +267,17 @@ def test_about_page_texts(qtbot):
         assert texts.count(text) == 1, text
     positions = [texts.index(text) for text in expected]
     assert positions == sorted(positions)  # the promises come one per line, in the spec's order
+
+
+def test_about_page_shows_the_version_the_way_people_read_it(qtbot):
+    # Release prep: "2.0.0 beta 1", as the installer and Siftool.exe say it -- never PEP 440's "2.0.0b1".
+    assert siftool.__version__ == "2.0.0b1"  # this release (tests/test_package.py pins it too)
+    page = AboutPage()
+    qtbot.addWidget(page)
+
+    assert page.version_label.text() == "Versão 2.0.0 beta 1"
+    assert page.engine_label.text() == "Motor de limpeza 2.0.0 beta 1"
+    assert not [label.text() for label in page.findChildren(QLabel) if "2.0.0b1" in label.text()]
 
 
 # -- window: pages, theme and geometry ------------------------------------------------------
@@ -241,14 +338,22 @@ def test_window_without_a_usable_saved_geometry_gets_the_default_size(qtbot, tmp
     assert window.size() == fresh.size()
 
 
-def test_main_hands_qt_the_program_name_first(monkeypatch):
+def test_main_hands_qt_the_program_name_first(monkeypatch, qapp, tmp_path):
     seen: dict = {}
+
+    class FakeSignal:
+        def connect(self, slot) -> None:
+            pass
 
     class FakeApplication:
         instance = staticmethod(QApplication.instance)  # pytest-qt asks for it at teardown
 
         def __init__(self, argv):
             seen["argv"] = list(argv)
+            self.lastWindowClosed = FakeSignal()
+
+        def setWindowIcon(self, icon) -> None:
+            seen["icon"] = not icon.isNull()
 
         def exec(self) -> int:
             return 7
@@ -257,14 +362,21 @@ def test_main_hands_qt_the_program_name_first(monkeypatch):
         def show(self) -> None:
             seen["shown"] = True
 
+        def open_paths(self, paths) -> None:
+            seen["paths"] = paths
+
     monkeypatch.setattr("PySide6.QtWidgets.QApplication", FakeApplication)
-    monkeypatch.setattr(app_module, "create_window", lambda: FakeWindow())
+    monkeypatch.setattr(app_module, "create_window", lambda config_path=None: FakeWindow())
     monkeypatch.setattr(sys, "argv", ["siftool-gui", "left over"])
+    # Settings, and so the single-window lock and server name, of its own: a Siftool open here stays out of it.
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
     assert app_module.main(["-style", "fusion"]) == 7
 
     # Qt reads argv[0] as the program name: without it, "-style" would be swallowed as the name.
-    assert seen == {"argv": ["siftool-gui", "-style", "fusion"], "shown": True}
+    assert seen == {"argv": ["siftool-gui", "-style", "fusion"], "icon": True, "shown": True}
+    assert not list(tmp_path.glob("*.lock"))  # the first window's place is given back on the way out
 
 
 def test_long_folder_path_is_cut_to_fit_and_whole_in_the_tooltip(settings_page, config, qtbot):
@@ -314,8 +426,8 @@ def test_real_start_shows_the_window_and_keeps_its_settings_under_appdata(tmp_pa
         print("exit:", main(["-style", "fusion"]))
         """
     )
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", APPDATA=str(tmp_path),
-               PYTHONPATH=str(Path(__file__).parents[2] / "src"))
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", APPDATA=str(tmp_path), TEMP=str(tmp_path),
+               TMP=str(tmp_path), PYTHONPATH=str(Path(__file__).parents[2] / "src"))  # its window lock there too
 
     result = subprocess.run([sys.executable, "-P", "-c", code], cwd=tmp_path, env=env, capture_output=True,
                             text=True, timeout=120)
