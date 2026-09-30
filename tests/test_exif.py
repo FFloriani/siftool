@@ -79,6 +79,31 @@ def _ifd0_tiff(entries, order=">"):
     return tiff_header(order) + tiff_ifd(fields, order=order) + tail
 
 
+def _ifd0_and_exif_tiff(ifd0_entries, exif_entries, order=">"):
+    """A TIFF whose IFD0 holds `ifd0_entries` plus an ExifIFD pointer, and whose
+    ExifIFD holds `exif_entries` (both lists of `(tag, type, count, value bytes)`);
+    values over 4 bytes are laid out right after both IFDs, IFD0's tail first."""
+    exif_off = 8 + _ifd_len(len(ifd0_entries) + 1)
+    tail_start = exif_off + _ifd_len(len(exif_entries))
+
+    def _fields(entries, voff):
+        fields, tail = [], b""
+        for tag, type_code, count, value in entries:
+            if len(value) <= 4:
+                fields.append((tag, type_code, count, value.ljust(4, b"\x00")))
+            else:
+                fields.append((tag, type_code, count, struct.pack(order + "I", voff + len(tail))))
+                tail += value
+        return fields, tail
+
+    ifd0_fields, ifd0_tail = _fields(ifd0_entries, tail_start)
+    exif_fields, exif_tail = _fields(exif_entries, tail_start + len(ifd0_tail))
+    ifd0_fields.append((0x8769, 4, 1, struct.pack(order + "I", exif_off)))
+    ifd0 = tiff_ifd(ifd0_fields, order=order)
+    exif = tiff_ifd(exif_fields, order=order)
+    return tiff_header(order) + ifd0 + exif + ifd0_tail + exif_tail
+
+
 def _tiff_gps_pointer(ptr_type, count=1, target=None):
     """IFD0 = Orientation + a GPSInfo pointer typed `ptr_type`, then a GPS IFD with a position."""
     gps_off = 8 + _ifd_len(2)
@@ -146,11 +171,17 @@ def test_interop_ifd_is_descended():  # triage T4
 
 @pytest.mark.parametrize("order", ["<", ">"])
 def test_srational_is_read_and_kept_signed(order):  # triage T4
-    tiff = _ifd0_tiff([(0x9204, 10, 1, struct.pack(order + "ii", -1, 3))], order)  # ExposureBiasValue
-    assert parse_exif(tiff, "x") == [Finding(C.CAMERA_SETTINGS, "ExposureBiasValue", "-1/3", "x/IFD0")]
+    # ExposureBiasValue's home is ExifIFD (re-review: the writer no longer
+    # keeps it from a flat IFD0), so it is placed behind an ExifIFD pointer.
+    exif_off = 8 + _ifd_len(1)
+    vals_off = exif_off + _ifd_len(1)
+    ifd0 = tiff_ifd([(0x8769, 4, 1, struct.pack(order + "I", exif_off))], order=order)
+    exif = tiff_ifd([(0x9204, 10, 1, struct.pack(order + "I", vals_off))], order=order)
+    tiff = tiff_header(order) + ifd0 + exif + struct.pack(order + "ii", -1, 3)
+    assert parse_exif(tiff, "x") == [Finding(C.CAMERA_SETTINGS, "ExposureBiasValue", "-1/3", "x/ExifIFD")]
     out = build_minimal_exif(tiff, PHOTOGRAPHER)
     assert out[:4] == b"MM\x00*"
-    assert parse_exif(out, "x") == [Finding(C.CAMERA_SETTINGS, "ExposureBiasValue", "-1/3", "x/IFD0")]
+    assert parse_exif(out, "x") == [Finding(C.CAMERA_SETTINGS, "ExposureBiasValue", "-1/3", "x/ExifIFD")]
 
 
 def test_float_and_double_values_are_formatted():  # triage T4
@@ -211,9 +242,18 @@ def test_every_allowable_tag_has_a_standard_form():
     assert {entry[0] for entry in STANDARD_ENTRIES} == set(STANDARD_FORMS)
 
 
+# Which STANDARD_ENTRIES tags are IFD0-native (the rest are ExifIFD-native):
+# re-review, the writer now keeps a tag only from its own home IFD, so the
+# fixture below must place each one there instead of flattening all of them
+# into IFD0.
+_IFD0_TAG_SET = {tag for (ifd, tag) in TAG_CATEGORIES if ifd == "IFD0"}
+
+
 @pytest.mark.parametrize("order", ["<", ">"])
 def test_minimal_writer_keeps_standard_forms_and_is_a_fixed_point(order):
-    tiff = _ifd0_tiff([(t, ty, n, _in_order(v, ty, order)) for t, ty, n, v in STANDARD_ENTRIES], order)
+    ifd0_entries = [(t, ty, n, _in_order(v, ty, order)) for t, ty, n, v in STANDARD_ENTRIES if t in _IFD0_TAG_SET]
+    exif_entries = [(t, ty, n, _in_order(v, ty, order)) for t, ty, n, v in STANDARD_ENTRIES if t not in _IFD0_TAG_SET]
+    tiff = _ifd0_and_exif_tiff(ifd0_entries, exif_entries, order)
     source = parse_exif(tiff, "x")
     assert len(source) == len(STANDARD_ENTRIES)
     for allowed in (PRIVACY, PHOTOGRAPHER):
@@ -258,6 +298,41 @@ def test_minimal_writer_keeps_ascii_only_up_to_its_first_nul():
     out = build_minimal_exif(tiff, PHOTOGRAPHER)
     assert b"owner" not in out
     assert parse_exif(out, "x") == [Finding(C.DEVICE, "Make", "Canon", "x/IFD0")]
+
+
+# ---------------------------------------------------------------------------
+# Re-review of the fix wave: `_collect_allowed` keeps a tag only when it is
+# found in its OWN IFD's table (IFD0 -> IFD0's table, ExifIFD -> ExifIFD's
+# table). `_resolve`/`parse_exif` are unchanged -- reading still labels a
+# misplaced tag via the other table's fallback -- but the minimal writer no
+# longer carries one over: a reader like Pillow looks for a tag in its home
+# IFD only, so a tag kept in the "wrong" one is dead weight at best.
+# ---------------------------------------------------------------------------
+
+
+def test_writer_keeps_tags_only_in_their_home_ifd():
+    exif_off = 8 + _ifd_len(3)  # IFD0: Orientation + ColorSpace (misplaced) + ExifIFD pointer
+    xres_off = exif_off + _ifd_len(1)  # right after the 1-entry ExifIFD
+    ifd0 = tiff_ifd([ORIENTATION_1,
+                      (0xA001, 3, 1, struct.pack(">HH", 1, 0)),        # ColorSpace: home is ExifIFD
+                      (0x8769, 4, 1, struct.pack(">I", exif_off))])
+    exif = tiff_ifd([(0x011A, 5, 1, struct.pack(">I", xres_off))])     # XResolution: home is IFD0
+    tiff = tiff_header() + ifd0 + exif + struct.pack(">II", 72, 1)
+    out = build_minimal_exif(tiff, PRIVACY)
+    labels = {f.label for f in parse_exif(out, "x")}
+    assert labels == {"Orientation"}  # neither misplaced tag survives the write
+
+
+def test_same_tag_in_ifd0_and_exififd_is_written_once():
+    exif_off = 8 + _ifd_len(2)  # IFD0: XResolution (home) + ExifIFD pointer
+    vals_off = exif_off + _ifd_len(1)  # right after the 1-entry ExifIFD
+    ifd0 = tiff_ifd([(0x011A, 5, 1, struct.pack(">I", vals_off)),
+                      (0x8769, 4, 1, struct.pack(">I", exif_off))])
+    exif = tiff_ifd([(0x011A, 5, 1, struct.pack(">I", vals_off + 8))])  # same tag, wrong IFD
+    tiff = tiff_header() + ifd0 + exif + struct.pack(">II", 72, 1) + struct.pack(">II", 300, 1)
+    out = build_minimal_exif(tiff, PRIVACY)
+    findings = [f for f in parse_exif(out, "x") if f.label == "XResolution"]
+    assert len(findings) == 1 and findings[0].detail == "72/1"
 
 
 # ---------------------------------------------------------------------------

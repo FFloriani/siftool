@@ -1,4 +1,6 @@
 import struct
+import time
+from pathlib import Path
 import pytest
 from siftool.model import Category as C, Finding
 from siftool.metadata.xmp import xmp_findings
@@ -79,7 +81,7 @@ ICC_LAYOUTS = {  # case -> (profile, valid); one tag: data area from 144, two ta
     "padding-3-at-end": (_icc([(144, 20)], 23), True),
     "padding-3-between": (_icc([(156, 20), (179, 8)], 31), True),
     "shared-data": (_icc([(156, 20), (156, 20)], 20), True),
-    "nested-data": (_icc([(156, 20), (160, 4)], 20), True),
+    "nested-data": (_icc([(156, 20), (160, 8)], 20), True),  # each entry >= 8 bytes (re-review)
     "unsorted-table": (_icc([(176, 8), (156, 20)], 28), True),
     "no-tags": (_icc([], 0), False),
     "no-tags-then-text": (_icc([], 46), False),
@@ -94,6 +96,63 @@ ICC_LAYOUTS = {  # case -> (profile, valid); one tag: data area from 144, two ta
 def test_icc_profile_carries_no_free_bytes(case):
     profile, valid = ICC_LAYOUTS[case]
     assert icc_profile_valid(profile) is valid
+
+# Re-review of the fix wave: a declared tag count over the cap must be
+# rejected before any entry is read (never O(count)), and each entry's data
+# must start at or after the end of the tag table and be at least 8 bytes
+# (a type signature plus its mandatory reserved field, ICC.1) -- three gaps
+# `icc_profile_valid` used to leave open.
+
+def test_icc_tag_count_over_cap_is_invalid():
+    count = 1_000_000
+    n = 128 + 4 + 12 * count  # the declared table fits exactly: no table_end > n early exit
+    profile = bytearray(n)
+    profile[36:40] = b"acsp"
+    profile[128:132] = struct.pack(">I", count)
+    # Only the LAST entry is out of bounds, so the OLD code notices it only
+    # after scanning ~1,000,000 harmless (zeroed) entries first.
+    last = 132 + 12 * (count - 1)
+    profile[last + 4 : last + 12] = struct.pack(">II", n, 10)
+    profile[0:4] = struct.pack(">I", n)
+    data = bytes(profile)
+    start = time.perf_counter()
+    assert icc_profile_valid(data) is False
+    assert time.perf_counter() - start < 0.05
+
+def test_icc_tag_data_must_follow_tag_table():
+    table_end = 128 + 4 + 12  # header + count field + one entry
+    n = table_end + 20        # 20 real bytes of tag-data area after the table
+
+    def _profile(offset, size):
+        header = bytearray(128)
+        header[36:40] = b"acsp"
+        table = struct.pack(">I", 1) + b"priv" + struct.pack(">II", offset, size)
+        body = (bytes(header) + table).ljust(n, b"\x5a")
+        return struct.pack(">I", len(body)) + body[4:]
+
+    # A tag claiming to start at 0 and cover the whole profile would, without
+    # the new check, make the coverage loop below think everything is
+    # accounted for -- even though bytes 0..table_end are the header and the
+    # tag table, not this tag's data.
+    assert icc_profile_valid(_profile(0, n)) is False                     # offset inside the header
+    assert icc_profile_valid(_profile(table_end, n - table_end)) is True  # offset == table_end, covers the rest
+
+def test_icc_tag_smaller_than_8_bytes_is_invalid():
+    table_end = 128 + 4 + 12
+    header = bytearray(128)
+    header[36:40] = b"acsp"
+    table = struct.pack(">I", 1) + b"priv" + struct.pack(">II", table_end, 4)
+    body = bytes(header) + table + b"\x5a" * 4
+    profile = struct.pack(">I", len(body)) + body[4:]
+    assert icc_profile_valid(profile) is False
+
+def test_real_icc_profiles_stay_valid():  # regression guard: True before and after the fix
+    assert icc_profile_valid(make_icc("sRGB IEC61966-2.1", 2)) is True
+    assert icc_profile_valid(make_icc("Display P3", 4)) is True
+    path = Path(r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm")
+    if not path.exists():
+        pytest.skip(f"{path} not found")
+    assert icc_profile_valid(path.read_bytes()) is True
 
 def test_iptc_dataset_names_only_apply_to_record_2():  # review M1
     # 1:90 is the Envelope Record's CodedCharacterSet (ESC % G = UTF-8), not 2:90 City.

@@ -581,6 +581,33 @@ def test_repeated_gamma_in_the_exif_ifd_keeps_only_its_first_entry(tmp_path, fmt
     assert _ifd_findings(tmp_path / f"out_privacy{ext}", "ExifIFD") == [("Gamma", _rational_detail(SECRET8[0]))]
 
 
+def _tiff_repeated_xres_in_exif_ifd(pieces: list[bytes]) -> bytes:
+    """IFD0 = Orientation + ExifIFD pointer; the ExifIFD holds one XResolution (RATIONAL) entry per piece.
+
+    XResolution's home is IFD0 -- every copy here sits in the "wrong" IFD, the
+    same layout as `_tiff_repeated_gamma_in_exif_ifd` but for a tag that does
+    not belong there.
+    """
+    exif_off = 8 + _ifd_len(2)
+    vals_off = exif_off + _ifd_len(len(pieces))
+    ifd0 = tiff_ifd([_orientation(), (0x8769, 4, 1, struct.pack(">I", exif_off))])
+    exif = tiff_ifd([(0x011A, 5, 1, struct.pack(">I", vals_off + 8 * k)) for k in range(len(pieces))])
+    return tiff_header() + ifd0 + exif + b"".join(pieces)
+
+
+@pytest.mark.parametrize("fmt", sorted(EXIF_CARRIERS))
+def test_cross_ifd_duplicate_tag_does_not_survive_privacy_clean(tmp_path, fmt):  # re-review
+    # Six XResolution entries in the ExifIFD -- its "wrong" IFD -- carrying
+    # QUIET_SECRET's bytes (SECRET8). Before the fix, the FIRST entry (the
+    # only one the old R24 "first entry per tag" rule didn't already drop)
+    # would have been kept via _resolve's IFD0/ExifIFD fallback and leaked
+    # into a VERIFIED output.
+    wrap, ext = EXIF_CARRIERS[fmt]
+    res, out = _clean(tmp_path, wrap(_tiff_repeated_xres_in_exif_ifd(SECRET8)), ext, Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED
+    assert QUIET_SECRET not in out and not [p for p in SECRET8 if p in out]
+
+
 def test_thumbnail_split_across_repeated_xresolution_is_removed(tmp_path):  # rr_attack2
     buf = io.BytesIO()
     Image.new("RGB", (24, 16), (200, 30, 30)).save(buf, format="JPEG", quality=50)

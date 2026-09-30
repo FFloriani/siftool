@@ -540,21 +540,28 @@ def _collect_allowed(
     """Scan one IFD's entries for allowed tags in their standard form.
 
     Returns `(kept, exif_offset)`: `kept` lists the canonical entry
-    (`_canonical_entry`) of every tag whose category is in `allowed` and
-    whose type/count match `STANDARD_FORMS`, skipping every structural tag
-    (`NO_FINDING_TAGS`); `exif_offset` is the ExifIFD pointer's value when
-    `ifd_name` is `"IFD0"` and it holds one in a followable form
-    (`_pointer_offset`), else `None`. Only the FIRST entry of each tag
-    counts -- TIFF forbids repeating one in an IFD -- so every later entry
-    with the same tag is ignored, even when the first is not kept (ruling
-    R24: N copies of an allowed tag would otherwise carry N values of free
-    bytes). Every non-pointer value, a repeated one included, is
-    bounds-checked exactly as `parse_exif` checks it, but no more than
-    `_MAX_ASCII` bytes of it are copied -- no standard form is longer.
+    (`_canonical_entry`) of every tag that belongs to `ifd_name`'s OWN
+    table (`IFD0` -> `_IFD0_TAGS`, `ExifIFD` -> `_EXIF_IFD_TAGS`; unlike
+    `_resolve`, there is no fallback to the other main IFD's table here),
+    whose category is in `allowed` and whose type/count match
+    `STANDARD_FORMS`, skipping every structural tag (`NO_FINDING_TAGS`). A
+    tag found only in the "wrong" main IFD is never kept -- a reader such
+    as Pillow looks for it in its home IFD only, so keeping it there would
+    be silent dead weight at best (re-review of the fix wave). `exif_offset`
+    is the ExifIFD pointer's value when `ifd_name` is `"IFD0"` and it holds
+    one in a followable form (`_pointer_offset`), else `None`. Only the
+    FIRST entry of each tag counts -- TIFF forbids repeating one in an IFD
+    -- so every later entry with the same tag is ignored, even when the
+    first is not kept (ruling R24: N copies of an allowed tag would
+    otherwise carry N values of free bytes). Every non-pointer value, a
+    repeated one included, is bounds-checked exactly as `parse_exif` checks
+    it, but no more than `_MAX_ASCII` bytes of it are copied -- no standard
+    form is longer.
     """
     kept: list[_Entry] = []
     exif_offset: int | None = None
     seen: set[int] = set()
+    home = _IFD0_TAGS if ifd_name == "IFD0" else _EXIF_IFD_TAGS
     for i in range(count):
         entry_off = entries_start + i * 12
         tag = _u16(buf, entry_off, order)
@@ -565,9 +572,9 @@ def _collect_allowed(
                 exif_offset = _pointer_offset(buf, entry_off, order)
             continue
         _, type_code, entry_count, value_bytes = _read_entry_value(buf, entry_off, order, _MAX_ASCII)
-        if not first or tag in NO_FINDING_TAGS or not value_bytes:
+        if not first or tag in NO_FINDING_TAGS or not value_bytes or tag not in home:
             continue
-        _, category = _resolve(ifd_name, tag)
+        _, category = home[tag]
         if category in allowed:
             entry = _canonical_entry(tag, type_code, entry_count, value_bytes, order)
             if entry is not None:

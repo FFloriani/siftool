@@ -29,14 +29,17 @@ What the seal enforces (spec section 8, "Limites"; rulings R21, R28):
   remaining non-`ESSENTIAL` block must show only findings the mode
   allows; a block kept with a bad CRC (`Block.corrupt`) is a violation too.
 - Kept metadata. A structure a file may hold once is trusted once: one
-  EXIF block per file, with one entry per tag (rulings R18, R24), and
-  `clean` always rewrites it canonically; one ICC profile per file, whose
-  bytes all lie in its tags' data bar alignment padding (rulings R20,
-  R26); one instance of each PNG chunk the spec allows once, in its legal
-  position, and one JFIF `APP0` (rulings R25, R28). A repeated or
-  misplaced one shows up as an `UNKNOWN` finding (a repeated EXIF tag) or
-  a removable `UNKNOWN` block (the rest): `clean` drops it, and a file
-  that still holds one fails here.
+  EXIF block per file, with each allowed tag kept at most once per block,
+  in its own home IFD (rulings R18, R24), and `clean` always rewrites it
+  canonically; one ICC profile per file, with every byte after its tag
+  table accounted for by some tag's data (rulings R20, R26) -- tag
+  contents, private ones included, are never inspected, so a valid
+  profile may still carry arbitrary bytes inside one tag's own data (an
+  open question for M2); one instance of each PNG chunk the spec allows
+  once, in its legal position, and one JFIF `APP0` (rulings R25, R28). A
+  repeated or misplaced one shows up as an `UNKNOWN` finding (a repeated
+  EXIF tag) or a removable `UNKNOWN` block (the rest): `clean` drops it,
+  and a file that still holds one fails here.
 - Signatures (`scan_signatures`). Every non-`ESSENTIAL` block's bytes, and
   any content a handler reassembled or inflated for it (`Block.logical`),
   are searched for every entry of `SIGNATURES`. `ESSENTIAL` spans --

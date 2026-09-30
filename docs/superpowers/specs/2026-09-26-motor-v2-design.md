@@ -393,13 +393,16 @@ O selo "Verified Clean" garante exatamente isto:
   para bloco desconhecido verificado o que foge do padrão; todo bloco não
   ESSENTIAL que resta precisa ter só achados permitidos pelo modo.
 - Metadados mantidos: o que o arquivo pode ter uma vez só é aceito uma vez.
-  Um bloco EXIF por arquivo, com uma entrada por tag, que o `clean` sempre
-  reescreve na forma canônica; um perfil ICC por arquivo, sem bytes fora dos
-  dados das suas tags além do alinhamento de 4 bytes; uma instância de cada
-  chunk PNG que a especificação permite uma vez, na posição legal; um APP0
-  JFIF no JPEG. A repetição ou o chunk fora de posição vira achado ou bloco
-  desconhecido removível: o `clean` remove, e o `verify` de um arquivo que
-  ainda o tenha dá `FAILED`.
+  Um bloco EXIF por arquivo, com cada tag permitida no máximo uma vez por
+  bloco EXIF, no seu IFD de origem, que o `clean` sempre reescreve na forma
+  canônica; um perfil ICC por arquivo, em que todo byte depois da tabela
+  pertence aos dados de alguma tag -- o conteúdo das tags, inclusive as
+  privadas, não é inspecionado, e um perfil válido pode carregar dados
+  arbitrários dentro de uma tag (questão aberta do M2); uma instância de
+  cada chunk PNG que a especificação permite uma vez, na posição legal; um
+  APP0 JFIF no JPEG. A repetição ou o chunk fora de posição vira achado ou
+  bloco desconhecido removível: o `clean` remove, e o `verify` de um
+  arquivo que ainda o tenha dá `FAILED`.
 - Assinaturas (passo 4): os valores das estruturas essenciais válidas e os
   dados de imagem comprimidos são verificados só com as assinaturas longas;
   os demais blocos, com todas.
