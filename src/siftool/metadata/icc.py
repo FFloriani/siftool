@@ -14,9 +14,11 @@ table of language-tagged UTF-16BE strings). Both are read directly from
 the profile's tag table; nothing here writes a profile.
 
 `icc_profile_valid` is the structural gate every handler applies before
-it keeps a profile as `appearance` (ruling R20): a "profile" that fails it
--- identity text, a split signature, anything but an ICC profile -- is
-dropped instead of trusted.
+it keeps a profile as `appearance` (rulings R20, R26): a "profile" that
+fails it -- identity text, a split signature, anything but an ICC
+profile, or a real profile with bytes riding along outside its tags -- is
+dropped instead of trusted. What a valid profile's tags contain (e.g. the
+text of its `desc` or `cprt` tag) is not interpreted here.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from __future__ import annotations
 import struct
 
 _TAG_TABLE_OFFSET = 128
+_RESERVED_START = 100  # header bytes 100-127 are reserved and must be zero (ICC.1)
+_MAX_PADDING = 3  # tag data is 4-byte aligned: at most 3 pad bytes between tags and at the end
 _MAX_TAGS = 1000  # sanity cap; a real profile has a handful of tags
 
 
@@ -68,26 +72,43 @@ def _describe(profile: bytes) -> str | None:
 
 
 def icc_profile_valid(profile: bytes) -> bool:
-    """True if `profile` is a structurally valid ICC profile (ruling R20).
+    """True if `profile` is a structurally valid ICC profile with no free bytes (rulings R20, R26).
 
     Its header's own size field (bytes 0-3, big-endian) equals
-    `len(profile)`, `acsp` sits at offset 36, and the tag table at offset
-    128 -- a 4-byte tag count, then 12 bytes per tag (signature, offset,
-    size) -- as well as every tag's data (`offset + size`) lies within the
-    profile. Tag contents are not interpreted. Never raises.
+    `len(profile)`, `acsp` sits at offset 36, the header's reserved bytes
+    100-127 are all zero (ICC.1), and the tag table at offset 128 -- a
+    4-byte tag count, at least 1, then 12 bytes per tag (signature,
+    offset, size) -- as well as every tag's data (`offset + size`) lies
+    within the profile. Every byte from the end of the tag table to the
+    end of the profile must lie in some tag's data -- tags may share or
+    nest data ranges -- except gaps of at most `_MAX_PADDING` bytes
+    (4-byte alignment padding) between ranges and at the end: nothing may
+    ride along outside the tags. Tag contents are not interpreted. Never
+    raises.
     """
     n = len(profile)
     entries_start = _TAG_TABLE_OFFSET + 4
     if n < entries_start or int.from_bytes(profile[0:4], "big") != n or profile[36:40] != b"acsp":
         return False
-    count = int.from_bytes(profile[_TAG_TABLE_OFFSET:entries_start], "big")
-    if entries_start + 12 * count > n:
+    if any(profile[_RESERVED_START:_TAG_TABLE_OFFSET]):
         return False
+    count = int.from_bytes(profile[_TAG_TABLE_OFFSET:entries_start], "big")
+    table_end = entries_start + 12 * count
+    if count < 1 or table_end > n:
+        return False
+    ranges: list[tuple[int, int]] = []
     for i in range(count):
         offset, size = struct.unpack_from(">II", profile, entries_start + 12 * i + 4)
         if offset + size > n:
             return False
-    return True
+        if size:
+            ranges.append((offset, offset + size))
+    covered = table_end  # everything before it is the header and the tag table
+    for start, end in sorted(ranges):
+        if start - covered > _MAX_PADDING:
+            return False
+        covered = max(covered, end)
+    return n - covered <= _MAX_PADDING
 
 
 def icc_description(profile: bytes) -> str | None:

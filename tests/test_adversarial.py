@@ -716,3 +716,45 @@ def test_second_webp_exif_chunk_is_dropped(tmp_path):
     res, out = _clean(tmp_path, _riff(head + _riff_chunk(b"EXIF", first) + _riff_chunk(b"EXIF", second)), ".webp",
                       Mode.PRIVACY)
     assert res.verdict.status is Status.VERIFIED and out == _riff(head + _riff_chunk(b"EXIF", first))
+
+
+# ---------------------------------------------------------------------------
+# R26: an ICC profile carries no bytes outside its tags' data (bar 4-byte
+# alignment padding), in every carrier (rr_attack J4/J4b/J4c/J5, rr_attack2).
+# ---------------------------------------------------------------------------
+
+
+def _zero_tag_wrapper(text: bytes) -> bytes:
+    """A 128-byte header with `acsp` and a tag table of 0 tags, then `text`: R20 alone took it for a profile."""
+    header = bytearray(128)
+    header[36:40] = b"acsp"
+    return _with_size_field(bytes(header) + struct.pack(">I", 0) + text)
+
+
+ICC_WITH_FREE_BYTES = {
+    "zero-tag-wrapper": _zero_tag_wrapper(QUIET_SECRET),
+    "valid-profile-plus-slack": _with_size_field(_icc_desc("Display P3") + QUIET_SECRET),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ICC_WITH_FREE_BYTES))
+def test_jpeg_icc_profile_with_free_bytes_is_dropped(tmp_path, case):  # rr_attack J4, J5
+    data = _jpeg_after_soi(_segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + ICC_WITH_FREE_BYTES[case]))
+    res, out = _clean(tmp_path, data, ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == base_jpeg()
+
+
+@pytest.mark.parametrize("case", sorted(ICC_WITH_FREE_BYTES))
+def test_webp_iccp_with_free_bytes_is_dropped(tmp_path, case):  # rr_attack J4b
+    data = _riff(_riff_chunk(b"VP8X", _vp8x(0x20)) + _riff_chunk(b"ICCP", ICC_WITH_FREE_BYTES[case])
+                 + _riff_chunk(b"VP8L", _vp8l()))
+    res, out = _clean(tmp_path, data, ".webp", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED
+    assert out == _riff(_riff_chunk(b"VP8X", _vp8x(0)) + _riff_chunk(b"VP8L", _vp8l()))
+
+
+@pytest.mark.parametrize("case", sorted(ICC_WITH_FREE_BYTES))
+def test_png_iccp_with_free_bytes_is_dropped(tmp_path, case):  # rr_attack J4c, rr_attack2
+    data = _bare_png(png_chunk(b"iCCP", b"x\x00\x00" + zlib.compress(ICC_WITH_FREE_BYTES[case])))
+    res, out = _clean(tmp_path, data, ".png", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == make_png(**_BARE_PNG)

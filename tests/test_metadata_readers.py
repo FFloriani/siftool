@@ -1,4 +1,5 @@
 import struct
+import pytest
 from siftool.model import Category as C, Finding
 from siftool.metadata.xmp import xmp_findings
 from siftool.metadata.c2pa import c2pa_findings
@@ -57,6 +58,42 @@ def test_icc_profile_structure_is_validated():  # ruling R20
     for bad in (b"", b"not an icc profile", good[:131], wrong_size_field, no_acsp, too_many_tags, tag_out_of_bounds,
                 good + b"\x00"):
         assert not icc_profile_valid(bad)
+
+# Residual round, ruling R26: a valid profile also has at least one tag, zero reserved
+# header bytes 100-127, and no byte after its tag table that no tag's data covers, bar
+# 4-byte alignment padding (at most 3 bytes per gap, and at the end).
+
+def _icc(ranges, area_size, *, reserved=bytes(28)):
+    """A 128-byte header ('acsp', `reserved` at 100-127, size field set) + a tag table of
+    `(offset, size)` entries + `area_size` bytes of tag data area right after the table."""
+    header = bytearray(128)
+    header[36:40] = b"acsp"
+    header[100:128] = reserved
+    table = struct.pack(">I", len(ranges)) + b"".join(
+        b"t%03d" % i + struct.pack(">II", offset, size) for i, (offset, size) in enumerate(ranges))
+    profile = bytes(header) + table + b"\x5a" * area_size
+    return struct.pack(">I", len(profile)) + profile[4:]
+
+ICC_LAYOUTS = {  # case -> (profile, valid); one tag: data area from 144, two tags: from 156
+    "one-tag-exact": (_icc([(144, 20)], 20), True),
+    "padding-3-at-end": (_icc([(144, 20)], 23), True),
+    "padding-3-between": (_icc([(156, 20), (179, 8)], 31), True),
+    "shared-data": (_icc([(156, 20), (156, 20)], 20), True),
+    "nested-data": (_icc([(156, 20), (160, 4)], 20), True),
+    "unsorted-table": (_icc([(176, 8), (156, 20)], 28), True),
+    "no-tags": (_icc([], 0), False),
+    "no-tags-then-text": (_icc([], 46), False),
+    "slack-4-at-end": (_icc([(144, 20)], 24), False),
+    "gap-4-between": (_icc([(156, 20), (180, 8)], 32), False),
+    "gap-4-before-first": (_icc([(148, 20)], 24), False),
+    "reserved-byte-100": (_icc([(144, 20)], 20, reserved=b"\x01" + bytes(27)), False),
+    "reserved-byte-127": (_icc([(144, 20)], 20, reserved=bytes(27) + b"\x01"), False),
+}
+
+@pytest.mark.parametrize("case", sorted(ICC_LAYOUTS))
+def test_icc_profile_carries_no_free_bytes(case):
+    profile, valid = ICC_LAYOUTS[case]
+    assert icc_profile_valid(profile) is valid
 
 def test_iptc_dataset_names_only_apply_to_record_2():  # review M1
     # 1:90 is the Envelope Record's CodedCharacterSet (ESC % G = UTF-8), not 2:90 City.
