@@ -319,7 +319,7 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]], arithmetic: bool
 
 
 def _classify(code: int, span: Span, payload: bytes) -> Block:
-    """Classify one non-SOI/EOI/RST/ICC/Adobe-APP14/DAC segment into its `Block`.
+    """Classify one non-SOI/EOI/RST/ICC/JFIF/Exif/Adobe-APP14/DAC segment into its `Block`.
 
     `SOF`/`SOS`/`DQT`/`DHT` additionally check that the declared length
     (`len(payload)`, i.e. the segment's own length field minus itself)
