@@ -1,11 +1,10 @@
 """Tests for the "Limpar" page: dropping, analysis and the list (spec sections 5.2 and 6; Task 10).
 
-Every page gets a config file under `tmp_path` (never `%APPDATA%`) and a real
-`JobRunner` running the real engine over the synthetic fixtures. The
-`make_page` fixture cancels and drains each page's runner at teardown, so no
-pool thread outlives its test. Waiting is done with `qtbot.waitUntil` /
-`waitSignal`; the only slow job is a monkeypatched `siftool.inspect` that
-blocks on a `threading.Event`.
+Every page (fixtures in `conftest.py`) gets a config file under `tmp_path`
+(never `%APPDATA%`) and a real `JobRunner` running the real engine over the
+synthetic fixtures. Waiting is done with `qtbot.waitUntil` / `waitSignal`; the
+only slow job is a monkeypatched `siftool.inspect` that blocks on a
+`threading.Event`.
 """
 
 from __future__ import annotations
@@ -13,9 +12,8 @@ from __future__ import annotations
 import os
 import threading
 
-import pytest
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
 from PySide6.QtWidgets import QFileDialog
 
 import siftool
@@ -25,47 +23,16 @@ from siftool.model import Category, Mode
 from siftool_gui.drop_area import FILE_FILTER
 from siftool_gui.entries import EntryState
 from siftool_gui.model import CATEGORY_ROLE, KIND_ROLE, OUTCOME_ROLE, STATE_ROLE, THUMBNAIL_ROLE, VALUE_ROLE, RowKind
+from siftool_gui.pages import clean_page as clean_page_module
 from siftool_gui.pages.clean_page import CleanPage
 from siftool_gui.presentation import Outcome, mode_description, summary_text
 from siftool_gui.settings import load_config
+from siftool_gui.workers import JobRunner
 
 TIMEOUT = 10_000  # ms
 
 HEIC_BYTES = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64
-
-
-@pytest.fixture
-def config(tmp_path):
-    return load_config(tmp_path / "cfg.json")
-
-
-@pytest.fixture
-def photos(tmp_path):
-    folder = tmp_path / "fotos"
-    folder.mkdir()
-    return folder
-
-
-@pytest.fixture
-def make_page(qtbot, config):
-    pages: list[CleanPage] = []
-
-    def factory(cfg=None, runner=None) -> CleanPage:
-        page = CleanPage(cfg if cfg is not None else config, runner)
-        qtbot.addWidget(page)
-        pages.append(page)
-        return page
-
-    yield factory
-    for page in pages:
-        page.runner.cancel()
-        assert page.runner.wait_for_done(TIMEOUT)
-
-
-@pytest.fixture
-def page(make_page):
-    return make_page()
 
 
 def _names(page: CleanPage) -> list[str]:
@@ -74,16 +41,6 @@ def _names(page: CleanPage) -> list[str]:
 
 def _states(page: CleanPage) -> dict[str, EntryState]:
     return {page.model.entry(i).path.name: page.model.entry(i).state for i in page.model.entry_ids()}
-
-
-def _settle(qtbot, page: CleanPage, total: int) -> None:
-    """Wait until `total` rows exist, none is being analyzed and the runner (thumbnails too) is idle."""
-
-    def settled() -> bool:
-        summary = page.model.summary()
-        return summary.total == total and summary.busy == 0 and not page.runner.busy()
-
-    qtbot.waitUntil(settled, timeout=TIMEOUT)
 
 
 def _child_rows(page: CleanPage, entry_id: int, kind: RowKind):
@@ -108,12 +65,12 @@ def _mime(*urls: QUrl) -> QMimeData:
 # -- dropping and analysis -------------------------------------------------------
 
 
-def test_drop_files_adds_rows_and_analyzes(page, qtbot, photos):
+def test_drop_files_adds_rows_and_analyzes(page, qtbot, photos, settle):
     jpg = write(photos, "a.jpg", make_jpeg())
     png = write(photos, "b.png", make_png())
 
     page.drop_area.pathsDropped.emit([str(jpg), str(png)])
-    _settle(qtbot, page, 2)
+    settle(page, 2)
 
     assert _states(page) == {"a.jpg": EntryState.ANALYZED, "b.png": EntryState.ANALYZED}
     assert page.model.summary().total == 2
@@ -122,18 +79,20 @@ def test_drop_files_adds_rows_and_analyzes(page, qtbot, photos):
         assert page.model.index_for(entry_id).data(THUMBNAIL_ROLE) is not None
 
 
-def test_real_drop_event_with_urls(page, qtbot, photos):
+def test_real_drop_event_with_urls(page, qtbot, photos, settle):
     jpg = write(photos, "a.jpg", make_jpeg())
     mime = _mime(QUrl.fromLocalFile(str(jpg)), QUrl("https://example.com/c.jpg"))
     actions = Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
 
     enter = QDragEnterEvent(QPoint(5, 5), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    enter.setDropAction(Qt.DropAction.MoveAction)  # what Explorer proposes for a drag within one drive
     page.drop_area.dragEnterEvent(enter)
     assert enter.isAccepted()
     assert enter.dropAction() == Qt.DropAction.CopyAction
     assert page.drop_area.is_highlighted()
 
     drop = QDropEvent(QPointF(5, 5), actions, mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    drop.setDropAction(Qt.DropAction.MoveAction)
     with qtbot.waitSignal(page.drop_area.pathsDropped, timeout=TIMEOUT) as blocker:
         page.drop_area.dropEvent(drop)
 
@@ -141,8 +100,19 @@ def test_real_drop_event_with_urls(page, qtbot, photos):
     # Never a move: Windows Explorer deletes the source of a move the target accepts.
     assert drop.isAccepted() and drop.dropAction() == Qt.DropAction.CopyAction
     assert not page.drop_area.is_highlighted()
-    _settle(qtbot, page, 1)
+    settle(page, 1)
     assert _states(page) == {"a.jpg": EntryState.ANALYZED}
+
+
+def test_a_drag_that_only_offers_a_move_is_refused(page, photos):
+    jpg = write(photos, "a.jpg", make_jpeg())
+    mime = _mime(QUrl.fromLocalFile(str(jpg)))
+    enter = QDragEnterEvent(QPoint(5, 5), Qt.DropAction.MoveAction, mime, Qt.MouseButton.LeftButton,
+                            Qt.KeyboardModifier.NoModifier)
+
+    page.drop_area.dragEnterEvent(enter)
+
+    assert not enter.isAccepted()  # accepting it would let the source delete the original
 
 
 def test_drag_without_local_files_is_refused(page):
@@ -155,20 +125,21 @@ def test_drag_without_local_files_is_refused(page):
     assert not page.drop_area.is_highlighted()
 
 
-def test_drop_on_the_list_area_is_accepted_too(page, qtbot, photos):
+def test_drop_on_the_list_area_is_accepted_too(page, qtbot, photos, settle):
     jpg = write(photos, "a.jpg", make_jpeg())
     mime = _mime(QUrl.fromLocalFile(str(jpg)))
     drop = QDropEvent(QPointF(5, 5), Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, mime,
                       Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    drop.setDropAction(Qt.DropAction.MoveAction)
 
     page.dropEvent(drop)
 
     assert drop.dropAction() == Qt.DropAction.CopyAction
-    _settle(qtbot, page, 1)
+    settle(page, 1)
     assert _names(page) == ["a.jpg"]
 
 
-def test_drop_accented_names(page, qtbot, photos):
+def test_drop_accented_names(page, qtbot, photos, settle):
     name = "fotó 26 de set., ção.png"
     path = write(photos, name, make_png())
 
@@ -177,7 +148,7 @@ def test_drop_accented_names(page, qtbot, photos):
     drop = QDropEvent(QPointF(5, 5), Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
                       Qt.KeyboardModifier.NoModifier)
     page.drop_area.dropEvent(drop)
-    _settle(qtbot, page, 1)
+    settle(page, 1)
 
     (entry_id,) = page.model.entry_ids()
     index = page.model.index_for(entry_id)
@@ -188,7 +159,7 @@ def test_drop_accented_names(page, qtbot, photos):
     assert index.data(THUMBNAIL_ROLE) is not None
 
 
-def test_drop_folder_skips_previous_outputs(page, qtbot, tmp_path):
+def test_drop_folder_skips_previous_outputs(page, qtbot, tmp_path, settle):
     folder = tmp_path / "viagem, set. 2026"
     (folder / "dia 2").mkdir(parents=True)
     photo = write(folder, "a.jpg", make_jpeg())
@@ -200,13 +171,13 @@ def test_drop_folder_skips_previous_outputs(page, qtbot, tmp_path):
 
     # The folder and one of its own files together: still one row per photo.
     page.add_paths([str(folder), str(photo)])
-    _settle(qtbot, page, 2)
+    settle(page, 2)
 
     assert sorted(_names(page)) == ["a.jpg", "b.png"]
     assert set(_states(page).values()) == {EntryState.ANALYZED}
 
 
-def test_heic_row_shows_not_supported_yet(page, qtbot, tmp_path):
+def test_heic_row_shows_not_supported_yet(page, qtbot, tmp_path, settle):
     folder = tmp_path / "celular"
     folder.mkdir()
     write(folder, "IMG_0001.HEIC", HEIC_BYTES)
@@ -214,7 +185,7 @@ def test_heic_row_shows_not_supported_yet(page, qtbot, tmp_path):
     write(folder, "IMG_0003.jpg", make_jpeg())
 
     page.add_paths([str(folder)])
-    _settle(qtbot, page, 3)
+    settle(page, 3)
 
     states = _states(page)
     assert states == {
@@ -249,10 +220,10 @@ def test_initial_mode_comes_from_the_config(make_page, tmp_path):
     assert page.mode_description.text() == mode_description(Mode.MAXIMUM)
 
 
-def test_mode_switch_updates_outcomes_and_description(page, qtbot, photos):
+def test_mode_switch_updates_outcomes_and_description(page, qtbot, photos, settle):
     jpg = write(photos, "a.jpg", make_jpeg())
     page.add_paths([str(jpg)])
-    _settle(qtbot, page, 1)
+    settle(page, 1)
     (entry_id,) = page.model.entry_ids()
 
     assert page.mode_selector.currentRouteKey() == "privacy"
@@ -275,7 +246,7 @@ def test_mode_switch_updates_outcomes_and_description(page, qtbot, photos):
 # -- summary, compact drop area, removing ---------------------------------------------
 
 
-def test_summary_text_and_compact_drop_area(page, qtbot, photos):
+def test_summary_text_and_compact_drop_area(page, qtbot, photos, settle):
     assert not page.drop_area.is_compact()
     assert not page.summary_label.isVisibleTo(page)
     assert not page.view.isVisibleTo(page)
@@ -284,7 +255,7 @@ def test_summary_text_and_compact_drop_area(page, qtbot, photos):
     heic = write(photos, "b.heic", HEIC_BYTES)
     plain = write(photos, "c.webp", make_webp("simple"))  # nothing hidden in it
     page.add_paths([str(write(photos, "a.jpg", make_jpeg())), str(heic), str(plain)])
-    _settle(qtbot, page, 3)
+    settle(page, 3)
 
     assert page.drop_area.is_compact()
     assert page.summary_label.isVisibleTo(page)
@@ -297,9 +268,9 @@ def test_summary_text_and_compact_drop_area(page, qtbot, photos):
     assert not page.summary_label.isVisibleTo(page)
 
 
-def test_delete_key_removes_selected_row(page, qtbot, photos):
+def test_delete_key_removes_selected_row(page, qtbot, photos, settle):
     page.add_paths([str(write(photos, "a.jpg", make_jpeg())), str(write(photos, "b.png", make_png()))])
-    _settle(qtbot, page, 2)
+    settle(page, 2)
     first, second = page.model.entry_ids()
 
     child = page.model.index(0, 0, page.model.index_for(first))  # a detail row selects its whole file
@@ -310,9 +281,9 @@ def test_delete_key_removes_selected_row(page, qtbot, photos):
     assert page.summary_label.text() == summary_text(1, 1, 0)
 
 
-def test_remove_selected_keeps_nothing_it_should_not(page, qtbot, photos):
+def test_remove_selected_keeps_nothing_it_should_not(page, qtbot, photos, settle):
     page.add_paths([str(write(photos, "a.jpg", make_jpeg())), str(write(photos, "b.png", make_png()))])
-    _settle(qtbot, page, 2)
+    settle(page, 2)
 
     page.view.selectAll()
     page.remove_selected()
@@ -321,9 +292,9 @@ def test_remove_selected_keeps_nothing_it_should_not(page, qtbot, photos):
     assert not page.drop_area.is_compact()
 
 
-def test_clear_list(page, qtbot, photos):
+def test_clear_list(page, qtbot, photos, settle):
     page.add_paths([str(write(photos, "a.jpg", make_jpeg())), str(write(photos, "b.png", make_png()))])
-    _settle(qtbot, page, 2)
+    settle(page, 2)
 
     page.clear_button.click()
 
@@ -331,7 +302,7 @@ def test_clear_list(page, qtbot, photos):
     assert page.model.summary().total == 0
 
 
-def test_clear_list_waits_while_photos_are_being_analyzed(page, qtbot, monkeypatch, photos):
+def test_clear_list_waits_while_photos_are_being_analyzed(page, qtbot, monkeypatch, photos, settle):
     release = threading.Event()
     real_inspect = siftool.inspect
 
@@ -348,7 +319,7 @@ def test_clear_list_waits_while_photos_are_being_analyzed(page, qtbot, monkeypat
     assert page.model.summary().total == 1  # nothing is cleared under a running analysis
 
     release.set()
-    _settle(qtbot, page, 1)
+    settle(page, 1)
     assert page.clear_button.isEnabled()
     page.clear_list()
     assert page.model.summary().total == 0
@@ -380,7 +351,7 @@ def test_an_entry_being_analyzed_can_be_removed(page, qtbot, monkeypatch, photos
 # -- the add buttons ---------------------------------------------------------------
 
 
-def test_add_buttons_open_the_dialogs(page, qtbot, monkeypatch, photos, tmp_path):
+def test_add_buttons_open_the_dialogs(page, qtbot, monkeypatch, photos, tmp_path, settle):
     jpg = write(photos, "a.jpg", make_jpeg())
     folder = tmp_path / "pasta"
     folder.mkdir()
@@ -400,7 +371,7 @@ def test_add_buttons_open_the_dialogs(page, qtbot, monkeypatch, photos, tmp_path
 
     page.drop_area.add_files_button.click()
     page.drop_area.add_folder_button.click()
-    _settle(qtbot, page, 2)
+    settle(page, 2)
 
     assert calls == [("files", "Adicionar fotos", FILE_FILTER), ("folder", "Adicionar pasta")]
     assert FILE_FILTER == "Imagens (*.jpg *.jpeg *.png *.webp *.heic *.heif);;Todos os arquivos (*.*)"
@@ -433,9 +404,9 @@ def test_list_uses_the_file_delegate_and_hides_its_header(page):
     assert not page.view.uniformRowHeights()
 
 
-def test_click_or_enter_opens_the_details(page, qtbot, photos):
+def test_click_or_enter_opens_the_details(page, qtbot, photos, settle):
     page.add_paths([str(write(photos, "a.jpg", make_jpeg()))])
-    _settle(qtbot, page, 1)
+    settle(page, 1)
     page.resize(900, 700)
     page.show()
     qtbot.waitExposed(page)
@@ -460,3 +431,63 @@ def test_click_or_enter_opens_the_details(page, qtbot, photos):
     assert page.view.isExpanded(index)
     qtbot.keyClick(page.view, Qt.Key.Key_Return)
     assert not page.view.isExpanded(index)
+
+
+# -- staying responsive with many files -------------------------------------------------
+
+
+def test_only_a_few_files_are_handed_to_the_runner_at_a_time(make_page, monkeypatch, photos, settle):
+    release = threading.Event()
+    real_inspect = siftool.inspect
+
+    def slow_inspect(path):
+        release.wait(TIMEOUT / 1000)
+        return real_inspect(path)
+
+    monkeypatch.setattr(siftool, "inspect", slow_inspect)
+    page = make_page(runner=JobRunner(max_workers=1))
+    paths = [write(photos, f"{number}.jpg", make_jpeg()) for number in range(5)]
+    try:
+        page.add_paths([str(path) for path in paths])
+
+        ids = page.model.entry_ids()
+        states = [page.model.entry(entry_id).state for entry_id in ids]
+        # Twice the workers are in flight; the others wait in the page, truthfully "Na fila".
+        assert states == [EntryState.ANALYZING] * 2 + [EntryState.QUEUED] * 3
+        assert page.model.index_for(ids[-1]).data(VALUE_ROLE) == "Na fila"
+        assert page.busy()
+        assert not page.clear_button.isEnabled()
+    finally:
+        release.set()
+    settle(page, 5)
+    assert set(_states(page).values()) == {EntryState.ANALYZED}
+
+
+def test_results_are_applied_a_few_per_turn_of_the_event_loop(page, qtbot, monkeypatch):
+    # A thousand results must not be applied back to back: painting, timers and input get
+    # their turn. With a clock that charges 5 ms per reading, 8 ms buys two results a turn.
+    class Clock:
+        now = 0.0
+
+        def perf_counter(self) -> float:
+            self.now += 0.005
+            return self.now
+
+    monkeypatch.setattr(clean_page_module, "time", Clock())
+    applied: list[int] = []
+    monkeypatch.setattr(page.model, "set_thumbnail", lambda entry_id, image: applied.append(entry_id))
+    seen: list[int] = []
+    probe = QTimer()  # any other user of the event loop
+    probe.setInterval(0)
+    probe.timeout.connect(lambda: seen.append(len(applied)))
+    probe.start()
+
+    for number in range(7):
+        page.runner.thumbnailReady.emit(number, QImage())
+    assert applied == []  # nothing is applied inside the runner's own signal
+    assert page.busy()
+
+    qtbot.waitUntil(lambda: len(applied) == 7, timeout=TIMEOUT)
+    probe.stop()
+    assert applied == list(range(7))  # in the order reported
+    assert max(after - before for before, after in zip(seen, seen[1:])) <= 2

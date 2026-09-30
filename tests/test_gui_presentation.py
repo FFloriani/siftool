@@ -26,6 +26,8 @@ from siftool_gui.presentation import (
     done_text,
     error_explanation,
     error_title,
+    failed_hint,
+    failed_title,
     mode_description,
     mode_title,
     result_explanation,
@@ -269,6 +271,13 @@ def test_done_text_combinations():
     assert done_text(1, 0, 0) == "1 foto limpa e verificada"
     assert done_text(3, 1, 1) == "3 fotos limpas e verificadas · 1 com ressalvas · 1 não limpou"
     assert done_text(0, 2, 0) == "0 fotos limpas e verificadas · 2 com ressalvas"
+
+
+def test_failed_texts_after_a_batch():
+    assert failed_title(1) == "1 foto não foi limpa"
+    assert failed_title(3) == "3 fotos não foram limpas"
+    assert failed_hint(1) == "Clique na linha para ver o motivo."
+    assert failed_hint(3) == "Clique em cada linha para ver o motivo."
 
 
 def test_presentation_imports_no_qt(tmp_path):

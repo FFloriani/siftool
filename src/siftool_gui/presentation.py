@@ -340,3 +340,13 @@ def done_text(verified: int, warnings: int, failed: int) -> str:
     if failed:
         parts.append(f"{failed} não limpou")
     return " · ".join(parts)
+
+
+def failed_title(failed: int) -> str:
+    """The title of the warning shown after a batch in which `failed` photos were not cleaned."""
+    return "1 foto não foi limpa" if failed == 1 else f"{failed} fotos não foram limpas"
+
+
+def failed_hint(failed: int) -> str:
+    """Where to find out why (each row explains its own failure, spec 5.5)."""
+    return "Clique na linha para ver o motivo." if failed == 1 else "Clique em cada linha para ver o motivo."
