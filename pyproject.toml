@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siftool"
-version = "2.0.0.dev0"
+dynamic = ["version"]  # siftool.__version__, the one source of truth (distribution spec 2)
 description = "Lossless, offline image metadata cleaner with verified results"
 requires-python = ">=3.11"
 dependencies = []
@@ -20,8 +20,14 @@ siftool = "siftool.cli:main"
 [project.gui-scripts]
 siftool-gui = "siftool_gui.app:main"
 
+[tool.setuptools.dynamic]
+version = {attr = "siftool.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+siftool_gui = ["assets/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

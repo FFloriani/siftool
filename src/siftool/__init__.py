@@ -14,7 +14,7 @@ from .errors import (
 )
 from .model import Category, CleanResult, Finding, Mode, Report, Status, Verdict
 
-__version__ = "2.0.0.dev0"
+__version__ = "2.0.0b1"  # the one source of truth: pyproject.toml and the build read it from here
 
 __all__ = [
     "inspect",

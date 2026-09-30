@@ -7,13 +7,42 @@ import pytest
 PYPROJECT = Path(__file__).parents[1] / "pyproject.toml"
 
 
+def _pyproject() -> dict:
+    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+
 def test_package_imports_with_version():
     import siftool
-    assert siftool.__version__ == "2.0.0.dev0"
+    assert siftool.__version__ == "2.0.0b1"
+
+
+def test_pyproject_reads_the_version_from_the_package():
+    # Distribution spec 2: one source of truth for the version, `siftool.__version__`.
+    config = _pyproject()
+    assert "version" not in config["project"]
+    assert "version" in config["project"]["dynamic"]
+    assert config["tool"]["setuptools"]["dynamic"]["version"] == {"attr": "siftool.__version__"}
+
+
+def test_setuptools_resolves_the_version_from_the_package():
+    pyprojecttoml = pytest.importorskip("setuptools.config.pyprojecttoml")
+    import siftool
+
+    resolved = pyprojecttoml.read_configuration(PYPROJECT, expand=True)
+    assert resolved["project"]["version"] == siftool.__version__
+
+
+def test_window_icon_ships_inside_the_gui_package():
+    # Distribution spec 2: the window icon is package data, so a wheel and the frozen program both carry it.
+    import siftool_gui
+
+    icon = Path(siftool_gui.__file__).parent / "assets" / "siftool.ico"
+    assert icon.read_bytes()[:4] == b"\x00\x00\x01\x00"  # an ICO file
+    assert _pyproject()["tool"]["setuptools"]["package-data"]["siftool_gui"] == ["assets/*.ico"]
 
 
 def _gui_extra() -> list[str]:
-    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["optional-dependencies"]["gui"]
+    return _pyproject()["project"]["optional-dependencies"]["gui"]
 
 
 def test_gui_extra_is_bounded_to_the_versions_the_code_relies_on():

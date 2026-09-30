@@ -1,14 +1,16 @@
-"""Persistent GUI preferences (spec sections 4.3, 5.6 and 7).
+"""Persistent GUI preferences (spec sections 4.3, 5.6 and 7; distribution spec 2).
 
 Stored via QFluentWidgets' `QConfig` machinery, at
-`%APPDATA%\\Siftool\\config.json` by default (or an explicit path, e.g.
-in tests): the default cleaning mode, where to save copies and the
-theme. No file list, no telemetry (spec section 7).
+`%APPDATA%\\Siftool\\config.json` by default -- or, in the portable copy,
+inside its own folder, `<Siftool.exe's folder>\\dados\\config.json` (or an
+explicit path, e.g. in tests): the default cleaning mode, where to save
+copies and the theme. No file list, no telemetry (spec section 7).
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from qfluentwidgets import (
@@ -21,6 +23,9 @@ from qfluentwidgets import (
 )
 
 from siftool.model import Mode
+
+PORTABLE_MARKER = "Siftool.portable"  # beside Siftool.exe in the portable ZIP: settings stay in the folder
+PORTABLE_DATA_FOLDER = "dados"
 
 
 class SiftoolConfig(QConfig):
@@ -42,8 +47,29 @@ class SiftoolConfig(QConfig):
     windowGeometry = ConfigItem("Window", "Geometry", "")  # base64 of QWidget.saveGeometry()
 
 
+def portable_dir() -> Path | None:
+    """The portable copy's folder -- the frozen program's own, with `PORTABLE_MARKER` beside it -- or None.
+
+    Only the frozen program (PyInstaller sets `sys.frozen`) can be the
+    portable copy: run from source, `sys.executable` is python.exe, and a
+    marker beside it means nothing.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    folder = Path(sys.executable).parent
+    return folder if (folder / PORTABLE_MARKER).is_file() else None
+
+
 def default_config_path() -> Path:
-    """Where preferences live when the caller doesn't pick a path."""
+    """Where preferences live when the caller doesn't pick a path.
+
+    The portable copy keeps them in its own folder (`dados\\config.json`
+    beside `Siftool.exe`), so nothing of it is left on the computer;
+    otherwise they live in `%APPDATA%\\Siftool\\config.json`.
+    """
+    portable = portable_dir()
+    if portable is not None:
+        return portable / PORTABLE_DATA_FOLDER / "config.json"
     return Path(os.environ.get("APPDATA") or Path.home()) / "Siftool" / "config.json"
 
 

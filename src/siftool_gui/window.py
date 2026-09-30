@@ -19,12 +19,19 @@ accessible name (spec 6). QFluentWidgets ships no Portuguese translation
 and sets the rail's own tooltips itself ("Back", "Open Navigation"...);
 `_PortugueseToolTips` swaps them as they are set. A scroll bar's arrow
 buttons are not tab stops.
+
+The window wears Siftool's icon (`assets/siftool.ico`, every size from 16
+to 256 px), and `open_paths` is how files reach it from Windows -- the
+command line, "Limpar com Siftool", a second launch (distribution spec 2).
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+
 from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QObject, QSize, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QIcon
 from PySide6.QtWidgets import QWidget
 from qfluentwidgets import FluentIcon, FluentWindow, NavigationItemPosition, Theme, setTheme
 from qfluentwidgets.components.widgets.scroll_bar import ArrowButton
@@ -39,6 +46,7 @@ from siftool_gui.workers import JobRunner
 MINIMUM_SIZE = QSize(720, 560)
 DEFAULT_SIZE = QSize(1100, 760)  # room for the 960 px column beside the navigation rail
 CLOSE_WAIT_MS = 10_000  # how long closing waits for copies already being written
+ICON_PATH = Path(__file__).with_name("assets") / "siftool.ico"  # package data: in a wheel and in the frozen program
 
 MINIMIZE_TEXT = "Minimizar"
 MAXIMIZE_TEXT = "Maximizar"
@@ -53,6 +61,11 @@ _RAIL_TOOLTIPS = {
     "Open Navigation": "Abrir navegação",
     "Close Navigation": "Fechar navegação",
 }
+
+
+def app_icon() -> QIcon:
+    """Siftool's icon, every size the .ico holds (the title bar, the taskbar and Alt+Tab each pick theirs)."""
+    return QIcon(str(ICON_PATH))
 
 
 class _PortugueseToolTips(QObject):
@@ -88,6 +101,7 @@ class MainWindow(FluentWindow):
         self.about_page = AboutPage(self)
 
         self.setWindowTitle("Siftool")
+        self.setWindowIcon(app_icon())
         self.setMinimumSize(MINIMUM_SIZE)
 
         self.addSubInterface(self.clean_page, FluentIcon.BROOM, "Limpar")
@@ -106,6 +120,28 @@ class MainWindow(FluentWindow):
         if app is not None:  # a session ending may quit without closing the window first
             app.aboutToQuit.connect(self._stop_theme_listener)
         self._follow_theme_mode(config.get(config.themeMode))
+
+    # -- files from Windows -----------------------------------------------------------------
+
+    def open_paths(self, paths: Sequence[str]) -> None:
+        """Files and folders from Windows: the command line, "Limpar com Siftool", a second launch.
+
+        They go to the "Limpar" page -- shown, whatever page was open -- and
+        the window comes to the front, restored if it was minimized. With no
+        paths (Siftool opened again from the Start menu), it only comes forward.
+        """
+        if paths:
+            self.switchTo(self.clean_page)
+            self.clean_page.add_paths(list(paths))
+        self.bring_to_front()
+
+    def bring_to_front(self) -> None:
+        """Show the window, restored if minimized (maximized again if it was), above the others and active."""
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
     # -- accessibility --------------------------------------------------------------------
 

@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -241,14 +242,22 @@ def test_window_without_a_usable_saved_geometry_gets_the_default_size(qtbot, tmp
     assert window.size() == fresh.size()
 
 
-def test_main_hands_qt_the_program_name_first(monkeypatch):
+def test_main_hands_qt_the_program_name_first(monkeypatch, qapp, tmp_path):
     seen: dict = {}
+
+    class FakeSignal:
+        def connect(self, slot) -> None:
+            pass
 
     class FakeApplication:
         instance = staticmethod(QApplication.instance)  # pytest-qt asks for it at teardown
 
         def __init__(self, argv):
             seen["argv"] = list(argv)
+            self.lastWindowClosed = FakeSignal()
+
+        def setWindowIcon(self, icon) -> None:
+            seen["icon"] = not icon.isNull()
 
         def exec(self) -> int:
             return 7
@@ -257,14 +266,21 @@ def test_main_hands_qt_the_program_name_first(monkeypatch):
         def show(self) -> None:
             seen["shown"] = True
 
+        def open_paths(self, paths) -> None:
+            seen["paths"] = paths
+
     monkeypatch.setattr("PySide6.QtWidgets.QApplication", FakeApplication)
-    monkeypatch.setattr(app_module, "create_window", lambda: FakeWindow())
+    monkeypatch.setattr(app_module, "create_window", lambda config_path=None: FakeWindow())
     monkeypatch.setattr(sys, "argv", ["siftool-gui", "left over"])
+    # Settings, and so the single-window lock and server name, of its own: a Siftool open here stays out of it.
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
     assert app_module.main(["-style", "fusion"]) == 7
 
     # Qt reads argv[0] as the program name: without it, "-style" would be swallowed as the name.
-    assert seen == {"argv": ["siftool-gui", "-style", "fusion"], "shown": True}
+    assert seen == {"argv": ["siftool-gui", "-style", "fusion"], "icon": True, "shown": True}
+    assert not list(tmp_path.glob("*.lock"))  # the first window's place is given back on the way out
 
 
 def test_long_folder_path_is_cut_to_fit_and_whole_in_the_tooltip(settings_page, config, qtbot):
@@ -314,8 +330,8 @@ def test_real_start_shows_the_window_and_keeps_its_settings_under_appdata(tmp_pa
         print("exit:", main(["-style", "fusion"]))
         """
     )
-    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", APPDATA=str(tmp_path),
-               PYTHONPATH=str(Path(__file__).parents[2] / "src"))
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", APPDATA=str(tmp_path), TEMP=str(tmp_path),
+               TMP=str(tmp_path), PYTHONPATH=str(Path(__file__).parents[2] / "src"))  # its window lock there too
 
     result = subprocess.run([sys.executable, "-P", "-c", code], cwd=tmp_path, env=env, capture_output=True,
                             text=True, timeout=120)

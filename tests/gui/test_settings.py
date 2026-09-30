@@ -7,13 +7,22 @@ Every test passes an explicit `tmp_path` config file -- never the real
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from qfluentwidgets import QConfig, Theme, isDarkTheme, qconfig, setTheme
 
 from siftool.model import Mode
 
-from siftool_gui.settings import SiftoolConfig, default_mode, load_config, output_dir
+from siftool_gui.settings import (
+    PORTABLE_MARKER,
+    SiftoolConfig,
+    default_config_path,
+    default_mode,
+    load_config,
+    output_dir,
+    portable_dir,
+)
 
 
 @pytest.fixture
@@ -89,3 +98,59 @@ def test_theme_is_qfluentwidgets_item_and_persists(tmp_path, theme_guard):
     reloaded = load_config(path)
     assert reloaded.get(reloaded.themeMode) is Theme.DARK
     assert load_config(tmp_path / "other.json").get(cfg.themeMode) is Theme.AUTO  # a fresh file: the default
+
+
+# -- where the settings live (distribution spec 2: installed and portable copies) --------------------
+
+
+def _frozen_program(monkeypatch, folder, *, portable: bool):
+    """Pretend to be the frozen `Siftool.exe` in `folder` (PyInstaller sets `sys.frozen`); with the marker when `portable`."""
+    folder.mkdir(parents=True, exist_ok=True)
+    exe = folder / "Siftool.exe"
+    exe.write_bytes(b"")
+    if portable:
+        (folder / PORTABLE_MARKER).write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    return folder
+
+
+def test_installed_program_keeps_its_settings_under_appdata(tmp_path, monkeypatch):
+    _frozen_program(monkeypatch, tmp_path / "Programs" / "Siftool", portable=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    assert portable_dir() is None
+    assert default_config_path() == tmp_path / "appdata" / "Siftool" / "config.json"
+
+
+def test_portable_copy_keeps_its_settings_in_its_own_folder(tmp_path, monkeypatch):
+    folder = _frozen_program(monkeypatch, tmp_path / "pendrive" / "Siftool", portable=True)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    assert portable_dir() == folder
+    assert default_config_path() == folder / "dados" / "config.json"
+
+
+def test_portable_copy_writes_its_settings_there(tmp_path, monkeypatch):
+    folder = _frozen_program(monkeypatch, tmp_path / "Siftool", portable=True)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    cfg = load_config()  # no path: where this copy keeps them
+    cfg.set(cfg.defaultMode, "maximum")
+
+    saved = json.loads((folder / "dados" / "config.json").read_text(encoding="utf-8"))
+    assert saved["Cleaning"]["DefaultMode"] == "maximum"
+    assert not (tmp_path / "appdata").exists()
+
+
+def test_marker_only_counts_for_the_frozen_program(tmp_path, monkeypatch):
+    # Run from source, `sys.executable` is python.exe: a marker next to it means nothing.
+    python = tmp_path / "venv" / "Scripts"
+    python.mkdir(parents=True)
+    (python / PORTABLE_MARKER).write_text("", encoding="utf-8")
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "executable", str(python / "python.exe"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    assert portable_dir() is None
+    assert default_config_path() == tmp_path / "appdata" / "Siftool" / "config.json"
