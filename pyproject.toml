@@ -13,6 +13,7 @@ dependencies = []
 test = ["pytest>=8", "Pillow>=10", "pytest-qt>=4.4"]
 legacy = ["Pillow>=10", "piexif>=1.1.3", "tkinterdnd2>=0.3.0"]
 gui = ["PySide6>=6.10,<7", "PySide6-Fluent-Widgets>=1.11,<2"]
+build = ["pyinstaller>=6.16"]  # packaging/build.py: `pip install -e ".[gui,build]"`; Inno Setup 6 is installed apart
 
 [project.scripts]
 siftool = "siftool.cli:main"

@@ -29,6 +29,7 @@ from siftool_gui.presentation import (
     category_outcome,
     category_value,
     clean_button_text,
+    display_version,
     done_text,
     error_explanation,
     error_title,
@@ -408,6 +409,35 @@ def test_batch_message_after_a_batch():
     assert batch_message(2, 1, 2) == (
         "2 fotos limpas e verificadas · 1 com ressalvas · 2 não limparam — clique em cada linha para ver o motivo."
     )
+
+
+@pytest.mark.parametrize(
+    ("version", "shown"),
+    [
+        ("2.0.0b1", "2.0.0 beta 1"),  # this release: what the installer and Siftool.exe call "ProductVersion"
+        ("2.0.0b12", "2.0.0 beta 12"),
+        ("2.1.0a3", "2.1.0 alpha 3"),
+        ("2.0.0rc2", "2.0.0 rc 2"),
+        ("2.0.0", "2.0.0"),  # final: nothing to add
+        ("2.0", "2.0"),
+        ("10.11.12rc10", "10.11.12 rc 10"),
+        ("2.0.0.dev4", "2.0.0 dev 4"),
+        ("2.0.0b1.dev2", "2.0.0 beta 1 dev 2"),
+        ("2.0.0.post1", "2.0.0 post 1"),
+        ("2.0.0rc1.post2.dev3", "2.0.0 rc 1 post 2 dev 3"),
+        ("2.0.0-beta.1", "2.0.0 beta 1"),  # the spelling of file names and tags reads the same
+        ("v2.0.0-rc.1", "2.0.0 rc 1"),
+        ("2.0.0B1", "2.0.0 beta 1"),
+    ],
+)
+def test_display_version_reads_the_way_people_say_it(version, shown):
+    assert display_version(version) == shown
+
+
+@pytest.mark.parametrize("version", ["", "garbage", "2.0.0b", "2.0.0.dev", "2.0.0+local", "2..0", "latest"])
+def test_display_version_leaves_alone_what_it_cannot_read(version):
+    # A version shown to people is never lost, and reading one never raises.
+    assert display_version(version) == version
 
 
 def test_presentation_imports_no_qt(tmp_path):

@@ -31,6 +31,26 @@ def config(tmp_path):
     return load_config(tmp_path / "cfg.json")
 
 
+@pytest.fixture(params=["folder-is-a-file", "read-only-file"])
+def unwritable_config(request, tmp_path):
+    """A settings path nothing can be written to, as in a portable copy on read-only media (release prep).
+
+    Either its folder is really a file, so `mkdir` fails (`QConfig.save`'s first step), or the settings file
+    itself is read-only, so opening it for writing fails. It loads as the defaults; every save raises `OSError`.
+    """
+    import os
+    import stat
+
+    if request.param == "folder-is-a-file":
+        (tmp_path / "dados").write_text("not a folder", encoding="utf-8")
+        return tmp_path / "dados" / "config.json"
+    path = tmp_path / "config.json"
+    path.write_text("{}", encoding="utf-8")
+    os.chmod(path, stat.S_IREAD)
+    request.addfinalizer(lambda: os.chmod(path, stat.S_IREAD | stat.S_IWRITE))
+    return path
+
+
 @pytest.fixture
 def photos(tmp_path):
     folder = tmp_path / "fotos"

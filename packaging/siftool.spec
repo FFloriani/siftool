@@ -1,9 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec of the new Siftool (siftool_gui): windowed, onedir, dist/Siftool/Siftool.exe.
 
-Run through packaging/build.py (distribution spec 2): it empties build/ and
-dist/, writes the version resource from siftool.__version__ and passes its
-path in SIFTOOL_VERSION_INFO, then has the result check itself
+Run through packaging/build.py (distribution spec 2): it removes what an
+earlier build left in build/ and dist/, writes the version resource from
+siftool.__version__ and passes its path in SIFTOOL_VERSION_INFO, then puts
+the license and the third-party notices beside the exe (PyInstaller 6 would
+put `datas` in _internal/) and has the result check itself
 (Siftool.exe --self-test). That self-test is what proves nothing the
 program needs went out with the exclusions below.
 

@@ -15,7 +15,8 @@
 Otherwise it creates the `QApplication` and -- one window per settings
 file (`siftool_gui.single_instance`) -- either opens the window, which gets
 the paths once it shows (`open_window`) and later those of every other
-launch, or hands the paths to the window already open and exits.
+launch, or hands the paths to the window already open and exits. With no
+temporary folder to keep the lock in, every launch simply opens its own window.
 `create_window` builds the window after applying the saved theme.
 """
 

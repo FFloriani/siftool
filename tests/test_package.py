@@ -52,13 +52,32 @@ def test_gui_extra_is_bounded_to_the_versions_the_code_relies_on():
     assert _gui_extra() == ["PySide6>=6.10,<7", "PySide6-Fluent-Widgets>=1.11,<2"]
 
 
-@pytest.mark.parametrize("requirement", _gui_extra())
-def test_installed_gui_packages_satisfy_the_extra(requirement):
+def _check_installed(requirement: str, extra: str) -> None:
     from packaging.requirements import Requirement
 
     parsed = Requirement(requirement)
     try:
         installed = importlib.metadata.version(parsed.name)
     except importlib.metadata.PackageNotFoundError:
-        pytest.skip(f"{parsed.name} is not installed (the `gui` extra is optional)")
+        pytest.skip(f"{parsed.name} is not installed (the `{extra}` extra is optional)")
     assert parsed.specifier.contains(installed), f"{parsed.name} {installed} is outside {parsed.specifier}"
+
+
+@pytest.mark.parametrize("requirement", _gui_extra())
+def test_installed_gui_packages_satisfy_the_extra(requirement):
+    _check_installed(requirement, "gui")
+
+
+def _build_extra() -> list[str]:
+    return _pyproject()["project"]["optional-dependencies"].get("build", [])
+
+
+def test_build_extra_installs_pyinstaller():
+    # Release prep: `pip install -e ".[gui,build]"` is all packaging/build.py needs from pip (the Inno Setup
+    # compiler, which makes the installer, is a separate install).
+    assert _build_extra() == ["pyinstaller>=6.16"]
+
+
+@pytest.mark.parametrize("requirement", _build_extra())
+def test_installed_build_packages_satisfy_the_extra(requirement):
+    _check_installed(requirement, "build")

@@ -27,11 +27,13 @@ from qfluentwidgets import (
 import siftool
 import siftool_gui
 from siftool_gui.drop_area import AccentIcon
+from siftool_gui.presentation import display_version
 
 TITLE_TEXT = "Sobre o Siftool"
 APP_NAME = "Siftool"
-VERSION_TEXT = f"Versão {siftool_gui.__version__}"  # the program
-ENGINE_TEXT = f"Motor de limpeza {siftool.__version__}"  # the engine it runs on (spec 5.7 asks for both)
+# "2.0.0 beta 1", the way the installer and Siftool.exe say it -- not PEP 440's "2.0.0b1"
+VERSION_TEXT = f"Versão {display_version(siftool_gui.__version__)}"  # the program
+ENGINE_TEXT = f"Motor de limpeza {display_version(siftool.__version__)}"  # the engine it runs on (spec 5.7 asks for both)
 TAGLINE_TEXT = "Limpa o que suas fotos escondem, sem mexer nas originais."
 PROMISES_TITLE = "O que o Siftool garante"
 PROMISES = (

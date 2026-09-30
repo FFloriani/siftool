@@ -16,6 +16,11 @@ Every card writes straight to the `SiftoolConfig` it is given, which saves
 itself; nothing else is stored (spec 7). The "Limpar" page reads the
 default mode when it is created: changing it here does not switch the mode
 of a list that is already open.
+
+When the settings file cannot be written (a portable copy on read-only
+media), the choice still applies -- the theme switches, the folder is used --
+and lasts until Siftool closes; one message says it will not be saved, for
+the whole run of failures (`SiftoolConfig.saveFailed`).
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from PySide6.QtWidgets import QFileDialog, QWidget
 from qfluentwidgets import (
     ExpandLayout,
     FluentIcon,
+    InfoBar,
+    InfoBarPosition,
     OptionsSettingCard,
     PushSettingCard,
     ScrollArea,
@@ -61,6 +68,11 @@ THEME_TEXTS = ["Claro", "Escuro", "Seguir o Windows"]
 
 SHOW_OPTIONS_TEXT = "Mostrar as opções"
 HIDE_OPTIONS_TEXT = "Esconder as opções"
+
+NOT_SAVED_TITLE = "Não foi possível salvar as configurações nesta pasta."
+NOT_SAVED_CONTENT = "A mudança vale só até você fechar o Siftool."
+CLOSE_MESSAGE_TOOLTIP = "Fechar"
+CLOSE_MESSAGE_NAME = "Fechar mensagem"
 
 MAX_CONTENT_WIDTH = 960
 SIDE_MARGIN = 36
@@ -129,6 +141,7 @@ class SettingsPage(ScrollArea):
         config.outputFolder.valueChanged.connect(self._show_folder)
         self.folder_card.clicked.connect(self._choose_folder)
         self.theme_card.optionChanged.connect(self._apply_theme)
+        config.saveFailed.connect(self._show_not_saved)
 
     def _build_layout(self) -> None:
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -194,3 +207,19 @@ class SettingsPage(ScrollArea):
 
     def _apply_theme(self, item) -> None:
         setTheme(self._config.get(item))
+
+    # -- a settings file that cannot be written ------------------------------------------------
+
+    def _show_not_saved(self) -> None:
+        """One message: the change was made, but it will not outlast this run.
+
+        `SiftoolConfig` announces the first failed save of a run of failures,
+        so the next card the user changes does not bring a second message.
+        It stays until closed -- it is the only word the user gets.
+        """
+        bar = InfoBar.warning(
+            NOT_SAVED_TITLE, NOT_SAVED_CONTENT, orient=Qt.Orientation.Vertical, isClosable=True, duration=-1,
+            position=InfoBarPosition.TOP, parent=self,
+        )
+        bar.closeButton.setToolTip(CLOSE_MESSAGE_TOOLTIP)  # only an icon: it says what it does (spec 6)
+        bar.closeButton.setAccessibleName(CLOSE_MESSAGE_NAME)

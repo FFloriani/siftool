@@ -233,11 +233,14 @@ class MainWindow(FluentWindow):
         self.move(available.center().x() - size.width() // 2, available.center().y() - size.height() // 2)
 
     def _save_geometry(self) -> None:
+        """Remember the size. A settings file that cannot be written (`SiftoolConfig.save` does not raise) must not
+        keep the window open, and on a window that is going nobody is left to read the message about it."""
         geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        was_blocked = self.config.blockSignals(True)  # no "não foi possível salvar" on the way out
         try:
             self.config.set(self.config.windowGeometry, geometry)
-        except OSError:  # an unwritable settings file must not keep the window open
-            pass
+        finally:
+            self.config.blockSignals(was_blocked)
 
     # -- closing ---------------------------------------------------------------------------
 

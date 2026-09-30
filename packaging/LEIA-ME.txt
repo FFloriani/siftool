@@ -7,20 +7,39 @@ cópia limpa fica ao lado dele, com "_clean" no nome.
 
 Como usar
 ---------
-1. Extraia a pasta Siftool inteira para onde quiser (um pendrive, por exemplo).
-2. Abra o Siftool.exe.
+1. Extraia a pasta Siftool inteira para um caminho CURTO, perto da raiz do
+   disco (por exemplo C:\Siftool, D:\Siftool ou um pendrive). Não a deixe
+   dentro de pastas fundas, como as do OneDrive: com o caminho da pasta
+   perto de 200 caracteres ou mais, o Siftool.exe não abre.
+2. Abra o Siftool.exe e arraste as fotos, ou a pasta delas, para a janela.
 
 Nada é instalado no computador. As configurações ficam na pasta "dados",
-ao lado do Siftool.exe. Para remover o Siftool, apague a pasta.
+ao lado do Siftool.exe. Em um pendrive protegido contra gravação o Siftool
+abre normalmente, mas avisa que não consegue salvar as configurações. Para
+remover o Siftool, apague a pasta.
 
 Não apague o arquivo Siftool.portable: é ele que faz o Siftool guardar as
 configurações aqui dentro.
 
+O item "Limpar com Siftool" do clique direito é do instalador, não desta
+versão (e o Windows o esconde quando mais de 15 arquivos estão
+selecionados). Aqui, arraste as fotos ou a pasta para a janela.
+
 Aviso do Windows
 ----------------
-Na primeira vez, o Windows pode mostrar "O Windows protegeu o computador",
-porque o programa não tem assinatura digital. Clique em "Mais informações"
-e depois em "Executar assim mesmo".
+Na primeira vez, o Windows pode mostrar "O Windows protegeu o computador"
+(o SmartScreen), porque o programa não tem assinatura digital. Clique em
+"Mais informações" e depois em "Executar assim mesmo".
 
-Licença: GPLv3 (veja LICENSE.txt).
+No Windows 11 com o "Controle inteligente de aplicativos" (Smart App
+Control) ligado, o Windows pode bloquear de vez os programas sem assinatura
+digital, e nesse caso não oferece o "Executar assim mesmo". Este programa
+ainda não é assinado, então isso pode acontecer com ele. Só deixa de
+acontecer quando o Siftool tiver assinatura digital, ou se você desligar
+esse recurso em Segurança do Windows > Controle de aplicativos e do
+navegador. A decisão é sua: em algumas versões do Windows 11 não dá para
+ligá-lo de novo depois.
+
+Licença: GPLv3 (veja LICENSE.txt). Os componentes de terceiros e as licenças
+deles estão em THIRD-PARTY-NOTICES.txt.
 Código-fonte: https://github.com/FFloriani/siftool

@@ -15,13 +15,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtWidgets import QApplication
 
 from fixtures.make_fixtures import make_png, write
+from siftool_gui import app as app_module
 from siftool_gui.single_instance import (
+    HAND_OVER_TIMEOUT_MS,
     MAX_MESSAGE_BYTES,
     SingleInstance,
     decode_message,
@@ -215,6 +220,149 @@ def test_a_lock_left_by_a_crashed_instance_is_taken_over(qtbot, make_instance, t
 
     first.release()
     assert not lock.exists()
+
+
+# -- a lock file Qt never calls stale (release prep): no process of this machine could ever clear it ---------
+
+
+def _write_lock(instance: SingleInstance, content: bytes) -> Path:
+    lock = Path(instance.lock_file)
+    lock.write_bytes(content)
+    return lock
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"\x00\x01 lixo \xff\xfe\n", b"not-a-pid\npython\nsome-host\n"],
+    ids=["empty", "garbled", "no-pid"],
+)
+def test_a_lock_file_that_names_no_process_is_taken_over(qtbot, make_instance, content):
+    # A crash or a full disk in the middle of writing the lock leaves a file Qt cannot read: it is never "stale"
+    # to it, so every launch used to wait HAND_OVER_TIMEOUT_MS for a window that does not exist.
+    first = make_instance()
+    lock = _write_lock(first, content)
+
+    assert first.claim()
+    assert first.listen()
+    received, sent = _received(qtbot, first, first.name, [r"C:\d.jpg"])
+    assert received == [r"C:\d.jpg"] and sent
+
+    first.release()
+    assert not lock.exists()
+
+
+def test_a_lock_naming_another_machine_is_taken_over(make_instance):
+    # A temporary folder copied or restored from elsewhere: the lock names a live pid -- but of another host.
+    first = make_instance()
+    _write_lock(first, f"{os.getpid()}\npython\nsome-other-machine\n".encode("utf-8"))
+
+    assert first.claim()
+    assert first.another_is_first() is False  # it holds the place now
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="elsewhere a file in use can be deleted anyway")
+def test_a_garbled_lock_that_cannot_be_removed_is_left_alone(make_instance):
+    # Whatever holds the file open (Windows will not delete it): one try, then it is another launch's lock as before.
+    first = make_instance()
+    lock = _write_lock(first, b"")
+
+    with open(lock, "rb"):
+        assert not first.claim()
+        assert not first.claim()  # and it does not try again
+        assert first.another_is_first()
+
+    assert lock.exists()
+
+
+def test_a_live_instances_lock_is_never_taken_over(make_instance):
+    first, second = make_instance(), make_instance()
+    assert first.claim()
+
+    assert not second.claim()  # the lock names this very process, on this machine: Qt's own rule keeps it
+    assert second.another_is_first()
+    assert Path(first.lock_file).exists() and first.claim()  # and the holder still holds it
+
+
+def test_a_launch_with_a_garbled_lock_does_not_wait_for_a_window_that_is_not_there(make_instance):
+    launch = make_instance()
+    _write_lock(launch, b"\x00\x00\x00")
+
+    started = time.monotonic()
+    first = launch.claim() or (launch.another_is_first() and launch.hand_over([r"C:\e.jpg"]))
+
+    assert first is True  # `run()`'s own test: it is the first, it does not hand anything over
+    assert (time.monotonic() - started) * 1000 < HAND_OVER_TIMEOUT_MS / 4
+
+
+# -- no temporary folder (release prep): standalone, never a crash at start-up ------------------------------
+
+
+def test_without_a_temporary_folder_it_runs_standalone(monkeypatch, tmp_path):
+    def no_temporary_folder():
+        raise FileNotFoundError(2, "No usable temporary directory found")
+
+    monkeypatch.setattr(tempfile, "gettempdir", no_temporary_folder)
+
+    instance = SingleInstance(tmp_path / "cfg.json")  # used to raise here, at start-up
+
+    assert instance.standalone
+    assert instance.lock_file is None
+    assert not instance.claim()  # nobody to share a place with, and none to hold
+    assert not instance.another_is_first()  # so nobody to hand anything to
+    assert not instance.listen()
+    assert not instance.hand_over([r"C:\f.jpg"])
+    instance.release()  # safe, as always
+
+
+def test_an_explicit_lock_folder_needs_no_temporary_folder(monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: (_ for _ in ()).throw(FileNotFoundError(2, "none")))
+
+    instance = SingleInstance(tmp_path / "cfg.json", lock_dir=tmp_path)
+
+    assert not instance.standalone
+    assert instance.claim()
+    instance.release()
+
+
+def test_the_program_opens_its_window_without_a_temporary_folder(monkeypatch, tmp_path, qapp):
+    seen: dict = {}
+
+    class FakeApplication:
+        instance = staticmethod(QApplication.instance)  # pytest-qt asks for it at teardown
+
+        def __init__(self, argv):
+            self.lastWindowClosed = _NoSignal()
+
+        def setWindowIcon(self, icon) -> None:
+            pass
+
+        def exec(self) -> int:
+            return 5
+
+    class FakeWindow:
+        def show(self) -> None:
+            seen["shown"] = True
+
+        def open_paths(self, paths) -> None:
+            seen["paths"] = list(paths)
+
+    def no_temporary_folder():
+        raise FileNotFoundError(2, "No usable temporary directory found")
+
+    monkeypatch.setattr("PySide6.QtWidgets.QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "create_window", lambda config_path=None: FakeWindow())
+    monkeypatch.setattr(sys, "argv", ["siftool-gui"])
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setattr(tempfile, "gettempdir", no_temporary_folder)
+
+    assert app_module.main([str(tmp_path / "foto.png")]) == 5  # the window opened and ran: it did not crash
+
+    assert seen == {"shown": True, "paths": [str(tmp_path / "foto.png")]}
+
+
+class _NoSignal:
+    def connect(self, slot) -> None:
+        pass
 
 
 def test_second_launch_hands_its_paths_to_the_first_window(tmp_path):

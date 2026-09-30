@@ -2,13 +2,18 @@
 
     .venv/Scripts/python.exe packaging/build.py
 
-From a clean checkout, with no manual step (spec 4, criterion 1). Each step
-is checked before the next one starts:
+From a clean checkout, with no manual step (spec 4, criterion 1); it needs
+`pip install -e ".[gui,build]"` and Inno Setup 6. Each step is checked before
+the next one starts:
 
-1. `build/` and `dist/` are emptied.
+1. What an earlier run of this script left is deleted -- `build/pyinstaller`,
+   `build/version_info.txt`, `dist/Siftool` and the ZIP and installer in
+   `dist/` -- and nothing else: `dist/legacy`, where `build.bat` puts the OLD
+   Tkinter program, and whatever else another tool made there stay.
 2. PyInstaller freezes the program (`packaging/siftool.spec`) into
    `dist/Siftool/` -- `Siftool.exe`, windowed -- with a version resource
-   written here from `siftool.__version__`; the license goes beside the exe.
+   written here from `siftool.__version__`; the license and the notices about
+   the third-party components (GPLv3, LGPLv3...) go beside the exe.
 3. The frozen program checks itself (`Siftool.exe --self-test`, off screen,
    with only Windows' own folders on PATH) and says its version.
 4. The portable ZIP, `dist/Siftool-<version>-portable.zip`: that folder plus
@@ -43,6 +48,10 @@ ROOT = PACKAGING.parent
 SRC = ROOT / "src"
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
+# What this script makes in build/ -- the legacy build.bat's own work folder there is build/siftool, and its
+# output dist/legacy/siftool (on Windows, paths ignore case: its old dist/siftool WAS dist/Siftool).
+WORK_DIR = BUILD / "pyinstaller"
+VERSION_FILE = BUILD / "version_info.txt"
 
 APP_NAME = "Siftool"
 EXE_NAME = "Siftool.exe"
@@ -50,6 +59,7 @@ PROGRAM_DIR = DIST / APP_NAME
 SPEC = PACKAGING / "siftool.spec"
 INSTALLER_SCRIPT = PACKAGING / "siftool.iss"
 LICENSE = PACKAGING / "LICENSE.txt"
+NOTICES = PACKAGING / "THIRD-PARTY-NOTICES.txt"
 README_PORTABLE = PACKAGING / "LEIA-ME.txt"
 ICON = SRC / "siftool_gui" / "assets" / "siftool.ico"
 PUBLISHER = "Felipe Floriani"
@@ -169,17 +179,46 @@ def _run(command: list[str], **kwargs) -> None:
         raise BuildError(f"{Path(command[0]).name} failed with exit code {completed.returncode}")
 
 
-def _remove(folder: Path) -> None:
-    def writable_again(function, path, _error) -> None:  # a read-only file: make it writable, try again
-        os.chmod(path, stat.S_IWRITE)
-        function(path)
+def _remove(path: Path) -> None:
+    """Delete a file or a folder -- read-only files included -- if it is there."""
+    def writable_again(function, target, _error) -> None:  # a read-only file: make it writable, try again
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
 
-    if not folder.exists():
-        return
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(folder, onexc=writable_again)
-    else:
-        shutil.rmtree(folder, onerror=writable_again)
+    if path.is_dir() and not path.is_symlink():
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=writable_again)
+        else:
+            shutil.rmtree(path, onerror=writable_again)
+    elif path.exists() or path.is_symlink():
+        try:
+            path.unlink()
+        except PermissionError:  # a read-only file: make it writable, try again
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+
+
+def previous_outputs(build: Path = BUILD, dist: Path = DIST) -> list[Path]:
+    """What an earlier run of this script left in `build/` and `dist/` -- its own outputs, and only those.
+
+    In `build/`: PyInstaller's work folder and the version resource. In
+    `dist/`: the program folder, and the ZIP and the installer of any version
+    (an older release's are this script's too). Never `dist/legacy` -- where
+    `build.bat` puts the old Tkinter program -- nor `build/siftool`, that
+    program's work folder, nor anything else another tool or a person left in
+    either folder.
+    """
+    found = [build / WORK_DIR.name, build / VERSION_FILE.name, dist / APP_NAME]
+    found += sorted(dist.glob(f"{APP_NAME}-*-portable.zip")) + sorted(dist.glob(f"{APP_NAME}-*-setup.exe"))
+    return [path for path in found if path.exists() or path.is_symlink()]
+
+
+def remove_previous_outputs(build: Path = BUILD, dist: Path = DIST) -> list[Path]:
+    """Step 1: delete `previous_outputs`; the paths removed."""
+    removed = previous_outputs(build, dist)
+    for path in removed:
+        _remove(path)
+    return removed
 
 
 def _windows_text(path: Path) -> bytes:
@@ -187,12 +226,21 @@ def _windows_text(path: Path) -> bytes:
     return path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
 
 
+def add_legal_files(program: Path) -> None:
+    """The GPLv3 license and the third-party notices go beside the exe, under their own names.
+
+    Not through the spec's `datas`: PyInstaller 6 puts those in `_internal/`, and these are for the person who
+    opens the folder -- the installer and the portable ZIP both carry the whole program folder.
+    """
+    for source in (LICENSE, NOTICES):
+        (program / source.name).write_bytes(_windows_text(source))
+
+
 def freeze(version: str) -> None:
-    """Step 2: PyInstaller makes dist/Siftool/ (see siftool.spec); the license goes beside the exe."""
-    version_file = BUILD / "version_info.txt"
-    version_file.parent.mkdir(parents=True, exist_ok=True)
-    version_file.write_text(version_info(version), encoding="utf-8")
-    env = dict(os.environ, SIFTOOL_VERSION_INFO=str(version_file))
+    """Step 2: PyInstaller makes dist/Siftool/ (see siftool.spec); the license and the notices go beside the exe."""
+    VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    VERSION_FILE.write_text(version_info(version), encoding="utf-8")
+    env = dict(os.environ, SIFTOOL_VERSION_INFO=str(VERSION_FILE))
     # A Python from conda keeps the DLLs of its own extension modules (ffi.dll for _ctypes, liblzma.dll,
     # libbz2.dll, libmpdec-4.dll, zstd.dll) in <base prefix>\Library\bin, which PyInstaller only searches
     # when it is on PATH. Last, so it never shadows a DLL found anywhere else.
@@ -202,12 +250,12 @@ def freeze(version: str) -> None:
     # -P: the repository root never goes on the module path, where the legacy siftool.py would shadow the engine.
     _run(
         [sys.executable, "-P", "-m", "PyInstaller", "--noconfirm", "--log-level", "WARN",
-         "--distpath", str(DIST), "--workpath", str(BUILD / "pyinstaller"), str(SPEC)],
+         "--distpath", str(DIST), "--workpath", str(WORK_DIR), str(SPEC)],
         env=env,
     )
     if not (PROGRAM_DIR / EXE_NAME).is_file():
         raise BuildError(f"PyInstaller did not make {PROGRAM_DIR / EXE_NAME}")
-    (PROGRAM_DIR / "LICENSE.txt").write_bytes(_windows_text(LICENSE))
+    add_legal_files(PROGRAM_DIR)
 
 
 def _clean_environment() -> dict[str, str]:
@@ -265,6 +313,9 @@ def check_portable_zip(target: Path, version: str) -> dict:
         with zipfile.ZipFile(target) as archive:
             archive.extractall(folder)
         copy = Path(folder) / APP_NAME
+        for legal in (LICENSE, NOTICES):  # next to the exe, in the ZIP as in the installer
+            if not (copy / legal.name).is_file():
+                raise BuildError(f"the portable ZIP does not carry {legal.name} next to {EXE_NAME}")
         report = self_test(copy / EXE_NAME, version)
         settings = copy / PORTABLE_DATA_FOLDER / "config.json"
         if report.get("portable") is not True or not settings.is_file() \
@@ -319,9 +370,9 @@ def main() -> int:
     version = read_version()
     release = release_name(version)
     print(f"Siftool {version} ({release})")
-    print("1/6 emptying build/ and dist/", flush=True)
-    for folder in (BUILD, DIST):
-        _remove(folder)
+    print("1/6 removing what an earlier build left (build/pyinstaller, dist/Siftool, its ZIP and installer)", flush=True)
+    for path in remove_previous_outputs():
+        print(f"  removed {path.relative_to(ROOT)}")
     print("2/6 freezing the program (PyInstaller)", flush=True)
     freeze(version)
     print("3/6 self-test of dist/Siftool", flush=True)

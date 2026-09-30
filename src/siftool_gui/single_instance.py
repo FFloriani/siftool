@@ -12,6 +12,18 @@ which adds them and comes to the front -- and exits.
   process that is gone: the next launch clears it and takes over (the
   "stale name" of spec 2). Outside Windows a crash also leaves the server's
   socket file behind: `listen` removes it and listens again.
+- Two kinds of left-behind lock Qt itself never clears -- it only judges a
+  lock by a process of this machine it can read from the file: one that is
+  empty or garbled (a crash or a full disk in the middle of writing it) and
+  one that names another machine (a temporary folder copied or restored from
+  elsewhere). Left alone, every launch would wait `HAND_OVER_TIMEOUT_MS` for a
+  window that does not exist and then open a window of its own. `claim` takes
+  both over, once: `removeStaleLockFile`, then one more try. A lock whose
+  process is alive on this machine is never touched, and Windows refuses to
+  delete a file its holder still has open.
+- With no temporary folder at all (`tempfile.gettempdir` fails) there is
+  nowhere to keep a lock: the program runs standalone -- `standalone` --
+  without the one-window rule, instead of failing at start-up.
 - The messages: the first instance's `QLocalServer` (a named pipe on
   Windows, open to this user only) takes one line of UTF-8 JSON,
   `{"paths": [...]}`, and answers `ok`. `send_paths` waits for that answer
@@ -36,7 +48,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, QThread, Signal
+from PySide6.QtCore import QLockFile, QObject, QSysInfo, QThread, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 ACK = b"ok\n"
@@ -159,7 +171,9 @@ class SingleInstance(QObject):
 
     `claim()` says whether this is the first; the first `listen()`s and
     receives the others' paths through `pathsReceived`; any other
-    `hand_over()`s its own. `release()` gives the place up.
+    `hand_over()`s its own. `release()` gives the place up. With no
+    temporary folder to keep the lock in, `standalone` is true and none of
+    that happens: every launch is on its own.
     """
 
     pathsReceived = Signal(list)  # list[str] from a second launch; empty when it had none
@@ -172,28 +186,75 @@ class SingleInstance(QObject):
 
             config_path = default_config_path()
         self.name = server_name(config_path)
-        folder = Path(tempfile.gettempdir() if lock_dir is None else lock_dir)
+        self._server: QLocalServer | None = None
+        self._lock: QLockFile | None = None
+        self.lock_file: str | None = None
+        self._takeover_tried = False
+        try:
+            folder = Path(tempfile.gettempdir() if lock_dir is None else lock_dir)
+        except OSError:  # FileNotFoundError: no temporary folder can be written to -- nowhere to keep a lock
+            return
         self.lock_file = str(folder / f"{self.name}.lock")
         self._lock = QLockFile(self.lock_file)
         self._lock.setStaleLockTime(0)  # stale only when its process is gone: a window may stay open for days
-        self._server: QLocalServer | None = None
+
+    @property
+    def standalone(self) -> bool:
+        """True when there is no folder to keep the lock in: this launch cannot tell who else is open."""
+        return self._lock is None
 
     def claim(self) -> bool:
-        """Whether this is the first instance (it already was, or it takes the lock now -- a crash's included)."""
-        return self._lock.isLocked() or self._lock.tryLock(0)
+        """Whether this is the first instance (it already was, or it takes the lock now -- a crash's included).
+
+        A lock left behind that no process of this machine can ever clear (see the module docstring) is
+        removed, once, and the lock tried again.
+        """
+        lock = self._lock
+        if lock is None:
+            return False
+        if lock.isLocked() or lock.tryLock(0):
+            return True
+        if self._takeover_tried or not self._lock_names_nobody_here():
+            return False
+        self._takeover_tried = True
+        lock.removeStaleLockFile()  # Windows refuses while a live holder still has the file open
+        return lock.tryLock(0)
+
+    def _lock_names_nobody_here(self) -> bool:
+        """After a `tryLock` that failed because the file exists: whether no process of this machine holds it.
+
+        Qt clears a lock whose process is gone, but only if it reads the
+        file and finds this machine's name in it. So an unreadable file
+        (empty, garbled) or one naming another machine is left in place
+        for good. The file is read twice, a moment apart: a live holder's
+        file can be seen in the instant between its creation and its content.
+        """
+        lock = self._lock
+        if lock is None or lock.error() != QLockFile.LockError.LockFailedError:
+            return False
+        for attempt in range(2):
+            *_, pid, hostname, _application = lock.getLockInfo()  # (pid, host, app); pid 0 when unreadable
+            if pid > 0:  # readable: a process that could be running here, unless it is another machine's
+                return hostname not in ("", QSysInfo.machineHostName())
+            if attempt == 0:
+                QThread.msleep(RETRY_MS)
+        return True
 
     def another_is_first(self) -> bool:
         """After a `claim()` that failed: whether another live instance holds the place.
 
         False when the lock could not even be tried (an unwritable temporary
-        folder): there is then nobody to hand anything to.
+        folder, or none at all): there is then nobody to hand anything to.
         """
-        return not self._lock.isLocked() and self._lock.error() == QLockFile.LockError.LockFailedError
+        lock = self._lock
+        return lock is not None and not lock.isLocked() and lock.error() == QLockFile.LockError.LockFailedError
 
     def listen(self) -> bool:
         """Start taking the other launches' paths (`pathsReceived`); the first instance's job."""
         if self._server is not None:
             return True
+        if self._lock is None:
+            return False  # standalone: nobody to take paths from, and no place to claim
         server = QLocalServer(self)
         server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)  # this user only
         if not server.listen(self.name):
@@ -209,8 +270,11 @@ class SingleInstance(QObject):
 
         Waits up to `timeout_ms` for the first window to listen -- it may still
         be opening. False when it never answered, or when it went away
-        meanwhile and this launch took its place (`claim()` then holds).
+        meanwhile and this launch took its place (`claim()` then holds);
+        False at once when standalone.
         """
+        if self._lock is None:
+            return False
         allow_foreground()
         deadline = time.monotonic() + timeout_ms / 1000
         while True:
@@ -226,7 +290,7 @@ class SingleInstance(QObject):
         server, self._server = self._server, None
         if server is not None:
             server.close()
-        if self._lock.isLocked():
+        if self._lock is not None and self._lock.isLocked():
             self._lock.unlock()
 
     def _take_connections(self) -> None:
