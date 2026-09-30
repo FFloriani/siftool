@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 import siftool
 from fixtures.make_fixtures import make_jpeg, make_png, make_webp, write
@@ -433,6 +434,31 @@ def test_click_or_enter_opens_the_details(page, qtbot, photos, settle):
     assert not page.view.isExpanded(index)
 
 
+def test_double_click_opens_the_details_once(page, qtbot, photos, settle):
+    page.add_paths([str(write(photos, "a.jpg", make_jpeg()))])
+    settle(page, 1)
+    page.resize(900, 700)
+    page.show()
+    qtbot.waitExposed(page)
+    (entry_id,) = page.model.entry_ids()
+    index = page.model.index_for(entry_id)
+    viewport, left = page.view.viewport(), Qt.MouseButton.LeftButton
+    center = page.view.visualRect(index).center()
+
+    # What Qt delivers for a double-click: press, release, double-click, release. The first
+    # release opens the row; the rest of the double-click must not close it again.
+    qtbot.mousePress(viewport, left, pos=center)
+    qtbot.mouseRelease(viewport, left, pos=center)
+    qtbot.mouseDClick(viewport, left, pos=center)
+    qtbot.mouseRelease(viewport, left, pos=center)
+    assert page.view.isExpanded(index)
+
+    page.view.collapse(index)
+    qtbot.wait(QApplication.doubleClickInterval() + 50)  # a new gesture, not the end of the last one
+    qtbot.mouseDClick(viewport, left, pos=center)  # a double-click alone (as QTest sends it) toggles too
+    assert page.view.isExpanded(index)
+
+
 # -- staying responsive with many files -------------------------------------------------
 
 
@@ -461,6 +487,60 @@ def test_only_a_few_files_are_handed_to_the_runner_at_a_time(make_page, monkeypa
         release.set()
     settle(page, 5)
     assert set(_states(page).values()) == {EntryState.ANALYZED}
+
+
+def test_cancel_during_a_scan_stops_the_files_it_found(make_page, qtbot, tmp_path, monkeypatch):
+    # Review of delivery C: "Cancelar" right after the first batch of a folder walk reached the
+    # page used to list that batch and analyze all of it anyway.
+    folder = tmp_path / "muitas fotos"
+    folder.mkdir()
+    jpeg = make_jpeg()
+    for number in range(450):
+        write(folder, f"{number:03d}.jpg", jpeg)
+    inspected: list[str] = []
+    real_inspect = siftool.inspect
+
+    def counted_inspect(path):
+        inspected.append(str(path))
+        return real_inspect(path)
+
+    monkeypatch.setattr(siftool, "inspect", counted_inspect)
+    page = make_page(runner=JobRunner(max_workers=1))
+    with qtbot.waitSignal(page.runner.pathsFound, timeout=TIMEOUT):  # the walk found files...
+        page.add_paths([str(folder)])
+    listed = len(page.model.entry_ids())
+
+    page.cancel()  # ... and "Cancelar" before the page has listed and handed them out
+    started = len(inspected)
+    qtbot.waitUntil(lambda: not page.busy(), timeout=TIMEOUT)
+    qtbot.wait(100)  # time for anything that would still be dispatched
+
+    assert len(inspected) <= started + 1  # at most one analysis the pool had already picked up
+    assert len(page.model.entry_ids()) == listed  # what was found but not listed yet went with the walk
+    states = {page.model.entry(i).state for i in page.model.entry_ids()}
+    assert EntryState.ANALYZING not in states
+    assert not page.progress_bar.isVisibleTo(page)
+
+
+def test_a_failing_result_does_not_stall_the_queue(make_page, qtbot, photos, monkeypatch):
+    # Review of delivery C: an exception while applying a result skipped handing out more work.
+    page = make_page(runner=JobRunner(max_workers=1))  # two files go to the runner, the third waits
+    monkeypatch.setattr(page.runner, "thumbnail", lambda *args: None)  # no later preview to unstick it
+    paths = [write(photos, f"{name}.jpg", make_jpeg()) for name in "abc"]
+    real_apply = page.model.apply_report
+
+    def apply_report(entry_id, report):
+        if Path(report.path).name != "c.jpg":
+            raise RuntimeError("a bug while showing a result")
+        real_apply(entry_id, report)
+
+    monkeypatch.setattr(page.model, "apply_report", apply_report)
+    with qtbot.capture_exceptions() as exceptions:
+        page.add_paths([str(path) for path in paths])
+        last = page.model.entry_ids()[-1]
+        qtbot.waitUntil(lambda: page.model.entry(last).state is EntryState.ANALYZED, timeout=TIMEOUT)
+
+    assert len(exceptions) == 2  # reported, not swallowed -- and the third photo still got its turn
 
 
 def test_results_are_applied_a_few_per_turn_of_the_event_loop(page, qtbot, monkeypatch):

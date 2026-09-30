@@ -56,13 +56,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import QColor, QFontMetrics, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import QAbstractItemView, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     Action,
     BodyLabel,
     FluentIcon,
     InfoBar,
+    InfoBarIcon,
     InfoBarPosition,
     PrimaryPushButton,
     ProgressBar,
@@ -107,11 +108,16 @@ FOLDER_UNAVAILABLE_TITLE = "Pasta indisponível"
 FOLDER_UNAVAILABLE_TEXT = (
     "A pasta escolhida para salvar as cópias não está disponível. Escolha outra em Configurações."
 )
+FOLDER_GONE_TEXT = "A pasta foi movida ou apagada."
+CLEANING_BUTTON_TEXT = "Limpando…"
 SHOW_IN_EXPLORER_TEXT = "Mostrar no Explorer"
 CLEAN_AGAIN_TEXT = "Limpar de novo"
 REMOVE_TEXT = "Remover da lista"
+CLOSE_MESSAGE_TOOLTIP = "Fechar"
+CLOSE_MESSAGE_NAME = "Fechar mensagem"
 
 MAX_CONTENT_WIDTH = 960
+MESSAGE_MIN_TEXT_WIDTH = 160  # a message's text never wraps narrower than this
 SIDE_MARGIN = 36
 RESULT_BUDGET_S = 0.008  # how long one turn of the event loop may spend applying results
 LIST_RIGHT_OVERHANG = 9  # the view's QSS right padding (5) + the delegate's card inset (4)
@@ -150,6 +156,68 @@ class _ActionBar(QWidget):
         dark = isDarkTheme()
         painter.fillRect(self.rect(), QColor(255, 255, 255, 8) if dark else QColor(255, 255, 255, 110))
         painter.fillRect(0, 0, self.width(), 1, QColor(255, 255, 255, 21) if dark else QColor(0, 0, 0, 18))
+
+
+def wrap_to_width(text: str, metrics: QFontMetrics, width: int) -> str:
+    """`text` with line breaks so that no line is wider than `width` px (a longer word keeps a line of its own)."""
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for word in paragraph.split(" "):
+            candidate = f"{line} {word}" if line else word
+            if line and metrics.horizontalAdvance(candidate) > width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        lines.append(line)
+    return "\n".join(lines)
+
+
+class _MessageBar(InfoBar):
+    """An inline `InfoBar` whose text wraps to the room it really has.
+
+    QFluentWidgets wraps the text at `(parent width - 50) / 9` characters,
+    whatever else the bar holds: in the smallest window the message after a
+    batch, with its title, its "Abrir pasta" button and its close button,
+    came out wider than the page, and the close button was cut off (at
+    every scale). Here the text wraps, word by word, to the pixels left once
+    the rest of the bar has its room -- measured, not guessed.
+    """
+
+    def _adjustText(self) -> None:
+        host = self.parentWidget()
+        if host is None or not self.content:
+            super()._adjustText()
+            return
+        self.titleLabel.setText(self.title)
+        self.contentLabel.ensurePolished()  # its style sheet font, not the default one
+        self.contentLabel.setText(self.content)  # on one line, to measure what the rest of the bar takes
+        metrics = self.contentLabel.fontMetrics()
+        room = max(MESSAGE_MIN_TEXT_WIDTH, host.width() - (self._needed_width() - self.contentLabel.sizeHint().width()))
+        for _ in range(3):  # a label draws a line a few px wider than its advance: shrink by what is left over
+            self.contentLabel.setText(wrap_to_width(self.content, metrics, room))
+            excess = self._needed_width() - host.width()
+            if excess <= 0 or room <= MESSAGE_MIN_TEXT_WIDTH:
+                break
+            room = max(MESSAGE_MIN_TEXT_WIDTH, room - excess)
+        self.adjustSize()
+
+    def _needed_width(self) -> int:
+        """The width the bar needs for its current texts, in px.
+
+        A label's new text only invalidates the bar's own layout, not the
+        nested ones that hold it: without invalidating those, the size hint
+        would still describe the old text. The widget's hints (not the
+        layout's) include the bar's own frame.
+        """
+        for layout in (self.textLayout, self.widgetLayout, self.hBoxLayout):
+            layout.invalidate()
+        return max(self.sizeHint().width(), self.minimumSizeHint().width())
+
+    def addWidget(self, widget: QWidget, stretch: int = 0) -> None:
+        super().addWidget(widget, stretch)
+        self._adjustText()  # a button takes room from the text
 
 
 @dataclass
@@ -414,19 +482,26 @@ class CleanPage(QWidget):
         if not self._drain_timer.isActive():
             self._drain_timer.start()
 
-    def _drain(self, everything: bool = False) -> None:
+    def _drain(self) -> None:
+        """One turn of the drain timer: apply what the runner reported for `RESULT_BUDGET_S`, then catch up."""
+        try:
+            self._apply_inbox(everything=False)
+        finally:  # even after a handler raised: the rest waits for the next turn, and the page moves on
+            self._next_turn()
+
+    def _apply_inbox(self, everything: bool) -> None:
         """Apply what the runner reported: for `RESULT_BUDGET_S`, or all of it when `everything`."""
         deadline = time.perf_counter() + RESULT_BUDGET_S
-        try:
-            with self._deferring_summary():
-                while self._inbox:
-                    handler, args = self._inbox.popleft()
-                    handler(*args)
-                    if not everything and time.perf_counter() >= deadline:
-                        break
-        finally:
-            if self._inbox:  # the rest next turn: paints, timers and input come first
-                self._drain_timer.start()
+        with self._deferring_summary():
+            while self._inbox:
+                handler, args = self._inbox.popleft()
+                handler(*args)
+                if not everything and time.perf_counter() >= deadline:
+                    break
+
+    def _next_turn(self) -> None:
+        if self._inbox:  # the rest next turn: paints, timers and input come first
+            self._drain_timer.start()
         self._catch_up()
 
     @contextmanager
@@ -574,12 +649,19 @@ class CleanPage(QWidget):
     def cancel(self) -> None:
         """"Cancelar": drop what has not started (it goes back to where it was); the rest finishes.
 
-        The page is up to date when this returns: what the runner dropped
-        (and any result already waiting) is applied at once.
+        Nothing waiting starts afterwards -- not even the files a folder walk
+        already found and the page has not listed yet: they are dropped with
+        the walk. The page is up to date when this returns: what the runner
+        dropped (and any result already waiting) is applied at once, without
+        handing out new work.
         """
-        self._abandon_queues()
-        self.runner.cancel()
-        self._drain(everything=True)
+        self.runner.cancel()  # nothing more starts in the pool; a running walk reports no further batch
+        self._inbox = deque(item for item in self._inbox if item[0] != self._add_files)
+        try:
+            self._apply_inbox(everything=True)
+        finally:
+            self._abandon_queues()
+            self._next_turn()
 
     def busy(self) -> bool:
         """Whether any work (walk, analysis, preview or clean) is queued, running or waiting to be shown."""
@@ -594,7 +676,7 @@ class CleanPage(QWidget):
         if folder is not None and folder.is_dir() and os.access(folder, os.W_OK):
             return True, folder
         self._close_bars()
-        self._post(InfoBar.error, FOLDER_UNAVAILABLE_TITLE, FOLDER_UNAVAILABLE_TEXT)
+        self._post(InfoBarIcon.ERROR, FOLDER_UNAVAILABLE_TITLE, FOLDER_UNAVAILABLE_TEXT)
         return False, folder
 
     def _queue_clean(self, entry_id: int, folder: Path | None) -> None:
@@ -653,21 +735,32 @@ class CleanPage(QWidget):
         batch, self._batch = self._batch, None
         counts = (batch.verified, batch.warnings, batch.failed)
         if any(counts):
-            kind = InfoBar.warning if batch.warnings or batch.failed else InfoBar.success
-            bar = self._post(kind, DONE_TITLE, batch_message(*counts))
+            icon = InfoBarIcon.WARNING if batch.warnings or batch.failed else InfoBarIcon.SUCCESS
+            bar = self._post(icon, DONE_TITLE, batch_message(*counts))
             if batch.verified or batch.warnings:
                 folder = batch.folder or batch.first_copy_folder
                 button = PushButton(FluentIcon.FOLDER, OPEN_FOLDER_TEXT, bar)
-                button.clicked.connect(lambda: shell.open_folder(folder))
+                button.clicked.connect(lambda: self._open_folder(folder))
                 bar.addWidget(button)
         self.batchFinished.emit(counts)
 
-    def _post(self, kind, title: str, content: str) -> InfoBar:
+    def _open_folder(self, folder: Path) -> None:
+        """"Abrir pasta". A folder moved or deleted meanwhile is said so -- never an error inside Qt."""
+        try:
+            shell.open_folder(folder)
+        except OSError:
+            self._close_bars()
+            self._post(InfoBarIcon.ERROR, FOLDER_UNAVAILABLE_TITLE, FOLDER_GONE_TEXT)
+
+    def _post(self, icon: InfoBarIcon, title: str, content: str) -> InfoBar:
         """Show one message about the last batch, inline in the action bar, until closed or replaced."""
-        bar = kind(title, content, orient=Qt.Orientation.Horizontal, isClosable=True, duration=-1,
-                   position=InfoBarPosition.NONE, parent=self._message_host)
+        bar = _MessageBar(icon, title, content, orient=Qt.Orientation.Horizontal, isClosable=True,
+                          duration=-1, position=InfoBarPosition.NONE, parent=self._message_host)
+        bar.closeButton.setToolTip(CLOSE_MESSAGE_TOOLTIP)  # only an icon: it says what it does (spec 6)
+        bar.closeButton.setAccessibleName(CLOSE_MESSAGE_NAME)
         # Left-aligned at its own width: stretched, an InfoBar spreads its title and text apart.
         self._messages.addWidget(bar, 0, Qt.AlignmentFlag.AlignLeft)
+        bar.show()
         self._bars.append(bar)
         return bar
 
@@ -819,7 +912,8 @@ class CleanPage(QWidget):
                 self.progress_label.setText(text.format(done=done, total=total))
 
         summary = self.model.summary()
-        self.clean_button.setText(clean_button_text(summary.cleanable))
+        # While a batch runs the button is off: it says so, instead of a count going down.
+        self.clean_button.setText(CLEANING_BUTTON_TEXT if self._cleaning else clean_button_text(summary.cleanable))
         self.clean_button.setEnabled(summary.cleanable > 0 and not self._cleaning)
         self.clear_button.setEnabled(summary.total > 0 and not self._working())
 

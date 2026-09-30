@@ -14,8 +14,9 @@ import threading
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
-from qfluentwidgets import InfoBar, InfoBarIcon, PushButton
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QWidget
+from qfluentwidgets import FluentIcon, InfoBar, InfoBarIcon, InfoBarPosition, PushButton
 
 import siftool
 from fixtures.make_fixtures import make_jpeg, make_png, make_webp, write
@@ -24,7 +25,8 @@ from siftool.model import Category, Mode, Status
 from siftool_gui import shell
 from siftool_gui.entries import EntryState
 from siftool_gui.model import CATEGORY_ROLE, KIND_ROLE, OUTCOME_ROLE, VALUE_ROLE, RowKind
-from siftool_gui.presentation import Outcome, clean_button_text, done_text
+from siftool_gui.pages.clean_page import _MessageBar
+from siftool_gui.presentation import Outcome, batch_message, clean_button_text, done_text
 from siftool_gui.settings import load_config
 from siftool_gui.window import MainWindow
 from siftool_gui.workers import JobRunner
@@ -359,7 +361,9 @@ def test_close_while_cleaning_leaves_no_partial_files(qtbot, monkeypatch, settle
     assert runner.wait_for_done(0)  # nothing runs any more
     assert _temp_files(photos) == []
     copies = sorted(photos.glob("*_clean*"))
-    assert 1 <= len(copies) < len(sources)
+    # One worker: the copy being written finishes; the one waiting in the pool and the one waiting
+    # in the page's queue are both dropped.
+    assert len(copies) == 1
     for copy in copies:  # whole files, never half-written ones
         assert siftool.verify(copy).status is Status.VERIFIED
     assert all(_sha256(src) == digest for src, digest in before.items())
@@ -570,5 +574,86 @@ def test_cancelling_the_runner_directly_stops_the_page_queue_too(make_page, qtbo
         slow_clean.release.set()
 
     assert blocker.args == [(1, 0, 0)]
-    states = [entry.state.name for entry in _entries(page).values()]
-    assert states == ["VERIFIED", "ANALYZED", "ANALYZED", "ANALYZED"]
+    # Which of the two handed-out copies the pool ran first is up to the pool: count, don't order.
+    states = sorted(entry.state.name for entry in _entries(page).values())
+    assert states == ["ANALYZED", "ANALYZED", "ANALYZED", "VERIFIED"]
+
+
+def test_the_main_button_says_cleaning_while_a_batch_runs(make_page, qtbot, settle, photos, slow_clean):
+    page = make_page(runner=JobRunner(max_workers=1))
+    sources = [write(photos, f"{name}.jpg", make_jpeg()) for name in "abcdef"]
+    _analyze(page, settle, sources)
+    assert page.clean_button.text() == "Limpar 6 fotos"
+
+    page.start_cleaning()
+    qtbot.waitUntil(slow_clean.started.is_set, timeout=TIMEOUT)
+    assert page.progress_label.text() == "Limpando fotos… 0 de 6"
+    # Not a count going down on a disabled button ("Limpar 4 fotos") while nothing is done yet.
+    assert page.clean_button.text() == "Limpando…" and not page.clean_button.isEnabled()
+
+    with qtbot.waitSignal(page.batchFinished, timeout=TIMEOUT):
+        slow_clean.release.set()
+    assert page.clean_button.text() == "Limpar" and not page.clean_button.isEnabled()
+
+
+def test_the_result_message_fits_the_smallest_window(qtbot, settle, photos, tmp_path):
+    # The longest message after a batch, with its "Abrir pasta" button, in a 720 x 560 window: its
+    # text wrapped as if the button were not there, so the bar ran off the column and its close
+    # button was cut off (at 100% and at 200% alike).
+    window = MainWindow(load_config(tmp_path / "cfg.json"))
+    qtbot.addWidget(window)
+    window.resize(720, 560)
+    window.show()
+    qtbot.waitExposed(window)
+    page = window.clean_page
+    sources = [write(photos, "a.jpg", make_jpeg()),
+               write(photos, "reservado.jpg", make_jpeg(reserved_marker=True)),
+               write(photos, "c2pa.jpg", make_jpeg(reserved_marker=True, reserved_payload=b"has c2pa inside"))]
+    _analyze(page, settle, sources)
+    assert _clean(qtbot, page) == (1, 1, 1)
+
+    (message,) = _bars(page)
+    close = message.closeButton
+    qtbot.waitUntil(close.isVisible, timeout=TIMEOUT)
+    qtbot.wait(50)  # let the pending layout run: a bar not laid out yet could look narrow
+    assert message.minimumSizeHint().width() <= message.parentWidget().width()  # it can fit...
+    column_right = page.clean_button.mapTo(window, QPoint(page.clean_button.width(), 0)).x()
+    assert message.mapTo(window, QPoint(message.width(), 0)).x() <= column_right  # ... and it does
+    assert close.mapTo(window, QPoint(close.width(), 0)).x() <= column_right
+    assert message.contentLabel.text().replace("\n", " ") == message.content  # wrapped, not cut
+    # Only an icon: it says what it does (spec 6).
+    assert (close.toolTip(), close.accessibleName()) == ("Fechar", "Fechar mensagem")
+
+
+def test_message_text_wraps_to_the_room_it_has(qtbot):
+    host = QWidget()
+    qtbot.addWidget(host)
+    host.resize(600, 200)
+    bar = _MessageBar(InfoBarIcon.WARNING, "Pronto", "curta", orient=Qt.Orientation.Horizontal, isClosable=True,
+                      duration=-1, position=InfoBarPosition.NONE, parent=host)
+    bar.addWidget(PushButton(FluentIcon.FOLDER, "Abrir pasta", bar))
+
+    for content in ("curta", batch_message(12, 3, 2), " ".join(["palavra"] * 40), "curta de novo"):
+        bar.content = content  # each text measured afresh, never with the last one's sizes
+        bar._adjustText()
+        for layout in (bar.textLayout, bar.widgetLayout, bar.hBoxLayout):
+            layout.invalidate()  # the truth, whatever the bar cached
+        assert bar.minimumSizeHint().width() <= host.width(), content
+        assert bar.contentLabel.text().replace("\n", " ") == content
+
+
+def test_open_folder_that_vanished_says_so(page, qtbot, settle, photos, monkeypatch):
+    def vanished(folder):  # what `os.startfile` does with a folder that is gone
+        raise FileNotFoundError(2, "O sistema não pode encontrar o arquivo especificado", str(folder))
+
+    monkeypatch.setattr(shell, "open_folder", vanished)
+    _analyze(page, settle, [write(photos, "a.jpg", make_jpeg())])
+    assert _clean(qtbot, page) == (1, 0, 0)
+    (open_folder,) = _open_folder_buttons(_bars(page)[0])
+
+    open_folder.click()  # no exception escapes into Qt: the page says what happened, in Portuguese
+
+    qtbot.waitUntil(lambda: len(_bars(page)) == 1, timeout=TIMEOUT)
+    (message,) = _bars(page)
+    assert (message.icon, message.title, message.content) == (
+        InfoBarIcon.ERROR, "Pasta indisponível", "A pasta foi movida ou apagada.")
