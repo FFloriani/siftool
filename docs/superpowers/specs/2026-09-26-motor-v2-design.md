@@ -392,16 +392,37 @@ O selo "Verified Clean" garante exatamente isto:
   (tamanho, contagem, ordem e conteúdo padrão) e rejeita, remove ou rebaixa
   para bloco desconhecido verificado o que foge do padrão; todo bloco não
   ESSENTIAL que resta precisa ter só achados permitidos pelo modo.
+- Metadados mantidos: o que o arquivo pode ter uma vez só é aceito uma vez.
+  Um bloco EXIF por arquivo, com uma entrada por tag, que o `clean` sempre
+  reescreve na forma canônica; um perfil ICC por arquivo, sem bytes fora dos
+  dados das suas tags além do alinhamento de 4 bytes; uma instância de cada
+  chunk PNG que a especificação permite uma vez, na posição legal; um APP0
+  JFIF no JPEG. A repetição ou o chunk fora de posição vira achado ou bloco
+  desconhecido removível: o `clean` remove, e o `verify` de um arquivo que
+  ainda o tenha dá `FAILED`.
 - Assinaturas (passo 4): os valores das estruturas essenciais válidas e os
   dados de imagem comprimidos são verificados só com as assinaturas longas;
   os demais blocos, com todas.
 
-Não é detectado: texto arbitrário escondido nos valores de uma estrutura
-essencial válida (um bit de flag, um valor de quantização, uma tabela não
-usada) ou nos dados de imagem comprimidos que não contenha nenhuma
-assinatura longa, nem esteganografia nos pixels. Ficam para o M2: dados após
-o fim do fluxo zlib do PNG (`unused_data`) e tabelas DHT/DQT do JPEG não
-referenciadas.
+Não é detectado:
+
+- texto sem assinatura longa nos dados essenciais: numa tabela DHT/DQT do
+  JPEG não referenciada, nos valores de uma estrutura essencial válida ou
+  nos dados de imagem comprimidos (por exemplo, após o fim do fluxo zlib do
+  PNG);
+- uma assinatura longa dividida entre vários chunks IDAT após o fim do fluxo
+  zlib do PNG;
+- poucos bytes livres dentro de cada valor válido que o modo mantém (um
+  RATIONAL de 8 bytes, o cabeçalho JFIF, um chunk PNG de tamanho fixo como o
+  `cHRM`, de 32 bytes), agora que nenhum deles pode se repetir;
+- texto dentro das tags de um perfil ICC válido (`desc`, `cprt`...; questão
+  de spec para o M2);
+- num arquivo que o `clean` não gerou, bytes de um bloco EXIF fora das suas
+  entradas (sobra, miniatura do IFD0), que o `clean` nunca mantém;
+- esteganografia nos pixels.
+
+Ficam para o M2: dados após o fim do fluxo zlib do PNG (`unused_data`), que
+fecha os dois casos do PNG, e tabelas DHT/DQT do JPEG não referenciadas.
 
 ## 9. Erros, caminhos e memória
 

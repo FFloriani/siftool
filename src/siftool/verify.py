@@ -21,13 +21,22 @@ Without this helper, either case would be invisible to `inspect`'s report,
 -- a removable-but-unremoved leftover block would otherwise silently pass
 as VERIFIED.
 
-What the seal enforces (spec section 8, "Limites"; ruling R21):
+What the seal enforces (spec section 8, "Limites"; rulings R21, R28):
 
 - Structures. Every handler validates the structures it trusts as
   `ESSENTIAL` and rejects, drops or demotes to a scanned `UNKNOWN` block
   whatever isn't in its standard shape (rulings R14-R20), so each
   remaining non-`ESSENTIAL` block must show only findings the mode
   allows; a block kept with a bad CRC (`Block.corrupt`) is a violation too.
+- Kept metadata. A structure a file may hold once is trusted once: one
+  EXIF block per file, with one entry per tag (rulings R18, R24), and
+  `clean` always rewrites it canonically; one ICC profile per file, whose
+  bytes all lie in its tags' data bar alignment padding (rulings R20,
+  R26); one instance of each PNG chunk the spec allows once, in its legal
+  position, and one JFIF `APP0` (rulings R25, R28). A repeated or
+  misplaced one shows up as an `UNKNOWN` finding (a repeated EXIF tag) or
+  a removable `UNKNOWN` block (the rest): `clean` drops it, and a file
+  that still holds one fails here.
 - Signatures (`scan_signatures`). Every non-`ESSENTIAL` block's bytes, and
   any content a handler reassembled or inflated for it (`Block.logical`),
   are searched for every entry of `SIGNATURES`. `ESSENTIAL` spans --
@@ -35,14 +44,28 @@ What the seal enforces (spec section 8, "Limites"; ruling R21):
   are searched for `LONG_SIGNATURES` only, where a 3- or 4-byte signature
   would match by chance.
 
-Known limit: arbitrary text hidden in the values of a valid essential
-structure (a flag bit, a quantization value, an unused table) or in the
-compressed image data is not detected unless it contains one of the long
-signatures, and pixel-level steganography is not detected at all: the
-"Verified Clean" seal guarantees the absence of non-standard metadata
-structures and of the long signatures, not the absence of every hidden bit
-in the image itself. Follow-ups for M2: data after the end of a PNG's
-zlib stream (`unused_data`) and unreferenced JPEG DHT/DQT tables.
+Known limits -- none of these is detected:
+
+- plain text without a long signature inside essential data: in an
+  unreferenced JPEG DHT/DQT table, in the values of a valid essential
+  structure, or in the compressed image data (e.g. after the end of a
+  PNG's zlib stream);
+- a long signature split across several PNG `IDAT` chunks after the end of
+  the zlib stream (M2 follow-up: detecting that data, `unused_data`, closes
+  both PNG cases);
+- a few free bytes inside each individual valid value a mode keeps -- one
+  RATIONAL (8 bytes), the JFIF header, one fixed-size PNG chunk such as
+  `cHRM` (32 bytes) -- now that no such value can be repeated;
+- text inside the tags of a valid ICC profile (`desc`, `cprt`, ...; a spec
+  question for M2, ruling R20);
+- in a file `clean` did not write, bytes an EXIF block holds outside its
+  entries (slack, an IFD0 preview) -- `clean` never keeps them;
+- pixel-level steganography.
+
+Within those limits, a VERIFIED file holds only structures the handlers
+recognize and have checked as described above, with no finding the mode
+forbids and none of the signatures its region is searched for -- not a
+guarantee that no bit hides in the image.
 """
 
 from __future__ import annotations
