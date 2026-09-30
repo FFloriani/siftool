@@ -1,8 +1,9 @@
 """Command-line interface for siftool: the `scan`, `clean` and `verify` subcommands.
 
-Spec section 10. This module only does argument parsing, input discovery,
-output naming and text/JSON rendering; every cleaning or verification
-decision stays in `siftool.api`. A per-file problem (missing file,
+Spec section 10. This module only does argument parsing and text/JSON
+rendering; input discovery and output naming live in `siftool.batch`
+(shared with the GUI), and every cleaning or verification decision stays
+in `siftool.api`. A per-file problem (missing file,
 unsupported format, failed verification, ...) never aborts the batch and
 never surfaces as a traceback -- it becomes one failed/error entry, and the
 process exit code is the worst outcome seen across the whole batch:
@@ -13,81 +14,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import sys
 from pathlib import Path
 
 import siftool
-from siftool.detect import supported_extensions
+from siftool.batch import SPEC_WALK_EXTENSIONS, iter_inputs, output_path_for, path_key
 from siftool.errors import SiftoolError, VerificationFailedError
 from siftool.model import Finding, Mode, Status
 
-# A previous run's own output: "<stem>_clean<suffix>" or "<stem>_clean (N)<suffix>".
-_CLEAN_SUFFIX_RE = re.compile(r"_clean \(\d+\)$")
-
-# Spec section 10's folder-walk extensions. Formats without a handler yet
-# (HEIC, video) are walked too, so each is reported ("HEIC is not supported
-# yet", exit 2) instead of silently skipped (ruling R22).
-SPEC_WALK_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".mp4", ".mov", ".m4v"})
-
 _EXIT_CODE = {Status.VERIFIED.value: 0, Status.WARNINGS.value: 1, Status.FAILED.value: 2}
-
-
-def iter_inputs(paths: list[str]) -> list[Path]:
-    """Expand `paths` into the sorted list of files a command should process.
-
-    A directory is walked recursively and filtered to spec section 10's
-    extensions (`SPEC_WALK_EXTENSIONS`) plus any extension a registered
-    handler declares (`supported_extensions()`, e.g. `.apng`/`.jfif`/`.jpe`),
-    case-insensitively (ruling R22), skipping any file whose stem is itself
-    a previous run's output (ends in `_clean`, or matches `_clean (N)`). A
-    path that names a file directly is always included, whatever its
-    extension or stem -- explicit means explicit.
-    """
-    extensions = SPEC_WALK_EXTENSIONS | supported_extensions()
-    found: list[Path] = []
-    for raw in paths:
-        path = Path(raw)
-        if path.is_dir():
-            for candidate in path.rglob("*"):
-                if not candidate.is_file() or candidate.suffix.lower() not in extensions:
-                    continue
-                stem = candidate.stem
-                if stem.endswith("_clean") or _CLEAN_SUFFIX_RE.search(stem):
-                    continue
-                found.append(candidate)
-        else:
-            found.append(path)
-    return sorted(found, key=str)
-
-
-def _path_key(path) -> str:
-    """How two output paths are compared: absolute, and case-folded where the OS folds case."""
-    return os.path.normcase(os.path.abspath(path))
-
-
-def output_path_for(
-    src: Path, out_dir: Path | None, overwrite: bool, taken: set[str] | frozenset[str] = frozenset()
-) -> Path:
-    """Return the path `src`'s cleaned copy should be written to.
-
-    `<stem>_clean<suffix>`, beside `src` or inside `out_dir` when given;
-    else `<stem>_clean (2)<suffix>`, then `(3)`, ... The first candidate
-    wins unless it is in `taken` -- the `_path_key` of every output this
-    run has already produced, which is never reused, `overwrite` or not
-    (ruling R22: two sources named alike, e.g. `trip1/IMG_0001.jpg` and
-    `trip2/IMG_0001.jpg` with `--out`, never share an output) -- or it
-    already exists and `overwrite` is False.
-    """
-    directory = out_dir if out_dir is not None else src.parent
-    n = 1
-    while True:
-        name = f"{src.stem}_clean{src.suffix}" if n == 1 else f"{src.stem}_clean ({n}){src.suffix}"
-        candidate = directory / name
-        if _path_key(candidate) not in taken and (overwrite or not candidate.exists()):
-            return candidate
-        n += 1
 
 
 def _error_message(exc: Exception) -> str:
@@ -228,7 +163,7 @@ def _run_clean(paths: list[str], mode: Mode, out_dir: Path | None, overwrite: bo
     for src in iter_inputs(paths):
         record = _clean_one(src, out_dir, overwrite, mode, taken)
         if record["output"] is not None:
-            taken.add(_path_key(record["output"]))
+            taken.add(path_key(record["output"]))
         results.append(record)
         worst = max(worst, _EXIT_CODE[record["status"]])
 

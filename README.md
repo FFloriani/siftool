@@ -136,6 +136,24 @@ python siftool.py
 
 ---
 
+## ✦ Programa novo (prévia)
+
+O Siftool v2 tem um programa novo, em português, sobre o motor novo. Ele ainda é uma prévia: o `siftool.py` antigo continua existindo até a versão final.
+
+Para instalar e abrir (Python 3.11 ou mais novo), na pasta do repositório:
+```bash
+pip install -e ".[gui]"
+siftool-gui
+```
+
+Também dá para abrir com `python -m siftool_gui`, mas **fora da pasta raiz do repositório**: ali o `siftool.py` antigo faz sombra ao pacote novo e o comando abriria a coisa errada.
+
+*   Arraste fotos ou pastas para a janela: a lista mostra o que cada foto esconde antes de limpar.
+*   Escolha o modo (Privacidade, Fotógrafo ou Máximo) e clique em **Limpar**. A cópia limpa fica ao lado do original, com `_clean` no nome, e o original nunca é alterado.
+*   Limpa fotos JPG, PNG e WEBP, 100% offline. HEIC e vídeos aparecem como "Ainda não suportado".
+
+---
+
 ## ✦ Standalone Executable Build (.exe)
 
 You can package Siftool into a standalone directory containing a portable `.exe` binary that does not require Python on the host machine.

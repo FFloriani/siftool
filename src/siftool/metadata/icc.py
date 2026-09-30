@@ -77,14 +77,22 @@ def icc_profile_valid(profile: bytes) -> bool:
     Its header's own size field (bytes 0-3, big-endian) equals
     `len(profile)`, `acsp` sits at offset 36, the header's reserved bytes
     100-127 are all zero (ICC.1), and the tag table at offset 128 -- a
-    4-byte tag count, at least 1, then 12 bytes per tag (signature,
-    offset, size) -- as well as every tag's data (`offset + size`) lies
-    within the profile. Every byte from the end of the tag table to the
-    end of the profile must lie in some tag's data -- tags may share or
-    nest data ranges -- except gaps of at most `_MAX_PADDING` bytes
-    (4-byte alignment padding) between ranges and at the end: nothing may
-    ride along outside the tags. Tag contents are not interpreted. Never
-    raises.
+    4-byte tag count, from 1 to `_MAX_TAGS` (checked, and every entry
+    skipped, before any entry is read: a declared count in the millions
+    costs nothing but this comparison), then 12 bytes per tag (signature,
+    offset, size) -- fits in the profile. Every tag's data starts at or
+    after the end of the tag table (`offset >= table_end`: a tag cannot
+    claim bytes that belong to the header or the table itself as its own
+    data), is at least 8 bytes (a type signature plus its mandatory
+    reserved field, ICC.1 -- anything shorter cannot be a real tag), and
+    lies within the profile (`offset + size <= len(profile)`). Every byte
+    from the end of the tag table to the end of the profile must lie in
+    some tag's data -- tags may share or nest data ranges -- except gaps
+    of at most `_MAX_PADDING` bytes (4-byte alignment padding) between
+    ranges and at the end: nothing may ride along outside the tags. Tag
+    contents (including a private tag's) are not interpreted, so a valid
+    profile may still carry arbitrary bytes inside one tag's own data
+    (open question for M2). Never raises.
     """
     n = len(profile)
     entries_start = _TAG_TABLE_OFFSET + 4
@@ -93,16 +101,17 @@ def icc_profile_valid(profile: bytes) -> bool:
     if any(profile[_RESERVED_START:_TAG_TABLE_OFFSET]):
         return False
     count = int.from_bytes(profile[_TAG_TABLE_OFFSET:entries_start], "big")
+    if count < 1 or count > _MAX_TAGS:
+        return False
     table_end = entries_start + 12 * count
-    if count < 1 or table_end > n:
+    if table_end > n:
         return False
     ranges: list[tuple[int, int]] = []
     for i in range(count):
         offset, size = struct.unpack_from(">II", profile, entries_start + 12 * i + 4)
-        if offset + size > n:
+        if size < 8 or offset < table_end or offset + size > n:
             return False
-        if size:
-            ranges.append((offset, offset + size))
+        ranges.append((offset, offset + size))
     covered = table_end  # everything before it is the header and the tag table
     for start, end in sorted(ranges):
         if start - covered > _MAX_PADDING:
