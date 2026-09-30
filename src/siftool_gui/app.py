@@ -21,13 +21,16 @@ if TYPE_CHECKING:
 def create_window(config_path: Path | None = None) -> "MainWindow":
     """Build a `MainWindow`, without starting the Qt event loop.
 
-    Testable without `QApplication.exec()`. `config_path` is accepted
-    from this task onward for a stable signature; only from Task 6
-    onward (once `siftool_gui.settings` exists) does it actually load
-    the persistent configuration from that path.
+    Testable without `QApplication.exec()`. Loads the persistent
+    configuration from `config_path` (default location when `None`,
+    see `siftool_gui.settings.default_config_path`) and binds it as the
+    global `qconfig`, before the window (and the QFluentWidgets
+    components it builds) can read the theme from it.
     """
+    from siftool_gui.settings import load_config
     from siftool_gui.window import MainWindow
 
+    load_config(config_path)
     return MainWindow()
 
 
