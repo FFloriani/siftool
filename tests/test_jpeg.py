@@ -4,7 +4,9 @@ from siftool.model import Category as C, Finding, Kind, Mode, Status
 from siftool.planner import plan_container
 from siftool.formats.jpeg import JpegHandler
 from siftool.errors import CorruptFileError, VerificationFailedError
-from fixtures.make_fixtures import make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER, make_c2pa_payload, make_icc
+from fixtures.make_fixtures import (
+    make_jpeg, base_jpeg, decode_pixels, MOTION_PHOTO_TRAILER, make_c2pa_payload, make_icc, tiff_header, tiff_ifd,
+)
 import io
 import struct
 import warnings
@@ -325,7 +327,6 @@ INVALID_ICC = {
     "missing-seq": _icc_chunks(_thirds(PROFILE), seqs=[1, 2, 4], count=3),
     "count-mismatch": _icc_chunks(_thirds(PROFILE), count=4),
     "inconsistent-count": _icc_chunks(_thirds(PROFILE))[:2] + _icc_chunks([_thirds(PROFILE)[2]], seqs=[3], count=5),
-    "two-profiles": _icc_chunks([PROFILE]) + _icc_chunks([PROFILE]),
     "seq-zero": _icc_chunks([PROFILE], seqs=[0], count=0),
     "no-seq-bytes": [_segment(0xE2, b"ICC_PROFILE\x00\x01")],
     "not-a-profile": _icc_chunks([b"G", b"PS +23.55", b"05-046.6333 owner=Felipe"]),
@@ -352,3 +353,74 @@ def test_every_jpeg_finding_says_where_it_is():  # review M2
             assert finding.where.startswith(expected) if block.tag in readers else finding.where == expected, finding
             seen.add(block.tag)
     assert {"COM", "TRAILING", "APP2:ICC", "APP0:JFIF", "APP0:JFXX", "APP2:MPF", "APP12", "RESERVED:0xF0"} <= seen
+
+# ---------------------------------------------------------------------------
+# Residual round. Ruling R26 (I1): one ICC profile per file -- the first
+# complete (seq 1..count), valid profile's ICC_PROFILE chunks are kept and
+# every other ICC_PROFILE chunk is dropped. Ruling R25: only the first JFIF
+# APP0 is kept. Ruling R24: only the first APP1 Exif is the EXIF block.
+# ---------------------------------------------------------------------------
+
+OTHER_PROFILE = make_icc("Felipe Floriani", 4)  # a second, equally valid profile
+
+def _with_segments(*segments):
+    base = base_jpeg()
+    return base[:2] + b"".join(segments) + base[2:]
+
+def _halves(data):
+    return [data[: len(data) // 2], data[len(data) // 2 :]]
+
+PROFILE_BLOCK = (Kind.METADATA, "ICC color profile")
+CONTINUED_BLOCK = (Kind.METADATA, "ICC color profile (continued)")
+EXTRA_BLOCK = (Kind.UNKNOWN, "Extra ICC profile")
+
+KEEPS_FIRST_PROFILE = {  # case -> (ICC chunks in file order, indices of the chunks kept, APP2:ICC blocks)
+    "two-profiles": (_icc_chunks([PROFILE]) + _icc_chunks([OTHER_PROFILE]), [0], [PROFILE_BLOCK, EXTRA_BLOCK]),
+    "invalid-then-valid": (_icc_chunks([b"owner=Felipe Floriani"]) + _icc_chunks(_thirds(PROFILE)), [1, 2, 3],
+                           [EXTRA_BLOCK, PROFILE_BLOCK]),
+    "interleaved": ([c for pair in zip(_icc_chunks(_halves(PROFILE)), _icc_chunks(_halves(OTHER_PROFILE))) for c in pair],
+                    [0, 2], [PROFILE_BLOCK, EXTRA_BLOCK, CONTINUED_BLOCK, EXTRA_BLOCK]),
+    "stray-chunk-after": (_icc_chunks(_thirds(PROFILE)) + _icc_chunks([b"stray"], count=2), [0, 1, 2],
+                          [PROFILE_BLOCK, EXTRA_BLOCK]),
+}
+
+@pytest.mark.parametrize("case", sorted(KEEPS_FIRST_PROFILE))
+def test_only_the_first_complete_valid_icc_profile_is_kept(case):
+    chunks, kept, layout = KEEPS_FIRST_PROFILE[case]
+    data = _with_segments(*chunks)
+    blocks = by_tag(H.parse(data), "APP2:ICC")
+    assert [(b.kind, b.label) for b in blocks] == layout
+    [profile_block] = [b for b in blocks if b.label == PROFILE_BLOCK[1]]
+    assert profile_block.logical == PROFILE
+    assert profile_block.findings == [Finding(C.APPEARANCE, "ICC profile", "Display P3", "APP2:ICC", len(PROFILE))]
+    assert all((b.removable, [f.label for f in b.findings]) == (True, ["Extra ICC profile"])
+               for b in blocks if b.kind is Kind.UNKNOWN)
+    out = clean_bytes(data)
+    assert out == _with_segments(*(chunks[i] for i in kept))
+    assert clean_bytes(out) == out
+
+@pytest.mark.parametrize("payload", [b"JFIF\x00owner=Fel", b"JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x02\x01" + bytes(6)],
+                         ids=["plain", "with-thumbnail"])
+def test_only_the_first_jfif_segment_is_kept(payload):
+    base = base_jpeg()
+    app0_end = 4 + int.from_bytes(base[4:6], "big")  # right after Pillow's own JFIF APP0
+    data = base[:app0_end] + _segment(0xE0, payload) + base[app0_end:]
+    first, extra = by_tag(H.parse(data), "APP0:JFIF")
+    assert (first.kind, [f.category for f in first.findings]) == (Kind.METADATA, [C.APPEARANCE])
+    label = "Extra JFIF segment"
+    assert (extra.kind, extra.removable, extra.label, extra.findings) == (
+        Kind.UNKNOWN, True, label, [Finding(C.UNKNOWN, label, None, "APP0:JFIF", len(payload))])
+    assert clean_bytes(data, Mode.PRIVACY) == base
+
+def test_only_the_first_app1_exif_is_the_exif_block():
+    tiffs = [tiff_header() + tiff_ifd([(0x0112, 3, 1, struct.pack(">HH", v, 0))]) for v in (6, 3)]
+    segments = [_segment(0xE1, b"Exif\x00\x00" + t) for t in tiffs]
+    data = _with_segments(*segments)
+    first, extra = by_tag(H.parse(data), "APP1:Exif")
+    assert (first.kind, first.rewritable, [f.detail for f in first.findings]) == (Kind.METADATA, True, ["6"])
+    label = "Extra EXIF block"
+    assert (extra.kind, extra.removable, extra.label, extra.findings) == (
+        Kind.UNKNOWN, True, label, [Finding(C.UNKNOWN, label, None, "APP1:Exif", 6 + len(tiffs[1]))])
+    assert clean_bytes(data, Mode.PRIVACY) == _with_segments(segments[0])
+    base = base_jpeg()
+    assert clean_bytes(data, Mode.MAXIMUM) == base[:2] + base[4 + int.from_bytes(base[4:6], "big"):]  # its JFIF goes too

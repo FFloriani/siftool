@@ -48,12 +48,16 @@ enough" (rulings R15 and R19):
   `f"{NAME}?"` (e.g. `"DQT?"`), so it's kept but fully signature-scanned
   instead of trusted.
 
-`ICC_PROFILE` APP2 chunks are reassembled across the whole file by their
-seq/count bytes and kept as `appearance` only when every chunk 1..count is
-present exactly once and the joined profile is structurally valid
-(`_reassemble_icc`, ruling R20); the reassembled profile is exposed as the
-first ICC block's `logical`, which `verify` scans too. Otherwise every ICC
-chunk is a removable `UNKNOWN` block ("Invalid ICC profile"), dropped.
+A file keeps at most one ICC profile (rulings R20, R26): its `ICC_PROFILE`
+APP2 chunks are gathered across the whole file by their seq/count bytes,
+and the first profile whose chunks 1..count are all present and whose
+joined bytes are a structurally valid profile is kept as `appearance`
+(`_select_icc_profile`), exposed as the first ICC block's `logical`, which
+`verify` scans too. Every other ICC chunk is a removable `UNKNOWN` block,
+dropped: "Extra ICC profile" beside a kept profile, "Invalid ICC profile"
+when no valid profile completes. Likewise only the first JFIF `APP0` and
+the first `APP1` Exif are classified as such; any later one is dropped as
+"Extra JFIF segment" (ruling R25) or "Extra EXIF block" (ruling R24).
 
 Fill bytes (extra `0xFF` before a marker) are tolerated on read and kept
 inside a block's span -- the following segment's, or, after a scan, the
@@ -256,18 +260,24 @@ def _frame_code(segments: list[tuple[Span, int, bytes]]) -> int:
 def _classify_segments(segments: list[tuple[Span, int, bytes]], arithmetic: bool) -> list[Block]:
     """Convert raw segments into `Block`s, merging runs of adjacent ICC chunks.
 
-    Keeps the three pieces of cross-segment state `_classify`/`_classify_app`
+    Keeps the pieces of cross-segment state `_classify`/`_classify_app`
     (otherwise stateless per segment) can't: only the FIRST Adobe-signature
     `APP14` can become the `ESSENTIAL` `"APP14:Adobe"` (ruling R15 -- a
     repeat, even at the same legal 12-byte size, is not trusted); `DAC` is
     classified against the whole file's frame type (`arithmetic`, ruling
-    R19); and the ICC profile is reassembled from every `ICC_PROFILE`
-    chunk in the file before any of them is classified (ruling R20).
+    R19); only the FIRST JFIF `APP0` and the FIRST `APP1` Exif are
+    classified as such, and every later one is a removable `UNKNOWN` block
+    with a finding naming it (`_extra`: "Extra JFIF segment", rulings R25;
+    "Extra EXIF block", R24); and the file's one ICC profile is chosen from
+    every `ICC_PROFILE` chunk in the file before any of them is classified
+    (`_select_icc_profile`, rulings R20, R26).
     """
-    icc_profile = _reassemble_icc(segments)
+    icc_profile, icc_chunks = _select_icc_profile(segments)
     blocks: list[Block] = []
     seen_standard_adobe = False
-    seen_icc = False
+    seen_icc_profile = False
+    seen_jfif = False
+    seen_exif = False
     i = 0
     while i < len(segments):
         span, code, payload = segments[i]
@@ -281,9 +291,19 @@ def _classify_segments(segments: list[tuple[Span, int, bytes]], arithmetic: bool
             blocks.append(Block(Kind.ESSENTIAL, span, f"Restart marker {code - _RST_LO}", "RST"))
             i += 1
         elif code == 0xE2 and payload.startswith(_ICC_SIG):
-            block, i = _classify_icc_run(segments, i, icc_profile, first=not seen_icc)
-            seen_icc = True
+            block, i = _classify_icc_run(segments, i, icc_profile, icc_chunks, first=not seen_icc_profile)
+            seen_icc_profile = seen_icc_profile or block.kind is Kind.METADATA
             blocks.append(block)
+        elif code == 0xE0 and payload.startswith(_JFIF_SIG):
+            blocks.append(_extra(span, "APP0:JFIF", "Extra JFIF segment", payload) if seen_jfif
+                          else _classify_jfif(span, payload))
+            seen_jfif = True
+            i += 1
+        elif code == 0xE1 and payload.startswith(_EXIF_SIG):
+            blocks.append(_extra(span, "APP1:Exif", "Extra EXIF block", payload) if seen_exif
+                          else _classify_exif(span, payload))
+            seen_exif = True
+            i += 1
         elif code == 0xEE and payload.startswith(_ADOBE_SIG):
             block = _classify_adobe(span, payload, seen_standard_adobe)
             seen_standard_adobe = seen_standard_adobe or block.kind is Kind.ESSENTIAL
@@ -450,20 +470,17 @@ def _classify_app(code: int, span: Span, payload: bytes) -> Block:
     Any APPn whose payload doesn't match a known signature (including
     every APP3-APP10, and an APP14 that doesn't start with `b"Adobe"`)
     falls back to an `UNKNOWN`, removable block tagged `f"APP{n}"` --
-    table 7.1's "Demais APPn -> unknown removivel". An Adobe-signature
-    APP14 never reaches here: `_classify_segments` intercepts it directly,
-    since classifying it needs cross-segment state (`_classify_adobe`).
+    table 7.1's "Demais APPn -> unknown removivel". A JFIF `APP0`, an
+    `APP1` Exif, an `ICC_PROFILE` `APP2` and an Adobe-signature `APP14`
+    never reach here: `_classify_segments` intercepts them directly, since
+    classifying each needs cross-segment state.
     """
     n = code - 0xE0
-    if code == 0xE0 and payload.startswith(_JFIF_SIG):
-        return _classify_jfif(span, payload)
     if code == 0xE0 and payload.startswith(_JFXX_SIG):
         return Block(
             Kind.METADATA, span, "JFIF extension thumbnail", "APP0:JFXX",
             findings=[Finding(Category.EXTRAS, "JFXX thumbnail", None, "APP0:JFXX", len(payload))],
         )
-    if code == 0xE1 and payload.startswith(_EXIF_SIG):
-        return _classify_exif(span, payload)
     if code == 0xE1 and payload.startswith(_XMP_SIG):
         packet = payload[len(_XMP_SIG) :]
         return Block(
@@ -542,51 +559,77 @@ def _classify_exif(span: Span, payload: bytes) -> Block:
     return Block(Kind.METADATA, span, "EXIF data", "APP1:Exif", findings=findings, rewritable=True, raw=tiff)
 
 
-def _reassemble_icc(segments: list[tuple[Span, int, bytes]]) -> bytes | None:
-    """The file's ICC profile, reassembled from every `ICC_PROFILE` APP2 chunk, or None.
+def _extra(span: Span, tag: str, label: str, payload: bytes) -> Block:
+    """A segment a file may hold only once, after its first: a removable `UNKNOWN` block (rulings R24, R25).
 
-    Each chunk's payload is the 12-byte signature, a 1-byte seq, a 1-byte
-    count, then its slice of the profile. As libjpeg's own reader does,
-    the chunks may sit anywhere in the file and in any order, but every
-    seq from 1 to count must appear exactly once, with the same count in
-    every chunk; the slices joined in seq order must then be a
-    structurally valid profile (`icc_profile_valid`, ruling R20). None
-    means the file has no valid ICC profile (or no ICC chunk at all).
+    It keeps its tag and gets one finding naming it, so reports show it,
+    and it is dropped in every mode.
     """
-    chunks = [payload for _, code, payload in segments if code == 0xE2 and payload.startswith(_ICC_SIG)]
-    if not chunks or any(len(chunk) < _ICC_HEADER_LEN for chunk in chunks):
-        return None
-    count = chunks[0][_ICC_HEADER_LEN - 1]
-    by_seq = {chunk[_ICC_HEADER_LEN - 2]: chunk[_ICC_HEADER_LEN:] for chunk in chunks}
-    if any(chunk[_ICC_HEADER_LEN - 1] != count for chunk in chunks) or len(chunks) != count:
-        return None
-    if sorted(by_seq) != list(range(1, count + 1)):
-        return None
-    profile = b"".join(by_seq[seq] for seq in range(1, count + 1))
-    return profile if icc_profile_valid(profile) else None
+    return Block(
+        Kind.UNKNOWN, span, label, tag, findings=[Finding(Category.UNKNOWN, label, None, tag, len(payload))],
+        removable=True,
+    )
+
+
+def _select_icc_profile(segments: list[tuple[Span, int, bytes]]) -> tuple[bytes | None, frozenset[int]]:
+    """The file's one ICC profile and the indices (into `segments`) of the chunks carrying it (ruling R26).
+
+    Each `ICC_PROFILE` APP2 payload is the 12-byte signature, a 1-byte seq,
+    a 1-byte count, then its slice of the profile. As libjpeg's own reader
+    allows, a profile's chunks may sit anywhere in the file and in any
+    order. Chunks are taken in file order: a chunk with 1 <= seq <= count
+    joins the open profile of its count, unless that seq is already filled
+    (a chunk without seq/count bytes or with a seq outside 1..count joins
+    nothing); once seq 1..count are all filled, the slices joined in seq
+    order must be a structurally valid profile (`icc_profile_valid`,
+    ruling R20). The first profile completed that way which is valid is
+    the file's profile; a complete but invalid one is discarded. Every
+    other `ICC_PROFILE` chunk -- another profile, a repeat, a stray -- is
+    not part of it. `(None, frozenset())` when no valid profile completes.
+    """
+    open_by_count: dict[int, dict[int, int]] = {}  # count -> {seq: segment index}
+    for index, (_, code, payload) in enumerate(segments):
+        if code != 0xE2 or not payload.startswith(_ICC_SIG) or len(payload) < _ICC_HEADER_LEN:
+            continue
+        seq, count = payload[_ICC_HEADER_LEN - 2], payload[_ICC_HEADER_LEN - 1]
+        if not 1 <= seq <= count:
+            continue
+        chunks = open_by_count.setdefault(count, {})
+        if seq in chunks:
+            continue
+        chunks[seq] = index
+        if len(chunks) == count:
+            del open_by_count[count]
+            profile = b"".join(segments[chunks[s]][2][_ICC_HEADER_LEN:] for s in range(1, count + 1))
+            if icc_profile_valid(profile):
+                return profile, frozenset(chunks.values())
+    return None, frozenset()
 
 
 def _classify_icc_run(
-    segments: list[tuple[Span, int, bytes]], i: int, profile: bytes | None, first: bool
+    segments: list[tuple[Span, int, bytes]], i: int, profile: bytes | None, carriers: frozenset[int], first: bool
 ) -> tuple[Block, int]:
-    """One Block for the run of adjacent `ICC_PROFILE` APP2 chunks starting at `i`.
+    """One Block for the run of adjacent `ICC_PROFILE` APP2 chunks starting at `i`
+    that all do, or all don't, carry the file's profile (`carriers`, from
+    `_select_icc_profile`).
 
     Real encoders write a large profile as back-to-back APP2 chunks (spec
     7.1: "inclusive multissegmento"), so a run is normally the whole
-    profile. `profile` is the file-wide reassembly (`_reassemble_icc`):
-    when it is valid, the file's `first` run carries the profile's
-    `appearance` finding and exposes the whole profile as `logical`; a
-    later run -- chunks apart in the file -- carries "ICC profile
-    (continued)". When it is None, every run is a removable `UNKNOWN`
-    "Invalid ICC profile" block, so the broken profile is dropped.
-    Returns `(block, index after the run)`.
+    profile. A run carrying it is `appearance`: the file's `first` such run
+    carries the "ICC profile" finding and exposes the whole profile as
+    `logical`; a later one -- chunks apart in the file -- carries "ICC
+    profile (continued)". Any other run is a removable `UNKNOWN` block,
+    dropped: "Extra ICC profile" (with a finding) when the file has a
+    profile -- at most one is kept (ruling R26) -- else "Invalid ICC
+    profile", the broken profile. Returns `(block, index after the run)`.
     """
+    carries = i in carriers
     first_span = last_span = segments[i][0]
     data_size = 0
     j = i
     while j < len(segments):
         span, code, payload = segments[j]
-        if code != 0xE2 or not payload.startswith(_ICC_SIG):
+        if code != 0xE2 or not payload.startswith(_ICC_SIG) or (j in carriers) != carries:
             break
         data_size += max(len(payload) - _ICC_HEADER_LEN, 0)
         last_span = span
@@ -595,6 +638,10 @@ def _classify_icc_run(
 
     if profile is None:
         return Block(Kind.UNKNOWN, span, "Invalid ICC profile", "APP2:ICC", removable=True), j
+    if not carries:
+        label = "Extra ICC profile"
+        finding = Finding(Category.UNKNOWN, label, None, "APP2:ICC", data_size)
+        return Block(Kind.UNKNOWN, span, label, "APP2:ICC", findings=[finding], removable=True), j
     if first:
         finding = Finding(Category.APPEARANCE, "ICC profile", icc_description(profile), "APP2:ICC", len(profile))
         return Block(Kind.METADATA, span, "ICC color profile", "APP2:ICC", findings=[finding], logical=profile), j

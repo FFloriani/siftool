@@ -660,3 +660,30 @@ def test_appearance_chunk_after_idat_is_dropped(tmp_path):  # rr_attack2
     res, out = _clean(tmp_path, _bare_png_after_idat(png_chunk(b"cHRM", QUIET_SECRET[:32])), ".png", Mode.PRIVACY)
     assert res.verdict.status is Status.VERIFIED and out == make_png(**_BARE_PNG)
     assert res.removed == [Finding(C.UNKNOWN, "Misplaced or repeated cHRM", None, "cHRM", 32)]
+
+
+# ---------------------------------------------------------------------------
+# JPEG: only the first JFIF APP0 (R25), the first APP1 Exif (R24) and the
+# first complete, valid ICC profile (R26) are kept.
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_jfif_segments_keep_only_the_first(tmp_path):  # rr_attack J1
+    jfifs = [_segment(0xE0, b"JFIF\x00" + piece) for piece in _pieces(QUIET_SECRET, 9)]
+    base = base_jpeg()
+    app0_end = 4 + int.from_bytes(base[4:6], "big")  # Pillow's own JFIF APP0 comes seventh here
+    res, out = _clean(tmp_path, base[:2] + b"".join(jfifs) + base[2:], ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == base[:2] + jfifs[0] + base[app0_end:]
+
+
+def test_second_jpeg_exif_segment_is_dropped(tmp_path):
+    first, second = (_segment(0xE1, b"Exif\x00\x00" + _single_tag_tiff(v)) for v in (QUIET_SECRET[:8], QUIET_SECRET[8:16]))
+    res, out = _clean(tmp_path, _jpeg_after_soi(first + second), ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == _jpeg_after_soi(first)
+
+
+def test_second_jpeg_icc_profile_is_dropped(tmp_path):
+    first = _segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + _icc_desc("Display P3"))
+    second = _segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + _icc_desc("owner=Felipe Floriani"))
+    res, out = _clean(tmp_path, _jpeg_after_soi(first + second), ".jpg", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == _jpeg_after_soi(first)
