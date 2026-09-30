@@ -4,28 +4,31 @@ One top-level `FILE` row per `FileEntry`. Its children are rebuilt from
 the entry every time the entry's state changes:
 
 - with a report that has findings: one `CATEGORY` row per category (in
-  `CATEGORY_ORDER`), then the result's `NOTE` rows when there is a result
-  or a clean failure (the explanation, then one row per note or
-  violation), then a `TECH_HEADER` ("Detalhes técnicos") whose `TECH`
-  children are the findings as the engine reported them -- plus, for a
-  failed verification, its violations;
+  `CATEGORY_ORDER`), then a `TECH_HEADER` ("Detalhes técnicos") whose
+  `TECH` children are the findings as the engine reported them -- plus,
+  once cleaned, the engine's notes and, for a failed verification, its
+  violations and notes (one row each, on one line);
 - with a report and no findings: a `NOTE` "Nada escondido nesta foto."
-  (followed by the result's notes, once cleaned);
+  instead of the category rows;
+- after a clean, the result's `NOTE` rows, in Portuguese only (spec 3,
+  criterion 4): "Não limpou" and "Com ressalvas" put them *first*, right
+  under the file, so the reason shows without scrolling (ruling P11(b));
+  "Verificado" puts "Cópia salva em ..." after the categories;
 - `UNSUPPORTED` / `ERROR`: a `NOTE` with the error's explanation.
 
 Roles (`Qt.UserRole + 1..8`), by row kind:
 
 | role | FILE | CATEGORY | NOTE | TECH_HEADER | TECH |
 |---|---|---|---|---|---|
-| `DisplayRole` | file name | category name | text | "Detalhes técnicos" | finding label |
-| `ToolTipRole` | full path | "name: value" | text | -- | label — detail — where |
+| `DisplayRole` | file name | category name | text | "Detalhes técnicos" | finding label (or note) |
+| `ToolTipRole` | full path | "name: value" | text | -- | label — detail — where (or note) |
 | `KIND_ROLE` | `RowKind` of the row (every row) |||||
 | `ENTRY_ID_ROLE` | the owning entry's id (every row) |||||
 | `STATE_ROLE` | `EntryState` | | | | |
 | `VALUE_ROLE` | status text ("" when the tags say it all) | human value | | | finding detail |
 | `CATEGORY_ROLE` | tuple of `Category` (tags) | `Category` value | | | |
 | `OUTCOME_ROLE` | | `Outcome` value | | | |
-| `FINDING_ROLE` | | | | | `Finding` |
+| `FINDING_ROLE` | | | | | `Finding` (None for a note) |
 | `THUMBNAIL_ROLE` | `QPixmap` or None | | | | |
 
 Every row also has an `AccessibleTextRole`; the file row's is
@@ -58,7 +61,6 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Callable, Iterable
-from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -170,28 +172,24 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
-def _single_line_finding(finding: Finding) -> Finding:
-    detail = _one_line(finding.detail) if finding.detail else finding.detail
-    return replace(finding, label=_one_line(finding.label), detail=detail)
-
-
 def _result_lines(result: CleanResult) -> list[str]:
-    tidy = replace(
-        result,
-        notes=[_one_line(note) for note in result.notes],
-        verdict=replace(result.verdict, notes=[_one_line(note) for note in result.verdict.notes]),
-    )
-    return result_explanation(tidy, Path(result.dst).parent).split("\n")
+    return [_one_line(line) for line in result_explanation(result, Path(result.dst).parent).split("\n")]
 
 
 def _error_lines(exc: BaseException) -> list[str]:
-    if isinstance(exc, VerificationFailedError):
-        verdict = exc.verdict
-        exc = VerificationFailedError(
-            replace(verdict, violations=[_single_line_finding(f) for f in verdict.violations])
-        )
-        return error_explanation(exc).split("\n")
-    return [_one_line(error_explanation(exc))]
+    """The Portuguese rows for `exc`: one per line of a failed verification, else one (spec 5.5)."""
+    text = error_explanation(exc)
+    lines = text.split("\n") if isinstance(exc, VerificationFailedError) else [text]
+    return [_one_line(line) for line in lines]
+
+
+def _engine_notes(*note_lists: list[str]) -> list[str]:
+    """The engine's notes, each once, in order, on one line: for "Detalhes técnicos" only."""
+    notes: list[str] = []
+    for note in (_one_line(note) for note_list in note_lists for note in note_list):
+        if note and note not in notes:
+            notes.append(note)
+    return notes
 
 
 def _summary_key(entry: FileEntry) -> tuple[EntryState, bool]:
@@ -440,7 +438,17 @@ class FileListModel(QStandardItemModel):
                 return []
             return [self._note(entry_id, line) for line in _error_lines(entry.error)]
 
+        result, error = entry.result, entry.error
+        saved = entry.state in (EntryState.VERIFIED, EntryState.WARNINGS) and result is not None
+        failed = entry.state is EntryState.FAILED and error is not None
+
         rows: list[QStandardItem] = []
+        # "Não limpou" / "Com ressalvas": the reason first, visible as soon as the row opens (P11(b)).
+        if failed:
+            rows.extend(self._note(entry_id, line) for line in _error_lines(error))
+        elif saved and entry.state is EntryState.WARNINGS:
+            rows.extend(self._note(entry_id, line) for line in _result_lines(result))
+
         categories = entry.categories
         for category in categories:
             item = self._child(RowKind.CATEGORY, entry_id, category_name(category))
@@ -449,17 +457,22 @@ class FileListModel(QStandardItemModel):
         if not categories:
             rows.append(self._note(entry_id, NO_FINDINGS_TEXT))
 
-        if entry.state in (EntryState.VERIFIED, EntryState.WARNINGS) and entry.result is not None:
-            rows.extend(self._note(entry_id, line) for line in _result_lines(entry.result))
-        elif entry.state is EntryState.FAILED and entry.error is not None:
-            rows.extend(self._note(entry_id, line) for line in _error_lines(entry.error))
+        if saved and entry.state is EntryState.VERIFIED:  # where the copy went
+            rows.extend(self._note(entry_id, line) for line in _result_lines(result))
 
-        technical = list(report.findings)
-        if entry.state is EntryState.FAILED and isinstance(entry.error, VerificationFailedError):
-            technical.extend(entry.error.verdict.violations)
+        # The engine's own words, only here (spec 3, criterion 4).
+        technical = [self._tech(entry_id, finding) for finding in report.findings]
+        if saved:
+            notes = _engine_notes(result.notes, result.verdict.notes)
+        elif failed and isinstance(error, VerificationFailedError):
+            technical.extend(self._tech(entry_id, finding) for finding in error.verdict.violations)
+            notes = _engine_notes(error.verdict.notes)
+        else:
+            notes = []
+        technical.extend(self._tech_note(entry_id, note) for note in notes)
         if technical:
             header = self._child(RowKind.TECH_HEADER, entry_id, TECH_HEADER_TEXT)
-            header.appendRows([self._tech(entry_id, finding) for finding in technical])
+            header.appendRows(technical)
             rows.append(header)
         return rows
 
@@ -497,4 +510,10 @@ class FileListModel(QStandardItemModel):
         item.setData(finding, FINDING_ROLE)
         item.setData(text, _TOOLTIP)
         item.setData(text, _ACCESSIBLE)
+        return item
+
+    def _tech_note(self, entry_id: int, note: str) -> QStandardItem:
+        """A `TECH` row holding one of the engine's notes (no `Finding`), already on one line."""
+        item = self._child(RowKind.TECH, entry_id, note)
+        item.setData(note, _TOOLTIP)
         return item

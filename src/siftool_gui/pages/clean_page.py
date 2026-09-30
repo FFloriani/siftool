@@ -85,10 +85,8 @@ from siftool_gui.entries import EntryState, FileEntry
 from siftool_gui.file_view import FileTreeView
 from siftool_gui.model import THUMBNAIL_ROLE, FileListModel, Summary
 from siftool_gui.presentation import (
+    batch_message,
     clean_button_text,
-    done_text,
-    failed_hint,
-    failed_title,
     mode_description,
     mode_title,
     summary_text,
@@ -646,16 +644,22 @@ class CleanPage(QWidget):
             self._job_came_back()
 
     def _finish_batch(self) -> None:
+        """One message about the batch (ruling P13), then `batchFinished`.
+
+        Success style when every copy is verified; warning style as soon as
+        one has reservations or failed, the text then saying where to look.
+        "Abrir pasta" whenever at least one copy was saved.
+        """
         batch, self._batch = self._batch, None
         counts = (batch.verified, batch.warnings, batch.failed)
-        if batch.verified or batch.warnings:
-            folder = batch.folder or batch.first_copy_folder
-            bar = self._post(InfoBar.success, DONE_TITLE, done_text(*counts))
-            button = PushButton(FluentIcon.FOLDER, OPEN_FOLDER_TEXT, bar)
-            button.clicked.connect(lambda: shell.open_folder(folder))
-            bar.addWidget(button)
-        if batch.failed:
-            self._post(InfoBar.warning, failed_title(batch.failed), failed_hint(batch.failed))
+        if any(counts):
+            kind = InfoBar.warning if batch.warnings or batch.failed else InfoBar.success
+            bar = self._post(kind, DONE_TITLE, batch_message(*counts))
+            if batch.verified or batch.warnings:
+                folder = batch.folder or batch.first_copy_folder
+                button = PushButton(FluentIcon.FOLDER, OPEN_FOLDER_TEXT, bar)
+                button.clicked.connect(lambda: shell.open_folder(folder))
+                bar.addWidget(button)
         self.batchFinished.emit(counts)
 
     def _post(self, kind, title: str, content: str) -> InfoBar:

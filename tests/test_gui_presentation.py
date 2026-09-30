@@ -9,6 +9,9 @@ import pytest
 
 from siftool.errors import (
     CorruptFileError,
+    DestinationExistsError,
+    SameFileError,
+    SiftoolError,
     UnsafeFileError,
     UnsupportedFormatError,
     VerificationFailedError,
@@ -19,6 +22,7 @@ from siftool.modes import ALLOWED
 from siftool_gui.presentation import (
     CATEGORY_ORDER,
     Outcome,
+    batch_message,
     category_name,
     category_outcome,
     category_value,
@@ -26,8 +30,6 @@ from siftool_gui.presentation import (
     done_text,
     error_explanation,
     error_title,
-    failed_hint,
-    failed_title,
     mode_description,
     mode_title,
     result_explanation,
@@ -214,13 +216,43 @@ def test_error_texts_for_each_exception():
     assert error_title(generic) == "Erro ao ler ou gravar"
     assert error_explanation(generic) == str(generic)
 
-    verdict = Verdict(Status.FAILED, [Finding(Category.LOCATION, "GPS", "1.0, 2.0", "where")], [])
+    verdict = Verdict(
+        Status.FAILED,
+        [
+            Finding(Category.AI_PROVENANCE, "C2PA label", None, "RESERVED:0xF0"),
+            Finding(Category.LOCATION, "GPS", "1.0, 2.0", "where"),
+            Finding(Category.AI_PROVENANCE, "C2PA manifest", "generator: OpenAI Media Service API", "caBX"),
+        ],
+        ["Image data differs from the original"],
+    )
     failed = VerificationFailedError(verdict)
     assert error_title(failed) == "Não limpou"
-    explanation = error_explanation(failed)
-    assert explanation.startswith(
-        "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva."
-    )
+    # Ruling P11(a): one Portuguese line per category that stayed, each once. The engine's own
+    # labels and notes are only shown under "Detalhes técnicos" (spec 3, criterion 4).
+    assert error_explanation(failed).split("\n") == [
+        "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva.",
+        "Marca de IA: ainda estava na cópia",
+        "Localização: ainda estava na cópia",
+    ]
+
+    # Ruling P11(c): the engine errors only a race can raise (a file appearing between naming the
+    # copy and writing it)...
+    exists = DestinationExistsError(r"C:\fotos\a_clean.jpg already exists")
+    assert error_title(exists) == "Já existe um arquivo com esse nome"
+    assert error_explanation(exists) == "A cópia não foi salva para não sobrescrever um arquivo existente."
+    same = SameFileError("a.jpg and a.jpg are the same file")
+    assert error_title(same) == "Destino igual ao original"
+    assert error_explanation(same) == "O Siftool nunca grava por cima do arquivo original."
+
+    # ... and every other engine error or unexpected exception: Portuguese, never the English message.
+    class FutureEngineError(SiftoolError):
+        pass
+
+    for unexpected in (SiftoolError("engine failure"), FutureEngineError("a new failure"),
+                       ValueError("unpack requires a buffer of 4 bytes"), KeyError("chunk"), MemoryError(),
+                       RuntimeError("boom")):
+        assert error_title(unexpected) == "Não foi possível limpar", unexpected
+        assert error_explanation(unexpected) == "O Siftool encontrou um problema com este arquivo.", unexpected
 
 
 def test_result_title_and_explanation(tmp_path):
@@ -247,12 +279,12 @@ def test_result_title_and_explanation(tmp_path):
         verdict=Verdict(Status.WARNINGS, [], ["Unrecognized structure kept: iCCP"]),
     )
     assert result_title(warned) == "Com ressalvas"
-    explanation = result_explanation(warned, tmp_path)
-    assert explanation.startswith(
+    # Portuguese only: the engine's note ("Unrecognized structure kept: iCCP") is listed under
+    # "Detalhes técnicos" instead (spec 3, criterion 4).
+    assert result_explanation(warned, tmp_path) == (
         "A cópia foi salva, mas havia uma estrutura que o Siftool não conhece "
         "e precisou ficar para a imagem não quebrar."
     )
-    assert "Unrecognized structure kept: iCCP" in explanation
 
 
 def test_summary_and_button_plurals():
@@ -273,11 +305,14 @@ def test_done_text_combinations():
     assert done_text(0, 2, 0) == "0 fotos limpas e verificadas · 2 com ressalvas"
 
 
-def test_failed_texts_after_a_batch():
-    assert failed_title(1) == "1 foto não foi limpa"
-    assert failed_title(3) == "3 fotos não foram limpas"
-    assert failed_hint(1) == "Clique na linha para ver o motivo."
-    assert failed_hint(3) == "Clique em cada linha para ver o motivo."
+def test_batch_message_after_a_batch():
+    # Ruling P13: one message per batch -- the counts, plus where to look when a photo was not cleaned.
+    assert batch_message(3, 0, 0) == "3 fotos limpas e verificadas"
+    assert batch_message(2, 1, 0) == "2 fotos limpas e verificadas · 1 com ressalvas"
+    assert batch_message(2, 1, 1) == (
+        "2 fotos limpas e verificadas · 1 com ressalvas · 1 não limpou — clique na linha para ver o motivo."
+    )
+    assert batch_message(0, 0, 3) == done_text(0, 0, 3) + " — clique em cada linha para ver o motivo."
 
 
 def test_presentation_imports_no_qt(tmp_path):

@@ -82,10 +82,24 @@ def _status(page, name: str) -> str:
     return page.model.index_for(_id_of(page, name)).data(VALUE_ROLE)
 
 
+def _children(page, parent) -> list:
+    return [page.model.index(row, 0, parent) for row in range(page.model.rowCount(parent))]
+
+
 def _notes(page, name: str) -> list[str]:
-    parent = page.model.index_for(_id_of(page, name))
-    rows = [page.model.index(row, 0, parent) for row in range(page.model.rowCount(parent))]
+    rows = _children(page, page.model.index_for(_id_of(page, name)))
     return [index.data(Qt.ItemDataRole.DisplayRole) for index in rows if index.data(KIND_ROLE) == RowKind.NOTE]
+
+
+def _first_child_kind(page, name: str) -> RowKind:
+    return _children(page, page.model.index_for(_id_of(page, name)))[0].data(KIND_ROLE)
+
+
+def _technical(page, name: str) -> list[str]:
+    """What "Detalhes técnicos" lists: the engine's own words (tooltips hold the whole line)."""
+    rows = _children(page, page.model.index_for(_id_of(page, name)))
+    (header,) = [index for index in rows if index.data(KIND_ROLE) == RowKind.TECH_HEADER]
+    return [index.data(Qt.ItemDataRole.ToolTipRole) for index in _children(page, header)]
 
 
 def _temp_files(folder: Path) -> list[Path]:
@@ -228,9 +242,14 @@ def test_verification_failure_shows_violations(page, qtbot, settle, photos):
 
     assert _entries(page)["c2pa.jpg"].state is EntryState.FAILED
     assert _status(page, "c2pa.jpg") == "Não limpou"
-    notes = _notes(page, "c2pa.jpg")
-    assert "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva." in notes
-    assert "Marca de IA: C2PA label" in notes  # the violation, in Portuguese
+    # The reason first, right under the file (ruling P11(b)), and in Portuguese only (P11(a)).
+    assert _first_child_kind(page, "c2pa.jpg") == RowKind.NOTE
+    assert _notes(page, "c2pa.jpg") == [
+        "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva.",
+        "Marca de IA: ainda estava na cópia",
+    ]
+    # The engine's own label stays under "Detalhes técnicos" (spec 3, criterion 4).
+    assert any(line.startswith("C2PA label") for line in _technical(page, "c2pa.jpg"))
     assert not _clean_copy(src).exists()
     assert _temp_files(photos) == []
 
@@ -243,7 +262,13 @@ def test_warnings_result(page, qtbot, settle, photos):
 
     assert _entries(page)["reservado.jpg"].state is EntryState.WARNINGS
     assert _status(page, "reservado.jpg") == "Com ressalvas"
-    assert _notes(page, "reservado.jpg")[0].startswith("A cópia foi salva, mas havia uma estrutura")
+    assert _first_child_kind(page, "reservado.jpg") == RowKind.NOTE  # the reason first
+    assert _notes(page, "reservado.jpg") == [
+        "A cópia foi salva, mas havia uma estrutura que o Siftool não conhece e precisou ficar para a imagem "
+        "não quebrar."
+    ]
+    # The engine's note, in its own words, only under "Detalhes técnicos".
+    assert any(line.startswith("Unrecognized structure kept:") for line in _technical(page, "reservado.jpg"))
     assert _clean_copy(src).exists()
 
 
@@ -366,7 +391,11 @@ def test_clean_again_uses_current_mode_and_new_name(page, qtbot, settle, photos)
     assert outcomes[Category.APPEARANCE] is Outcome.REMOVED  # Máximo takes orientation and colors too
 
 
-def test_batch_finished_counts_and_infobar(page, qtbot, settle, photos, monkeypatch):
+def _open_folder_buttons(bar) -> list[PushButton]:
+    return [button for button in bar.findChildren(PushButton) if button.text() == "Abrir pasta"]
+
+
+def test_batch_finished_counts_and_one_message(page, qtbot, settle, photos, monkeypatch):
     opened: list[Path] = []
     monkeypatch.setattr(shell, "open_folder", opened.append)
     sources = [
@@ -378,21 +407,38 @@ def test_batch_finished_counts_and_infobar(page, qtbot, settle, photos, monkeypa
 
     assert _clean(qtbot, page) == (1, 1, 1)
 
-    (success,) = _bars(page, InfoBarIcon.SUCCESS)
-    assert success.title == "Pronto"
-    assert success.content == done_text(1, 1, 1)
-    (open_folder,) = [button for button in success.findChildren(PushButton) if button.text() == "Abrir pasta"]
+    # Ruling P13: ONE message per batch -- a warning when a photo needs a look, saying where to look.
+    (bar,) = _bars(page)
+    assert bar.icon == InfoBarIcon.WARNING
+    assert bar.title == "Pronto"
+    assert bar.content == done_text(1, 1, 1) + " — clique na linha para ver o motivo."
+    (open_folder,) = _open_folder_buttons(bar)
     open_folder.click()
     assert opened == [photos]  # beside the originals: the folder of the first cleaned file
-    (warning,) = _bars(page, InfoBarIcon.WARNING)
-    assert warning.content  # says how many were not cleaned
 
-    # The next batch replaces the previous batch's messages.
+    def again(name: str) -> None:
+        with qtbot.waitSignal(page.batchFinished, timeout=TIMEOUT):
+            page.clean_again(_id_of(page, name))
+
+    # Each batch replaces the last one's message. Everything verified: the success style.
     page.set_mode(Mode.PHOTOGRAPHER)
-    with qtbot.waitSignal(page.batchFinished, timeout=TIMEOUT):
-        page.clean_again(_id_of(page, "a.jpg"))
-    assert len(_bars(page, InfoBarIcon.SUCCESS)) == 1
-    assert _bars(page, InfoBarIcon.WARNING) == []
+    again("a.jpg")
+    (bar,) = _bars(page)
+    assert (bar.icon, bar.title, bar.content) == (InfoBarIcon.SUCCESS, "Pronto", done_text(1, 0, 0))
+    assert len(_open_folder_buttons(bar)) == 1
+
+    # Saved with reservations: a warning, still with the folder to open, and nothing failed to explain.
+    again("reservado.jpg")
+    (bar,) = _bars(page)
+    assert (bar.icon, bar.title, bar.content) == (InfoBarIcon.WARNING, "Pronto", done_text(0, 1, 0))
+    assert len(_open_folder_buttons(bar)) == 1
+
+    # Nothing saved: no folder to open.
+    again("c2pa.jpg")
+    (bar,) = _bars(page)
+    assert bar.icon == InfoBarIcon.WARNING
+    assert bar.content == done_text(0, 0, 1) + " — clique na linha para ver o motivo."
+    assert _open_folder_buttons(bar) == []
 
 
 # -- the row menu and keyboard ----------------------------------------------------------

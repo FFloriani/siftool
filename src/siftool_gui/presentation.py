@@ -24,6 +24,15 @@ the task-4 brief's named tests don't pin them):
   page's own goal), `_GENERIC_FALLBACKS` supplies a short, jargon-free
   Portuguese phrase for each. `ai_provenance` needs no separate entry:
   its rule already always yields at least "Gerada por IA".
+
+The engine's own words -- finding labels, violations, notes, exception
+messages, all in English -- never reach these texts (spec 3, criterion 4;
+ruling P11): a failed verification names each category that stayed, a
+result with reservations explains itself in one sentence, and an engine
+error or unexpected exception gets a Portuguese text of its own. The list
+shows the engine's words only under "Detalhes técnicos" (`model.py`).
+The one exception is the spec's own: an `OSError` other than "not found"
+or "no permission" shows the system's message (spec 5.5).
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ from pathlib import Path
 
 from siftool.errors import (
     CorruptFileError,
+    DestinationExistsError,
+    SameFileError,
     UnsafeFileError,
     UnsupportedFormatError,
     VerificationFailedError,
@@ -235,15 +246,22 @@ def mode_description(mode: Mode) -> str:
     return _MODE_DESCRIPTIONS[mode]
 
 
-def _describe_finding(finding: Finding) -> str:
-    text = f"{category_name(finding.category)}: {finding.label}"
-    if finding.detail:
-        text += f" ({finding.detail})"
-    return text
+_UNEXPECTED_TITLE = "Não foi possível limpar"
+_UNEXPECTED_EXPLANATION = "O Siftool encontrou um problema com este arquivo."
+
+
+def _violation_lines(violations: Sequence[Finding]) -> list[str]:
+    """One Portuguese line per category the verification still found in the copy, each once, in order."""
+    lines: list[str] = []
+    for finding in violations:
+        line = f"{category_name(finding.category)}: ainda estava na cópia"
+        if line not in lines:
+            lines.append(line)
+    return lines
 
 
 def error_title(exc: BaseException) -> str:
-    """The line-level text for `exc` (spec 5.5, "Texto na linha")."""
+    """The line-level text for `exc` (spec 5.5, "Texto na linha"); any exception gets one."""
     if isinstance(exc, UnsupportedFormatError):
         return "Ainda não suportado" if exc.format_name in _COMING_SOON_FORMATS else "Formato não suportado"
     if isinstance(exc, CorruptFileError):
@@ -252,17 +270,25 @@ def error_title(exc: BaseException) -> str:
         return "Grande demais"
     if isinstance(exc, VerificationFailedError):
         return "Não limpou"
+    if isinstance(exc, DestinationExistsError):  # only in a race: a file took the copy's name meanwhile
+        return "Já existe um arquivo com esse nome"
+    if isinstance(exc, SameFileError):
+        return "Destino igual ao original"
     if isinstance(exc, FileNotFoundError):
         return "Não encontrado"
     if isinstance(exc, PermissionError):
         return "Sem permissão"
     if isinstance(exc, OSError):
         return "Erro ao ler ou gravar"
-    return "Erro"
+    return _UNEXPECTED_TITLE  # any other engine error, or a bug: never the English message
 
 
 def error_explanation(exc: BaseException) -> str:
-    """The expanded text for `exc` (spec 5.5, "Texto ao expandir")."""
+    """The expanded text for `exc` (spec 5.5, "Texto ao expandir"), in Portuguese.
+
+    A failed verification adds one line per category that stayed in the
+    copy (ruling P11(a)); its labels are for "Detalhes técnicos" only.
+    """
     if isinstance(exc, UnsupportedFormatError):
         if exc.format_name in _COMING_SOON_FORMATS:
             return "Fotos HEIC e vídeos chegam numa próxima versão."
@@ -273,15 +299,18 @@ def error_explanation(exc: BaseException) -> str:
         return "Arquivos acima de 512 MB ainda não são aceitos."
     if isinstance(exc, VerificationFailedError):
         base = "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva."
-        lines = [_describe_finding(f) for f in exc.verdict.violations]
-        return base if not lines else base + "\n" + "\n".join(lines)
+        return "\n".join([base, *_violation_lines(exc.verdict.violations)])
+    if isinstance(exc, DestinationExistsError):
+        return "A cópia não foi salva para não sobrescrever um arquivo existente."
+    if isinstance(exc, SameFileError):
+        return "O Siftool nunca grava por cima do arquivo original."
     if isinstance(exc, FileNotFoundError):
         return "O arquivo foi movido ou apagado."
     if isinstance(exc, PermissionError):
         return "O Windows não deixou ler o arquivo ou gravar a cópia nesta pasta."
     if isinstance(exc, OSError):
-        return str(exc)
-    return str(exc)
+        return str(exc)  # spec 5.5: the system's own message
+    return _UNEXPECTED_EXPLANATION
 
 
 def result_title(result: CleanResult) -> str:
@@ -294,16 +323,18 @@ def result_title(result: CleanResult) -> str:
 
 
 def result_explanation(result: CleanResult, output_dir: Path) -> str:
-    """The expanded text for a (successful) `CleanResult` (spec 5.5)."""
+    """The expanded text for a (successful) `CleanResult` (spec 5.5), in Portuguese.
+
+    The engine's notes -- which structure had to stay -- are for "Detalhes
+    técnicos" only: a copy "com ressalvas" always means that an unknown
+    structure was kept, which the sentence already says.
+    """
     if result.verdict.status is Status.VERIFIED:
         return f"Cópia salva em {output_dir}. Nada do que o modo proíbe ficou no arquivo."
-
-    base = (
+    return (
         "A cópia foi salva, mas havia uma estrutura que o Siftool não conhece "
         "e precisou ficar para a imagem não quebrar."
     )
-    notes = list(result.notes) + [n for n in result.verdict.notes if n not in result.notes]
-    return base if not notes else base + "\n" + "\n".join(notes)
 
 
 def clean_button_text(n: int) -> str:
@@ -342,11 +373,13 @@ def done_text(verified: int, warnings: int, failed: int) -> str:
     return " · ".join(parts)
 
 
-def failed_title(failed: int) -> str:
-    """The title of the warning shown after a batch in which `failed` photos were not cleaned."""
-    return "1 foto não foi limpa" if failed == 1 else f"{failed} fotos não foram limpas"
+def batch_message(verified: int, warnings: int, failed: int) -> str:
+    """The one message after a batch (ruling P13): `done_text`, plus where to look when some failed.
 
-
-def failed_hint(failed: int) -> str:
-    """Where to find out why (each row explains its own failure, spec 5.5)."""
-    return "Clique na linha para ver o motivo." if failed == 1 else "Clique em cada linha para ver o motivo."
+    Each row explains its own failure (spec 5.5), so the hint sends the
+    user to the row -- or to each row, when more than one failed.
+    """
+    text = done_text(verified, warnings, failed)
+    if failed:
+        text += " — clique na linha para ver o motivo." if failed == 1 else " — clique em cada linha para ver o motivo."
+    return text

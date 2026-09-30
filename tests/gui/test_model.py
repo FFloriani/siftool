@@ -15,7 +15,12 @@ from PySide6.QtGui import QColor, QImage, QPixmap
 
 import siftool
 from fixtures.make_fixtures import make_jpeg, make_png, write
-from siftool.errors import CorruptFileError, UnsupportedFormatError, VerificationFailedError
+from siftool.errors import (
+    CorruptFileError,
+    DestinationExistsError,
+    UnsupportedFormatError,
+    VerificationFailedError,
+)
 from siftool.model import Category, CleanResult, Finding, Mode, Report, Status, Verdict
 
 from siftool_gui.entries import EntryState, InvalidTransition
@@ -244,31 +249,69 @@ def test_result_rows_verified_warnings_failed(model, tmp_path):
     assert _texts(_of_kind(model, ok, RowKind.NOTE)) == [
         f"Cópia salva em {tmp_path}. Nada do que o modo proíbe ficou no arquivo."
     ]
+    # Portuguese only (spec 3, criterion 4): the engine's note and labels are technical details.
     assert _texts(_of_kind(model, warn, RowKind.NOTE)) == [
         "A cópia foi salva, mas havia uma estrutura que o Siftool não conhece e precisou ficar para a "
         "imagem não quebrar.",
-        note,
     ]
     assert _texts(_of_kind(model, fail, RowKind.NOTE)) == [
         "A verificação encontrou dados que não saíram, por isso nenhuma cópia foi salva.",
-        "Marca de IA: C2PA label",
+        "Marca de IA: ainda estava na cópia",
     ]
-    for index in (ok, warn, fail):  # categories, then the notes, then the technical details
-        kinds = _kinds(model, index)
-        assert kinds[:2] == [RowKind.CATEGORY, RowKind.CATEGORY]
-        assert kinds[-1] is RowKind.TECH_HEADER
-        assert set(kinds[2:-1]) == {RowKind.NOTE}
+    for index in (warn, fail):
+        (header,) = _of_kind(model, index, RowKind.TECH_HEADER)
+        assert _texts(_children(model, header)).count(note) == 1  # once, even when both lists carry it
+
+    # A saved copy: its categories, then where it went. A copy with reservations, or none: the
+    # reason first, right under the file (ruling P11(b)). The technical details always come last.
+    assert _kinds(model, ok) == [RowKind.CATEGORY, RowKind.CATEGORY, RowKind.NOTE, RowKind.TECH_HEADER]
+    assert _kinds(model, warn) == [RowKind.NOTE, RowKind.CATEGORY, RowKind.CATEGORY, RowKind.TECH_HEADER]
+    assert _kinds(model, fail) == [RowKind.NOTE, RowKind.NOTE, RowKind.CATEGORY, RowKind.CATEGORY,
+                                   RowKind.TECH_HEADER]
 
 
-def test_notes_with_embedded_newlines_stay_one_row_each(model, tmp_path):
+def test_engine_texts_with_embedded_newlines_stay_one_row_each(model, tmp_path):
     photo = tmp_path / "fail.jpg"
     entry_id = _analyzed(model, photo, _report(photo, GPS))
     model.mark_cleaning(entry_id)
     sneaky = Finding(Category.TEXT, "Comment", "line one\nline two", "COM")
-    model.apply_clean_error(entry_id, VerificationFailedError(Verdict(Status.FAILED, [sneaky, C2PA], [])))
+    verdict = Verdict(Status.FAILED, [sneaky, C2PA, C2PA], ["note one\nnote two"])
+    model.apply_clean_error(entry_id, VerificationFailedError(verdict))
 
-    notes = _texts(_of_kind(model, model.index_for(entry_id), RowKind.NOTE))
-    assert notes[1:] == ["Textos e comentários: Comment (line one line two)", "Marca de IA: C2PA label"]
+    index = model.index_for(entry_id)
+    notes = _texts(_of_kind(model, index, RowKind.NOTE))
+    assert notes[1:] == ["Textos e comentários: ainda estava na cópia", "Marca de IA: ainda estava na cópia"]
+    (header,) = _of_kind(model, index, RowKind.TECH_HEADER)
+    rows = _children(model, header)
+    assert [row.data(FINDING_ROLE) for row in rows[:4]] == [GPS, sneaky, C2PA, C2PA]
+    assert _texts(rows[4:]) == ["note one note two"]  # the verdict's note: one row, on one line
+    for row in rows:
+        assert "\n" not in row.data(Qt.ItemDataRole.ToolTipRole)
+
+
+def test_race_and_unexpected_errors_read_in_portuguese(model, tmp_path):
+    photo = tmp_path / "a.jpg"
+    exists_id = _analyzed(model, photo, _report(photo, GPS))
+    model.mark_cleaning(exists_id)
+    model.apply_clean_error(exists_id, DestinationExistsError(f"{tmp_path / 'a_clean.jpg'} already exists"))
+    (broken_id,) = model.add_paths([tmp_path / "b.jpg"])
+    model.mark_analyzing(broken_id)
+    model.apply_analysis_error(broken_id, ValueError("unpack requires a buffer of 4 bytes"))
+
+    exists = model.index_for(exists_id)
+    assert exists.data(VALUE_ROLE) == "Já existe um arquivo com esse nome"
+    assert _kinds(model, exists)[0] is RowKind.NOTE  # the reason first (ruling P11(b))
+    assert _texts(_of_kind(model, exists, RowKind.NOTE)) == [
+        "A cópia não foi salva para não sobrescrever um arquivo existente."
+    ]
+    broken = model.index_for(broken_id)
+    assert broken.data(VALUE_ROLE) == "Não foi possível limpar"
+    assert _texts(_children(model, broken)) == ["O Siftool encontrou um problema com este arquivo."]
+    for index in (exists, broken, *_of_kind(model, exists, RowKind.NOTE), *_children(model, broken)):
+        for role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.AccessibleTextRole,
+                     VALUE_ROLE):
+            text = str(index.data(role) or "")
+            assert "already exists" not in text and "unpack" not in text
 
 
 def test_outcomes_after_cleaning_describe_the_copy(model, tmp_path):

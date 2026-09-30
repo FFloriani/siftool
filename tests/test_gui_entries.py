@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -162,3 +164,20 @@ def test_cancel_reverts():
     entry.start_clean()
     entry.cancel_clean()
     assert entry.state is EntryState.ANALYZED
+
+
+def test_entries_imports_no_qt(tmp_path):
+    # Spec 4.3: the state machine stays testable without a display (ruling P11(e)).
+    code = (
+        "import siftool_gui.entries, sys; "
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in ('PySide6', 'qfluentwidgets')))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", code],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"
