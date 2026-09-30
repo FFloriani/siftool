@@ -662,7 +662,8 @@ class CleanPage(QWidget):
         """Show one message about the last batch, inline in the action bar, until closed or replaced."""
         bar = kind(title, content, orient=Qt.Orientation.Horizontal, isClosable=True, duration=-1,
                    position=InfoBarPosition.NONE, parent=self._message_host)
-        self._messages.addWidget(bar)
+        # Left-aligned at its own width: stretched, an InfoBar spreads its title and text apart.
+        self._messages.addWidget(bar, 0, Qt.AlignmentFlag.AlignLeft)
         self._bars.append(bar)
         return bar
 

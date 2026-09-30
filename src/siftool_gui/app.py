@@ -3,7 +3,8 @@
 `main` handles `--version` without creating a `QApplication` or importing
 Qt at all, so `siftool-gui --version` stays fast and works even without a
 display. Any other invocation creates the `QApplication`, builds the
-window via `create_window` and runs the event loop.
+window via `create_window` -- which applies the saved theme first -- and
+runs the event loop.
 """
 
 from __future__ import annotations
@@ -23,14 +24,21 @@ def create_window(config_path: Path | None = None) -> "MainWindow":
 
     Testable without `QApplication.exec()`. Loads the persistent
     configuration from `config_path` (default location when `None`,
-    see `siftool_gui.settings.default_config_path`) and binds it as the
-    global `qconfig`, before the window (and the QFluentWidgets
-    components it builds) can read the theme from it.
+    see `siftool_gui.settings.default_config_path`), binds it as the
+    global `qconfig` and applies its theme, before the window (and the
+    QFluentWidgets components it builds) is created: every widget is born
+    in the saved theme, and the window is ready to be shown.
     """
+    from qfluentwidgets import setTheme
+
     from siftool_gui.settings import load_config
     from siftool_gui.window import MainWindow
 
-    return MainWindow(load_config(config_path))
+    config = load_config(config_path)
+    # Lazy: nothing of this window exists yet, so there is nothing to restyle now; widgets
+    # that do exist (another window, earlier tests) restyle themselves when next painted.
+    setTheme(config.get(config.themeMode), lazy=True)
+    return MainWindow(config)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,7 +55,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from PySide6.QtWidgets import QApplication
 
-    app = QApplication(args)
+    # Qt takes argv[0] as the program name and parses its own options (-style, -platform...)
+    # from the rest: without argv[0] the first real argument would be swallowed as the name.
+    app = QApplication([sys.argv[0], *args])
     window = create_window()
     window.show()
     return app.exec()

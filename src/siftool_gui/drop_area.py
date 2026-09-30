@@ -76,7 +76,7 @@ def accept_as_copy(event: QDragEnterEvent | QDragMoveEvent | QDropEvent) -> bool
     return True
 
 
-class _AccentIcon(IconWidget):
+class AccentIcon(IconWidget):
     """A Fluent icon painted in the current accent color (it differs between themes)."""
 
     def paintEvent(self, event) -> None:
@@ -99,7 +99,7 @@ class DropArea(QFrame):
         self._highlighted = False
         self._last_dir = ""  # this session only: no recent-files list (spec 7)
 
-        self.icon_widget = _AccentIcon(FluentIcon.PHOTO, self)
+        self.icon_widget = AccentIcon(FluentIcon.PHOTO, self)
         self.title_label = BodyLabel(DROP_TEXT, self)
         self.hint_label = BodyLabel(HINT_TEXT, self)
         self.hint_label.setTextColor(QColor(96, 96, 96), QColor(206, 206, 206))
