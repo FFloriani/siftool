@@ -136,6 +136,23 @@ python siftool.py
 
 ---
 
+## ✦ Instalar (Windows)
+
+O programa novo vem de duas formas. Nenhuma precisa de Python.
+
+*   **Instalador** (`Siftool-<versão>-setup.exe`): instala só para o seu usuário, sem pedir senha de administrador, em `%LOCALAPPDATA%\Programs\Siftool`. Cria o atalho no menu Iniciar e, se você deixar a opção marcada, põe **Limpar com Siftool** no clique direito das fotos JPG, PNG e WEBP e das pastas (no Windows 11, em **Mostrar mais opções**). Para remover, vá em Configurações → Aplicativos → Siftool → Desinstalar. As suas configurações ficam guardadas.
+*   **Portátil** (`Siftool-<versão>-portable.zip`): extraia a pasta `Siftool` para onde quiser (um pendrive, por exemplo) e abra o `Siftool.exe`. Nada é instalado no computador: as configurações ficam na pasta `dados`, dentro dela. Para remover, apague a pasta.
+
+Na primeira vez, o Windows pode mostrar **O Windows protegeu o computador**, porque o Siftool ainda não tem assinatura digital. Clique em **Mais informações** e depois em **Executar assim mesmo**.
+
+Para gerar os dois arquivos a partir do código, com o PyInstaller no `.venv` e o [Inno Setup 6](https://jrsoftware.org/isinfo.php) instalados:
+```cmd
+.venv\Scripts\python.exe packaging\build.py
+```
+Ele esvazia `build\` e `dist\`, gera a pasta `dist\Siftool`, testa o programa pronto, e deixa o instalador e o ZIP em `dist\`.
+
+---
+
 ## ✦ Programa novo (prévia)
 
 O Siftool v2 tem um programa novo, em português, sobre o motor novo. Ele ainda é uma prévia: o `siftool.py` antigo continua existindo até a versão final.

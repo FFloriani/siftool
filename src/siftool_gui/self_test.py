@@ -5,7 +5,8 @@ the program needs made it into the bundle:
 
 - the Qt plugins: the image formats of the previews and of the window icon,
   and the Windows platform plugin (loaded, though not the one in use here);
-- QtNetwork, which keeps Siftool to one window: a local server listens;
+- what keeps Siftool to one window: its lock takes and its local server
+  (QtNetwork) listens, under a name made with hashlib;
 - QFluentWidgets and its resources: the main window is built and drawn,
   with its icon, and a Fluent icon draws something;
 - the engine and the workers: a tiny generated PNG carrying a personal
@@ -32,7 +33,6 @@ import struct
 import sys
 import tempfile
 import traceback
-import uuid
 import zlib
 from collections.abc import Callable
 from pathlib import Path
@@ -82,7 +82,6 @@ def _check_everything() -> dict[str, object]:
     qt_app = QApplication.instance() or QApplication([sys.argv[0]])
     _check_image_formats()
     _check_platform_plugin()
-    _check_local_server()
 
     config = default_config_path()
     portable = portable_dir() is not None
@@ -92,7 +91,9 @@ def _check_everything() -> dict[str, object]:
             raise SelfTestError(f"the portable settings were not written: {config}")
 
     with tempfile.TemporaryDirectory(prefix="siftool-self-test-") as folder:
-        window = gui_app.create_window(Path(folder) / "config.json")
+        throwaway = Path(folder) / "config.json"
+        _check_single_instance(throwaway, Path(folder))
+        window = gui_app.create_window(throwaway)
         try:
             _check_window(qt_app, window)
             _check_cleaning(window.clean_page, Path(folder))
@@ -126,15 +127,18 @@ def _check_platform_plugin() -> None:
     raise SelfTestError("the Windows platform plugin (platforms/qwindows.dll) is missing")
 
 
-def _check_local_server() -> None:
-    from PySide6.QtNetwork import QLocalServer
+def _check_single_instance(config: Path, folder: Path) -> None:
+    """The one-window machinery, for the throwaway settings `config` (a name no real window uses), lock in `folder`."""
+    from siftool_gui.single_instance import SingleInstance
 
-    server = QLocalServer()
+    instance = SingleInstance(config, lock_dir=folder)
     try:
-        if not server.listen(f"siftool-self-test-{uuid.uuid4().hex}"):
-            raise SelfTestError(f"a local server does not listen: {server.errorString()}")
+        if not instance.claim():
+            raise SelfTestError("the single-window lock cannot be taken")
+        if not instance.listen():
+            raise SelfTestError("the single-window server does not listen")
     finally:
-        server.close()
+        instance.release()
 
 
 def _check_window(qt_app: "QApplication", window: "MainWindow") -> None:
