@@ -599,3 +599,64 @@ def test_repeated_tags_are_seen_by_inspect_and_verify(tmp_path):
     assert [f for f in siftool.inspect(src).findings if f.category is C.UNKNOWN] == duplicates
     verdict = siftool.verify(src, Mode.PRIVACY)
     assert verdict.status is Status.FAILED and verdict.violations == duplicates
+
+
+def _single_tag_tiff(value: bytes) -> bytes:
+    """A canonical big-endian TIFF: IFD0 = one XResolution whose RATIONAL is `value` (8 bytes)."""
+    return tiff_header() + tiff_ifd([(0x011A, 5, 1, struct.pack(">I", 26))]) + value
+
+
+def test_second_png_exif_chunk_is_dropped(tmp_path):  # rr_attack2
+    first, second = _single_tag_tiff(QUIET_SECRET[:8]), _single_tag_tiff(QUIET_SECRET[8:16])
+    res, out = _clean(tmp_path, _bare_png(png_chunk(b"eXIf", first), png_chunk(b"eXIf", second)), ".png", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == _bare_png(png_chunk(b"eXIf", first))
+    assert res.removed == [Finding(C.UNKNOWN, "Extra EXIF block", None, "eXIf", len(second))]
+
+
+# ---------------------------------------------------------------------------
+# R25 + R28: a PNG chunk the spec allows once keeps only its first instance in
+# its legal position. That instance keeps its own value bytes -- the accepted
+# limit of a few free bytes inside one valid value -- and every other copy is
+# dropped.
+# ---------------------------------------------------------------------------
+
+
+def _pieces(secret: bytes, size: int) -> list[bytes]:
+    return [secret[i:i + size].ljust(size, b".") for i in range(0, len(secret), size)]
+
+
+def _bare_png_after_idat(*chunks: bytes) -> bytes:
+    """The fixture's bare 16x16 RGB PNG with `chunks` right before its IEND, after its IDAT."""
+    png = make_png(**_BARE_PNG)
+    at = png.index(b"IEND") - 4
+    return png[:at] + b"".join(chunks) + png[at:]
+
+
+REPEATED_APPEARANCE = {  # rr_attack P1 (2x cHRM), P1b (12x gAMA); rr_attack2 (5x pHYs)
+    "2x-cHRM": (b"cHRM", _pieces(QUIET_SECRET, 32)),
+    "12x-gAMA": (b"gAMA", _pieces(QUIET_SECRET, 4)),
+    "5x-pHYs": (b"pHYs", _pieces(QUIET_SECRET[:45], 9)),
+}
+
+
+@pytest.mark.parametrize("mode", [Mode.PRIVACY, Mode.PHOTOGRAPHER])
+@pytest.mark.parametrize("case", sorted(REPEATED_APPEARANCE))
+def test_repeated_appearance_chunk_keeps_only_its_first_instance(tmp_path, case, mode):
+    ctype, pieces = REPEATED_APPEARANCE[case]
+    chunks = [png_chunk(ctype, piece) for piece in pieces]
+    res, out = _clean(tmp_path, _bare_png(*chunks), ".png", mode)
+    assert res.verdict.status is Status.VERIFIED and out == _bare_png(chunks[0])
+
+
+def test_five_hundred_mdcv_chunks_leave_one(tmp_path):  # rr_attack P1c
+    chunks = [png_chunk(b"mDCV", (b"owner=Felipe Floriani %04d " % k)[:24]) for k in range(500)]
+    res, out = _clean(tmp_path, _bare_png(*chunks), ".png", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == _bare_png(chunks[0])
+    assert out.count(b"owner=Felipe Floriani") == 1
+    assert res.removed == [Finding(C.UNKNOWN, "Misplaced or repeated mDCV", None, "mDCV", 24)] * 499
+
+
+def test_appearance_chunk_after_idat_is_dropped(tmp_path):  # rr_attack2
+    res, out = _clean(tmp_path, _bare_png_after_idat(png_chunk(b"cHRM", QUIET_SECRET[:32])), ".png", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == make_png(**_BARE_PNG)
+    assert res.removed == [Finding(C.UNKNOWN, "Misplaced or repeated cHRM", None, "cHRM", 32)]

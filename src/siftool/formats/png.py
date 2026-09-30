@@ -19,7 +19,9 @@ R19):
 
 - `IHDR`/`IEND`/`acTL`/`fcTL` have a payload size fixed by the format
   itself (13/0/8/26 bytes); `tRNS`/`sBIT`'s size is fixed by `IHDR`'s
-  colour type (and, for `tRNS` on a palette image, `PLTE`'s entry count).
+  colour type (and, for `tRNS` on a palette image, `PLTE`'s entry count),
+  checked on the one instance in its legal position -- a repeated or
+  misplaced one is dropped instead (below).
 - Count and order (`_check_structure`): `IHDR` is the file's first chunk
   and appears exactly once; `acTL` at most once and before the first
   `IDAT`; `fcTL`/`fdAT` only after an `acTL`. And a file reaching `IEND`
@@ -43,6 +45,18 @@ structurally valid ICC profile (`icc_profile_valid`), which is exposed as
 keyword `b"ICC profile"` (the compressed profile copied unchanged, the CRC
 recomputed), so a profile name can't carry identity text; an invalid one
 is dropped as "Invalid ICC profile".
+
+Each chunk the spec allows only once is trusted only once, in its legal
+position (PNG 3rd edition; rulings R25, R28): `gAMA`/`cHRM`/`sRGB`/`iCCP`/
+`cICP`/`mDCV`/`cLLI`/`sBIT` before `PLTE` and before the first `IDAT`,
+`tRNS` after `PLTE` (when the file has one) and before `IDAT`, `pHYs`
+before `IDAT`. The first instance in a legal position is classified as
+above; every later instance and every misplaced one -- which decoders
+ignore -- is a removable `UNKNOWN` block ("Misplaced or repeated <TYPE>"),
+dropped in every mode, whatever its size. Likewise only the first `eXIf`
+is the file's EXIF block; any later one is dropped as "Extra EXIF block"
+(ruling R24). What the one kept instance can carry is bounded by that
+chunk's own size and content rules.
 
 A chunk type's first letter's case is the PNG spec's own critical/ancillary
 flag: an unrecognized chunk starting with an uppercase letter is critical
@@ -96,6 +110,14 @@ _FIXED_ESSENTIAL_SIZES: dict[bytes, int] = {b"IHDR": 13, b"IEND": 0, b"acTL": 8,
 _APPEARANCE_SIZES: dict[bytes, int] = {
     b"gAMA": 4, b"sRGB": 1, b"cHRM": 32, b"pHYs": 9, b"cICP": 4, b"mDCV": 24, b"cLLI": 8,
 }
+
+# Chunks the PNG spec (3rd edition) allows at most once, in a set position
+# (rulings R25, R28): these must come before PLTE and before the first IDAT;
+# tRNS after PLTE (when the file has one) and before IDAT; pHYs before IDAT.
+# Only the first instance in a legal position is classified; every later
+# instance and every misplaced one is a removable UNKNOWN block, dropped.
+_BEFORE_PLTE_AND_IDAT = frozenset({b"gAMA", b"cHRM", b"sRGB", b"iCCP", b"cICP", b"mDCV", b"cLLI", b"sBIT"})
+_ONCE_ONLY_TYPES = _BEFORE_PLTE_AND_IDAT | {b"tRNS", b"pHYs"}
 
 # The keyword every kept iCCP is rewritten with (ruling R20).
 _ICCP_KEYWORD = b"ICC profile"
@@ -194,6 +216,15 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     been seen, `IHDR`'s own colour type and bit depth, and `PLTE`'s entry
     count. Reaching `IEND` without any `IDAT` is `CorruptFileError("missing
     image data")`.
+
+    It also keeps the chunks the spec allows once to one trusted instance
+    (rulings R25, R28, R24): only the first `_ONCE_ONLY_TYPES` chunk of a
+    type that sits in its legal position (`_in_legal_position`; any `PLTE`
+    counts for the order, even one a non-palette image drops) and the first
+    `eXIf` are classified; every later or misplaced one is a removable
+    `UNKNOWN` block (`_misplaced_or_repeated`, `_extra_exif`), dropped in
+    every mode. Whether a `PLTE` is still to come -- which makes an early
+    `tRNS` misplaced -- is looked up once, by `_plte_before_first_idat`.
     """
     n = len(buf)
     if buf[:8] != _SIGNATURE:
@@ -203,8 +234,12 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
     p = 8
     index = 0
     seen_actl = False
-    seen_plte = False
+    seen_plte = False  # a palette image's PLTE
+    seen_any_plte = False  # any PLTE, whatever the colour type: the chunk order counts it
     seen_idat = False
+    seen_exif = False
+    placed: set[bytes] = set()  # once-only types whose first legal instance is already classified
+    plte_ahead: bool | None = None  # a PLTE still to come before the first IDAT (looked up once, for tRNS)
     colour_type: int | None = None
     bit_depth = 0
     plte_entries: int | None = None
@@ -220,16 +255,32 @@ def _read_chunks(buf: bytes) -> tuple[list[Block], int]:
             raise CorruptFileError(f"chunk {ctype!r} exceeds buffer")
         data = buf[data_start:data_end]
         crc = int.from_bytes(buf[data_end:crc_end], "big")
+        span = Span(p, crc_end)
 
         _check_structure(ctype, index, seen_actl, seen_idat)
         _check_palette(ctype, data, colour_type, bit_depth, seen_plte, seen_idat)
-        blocks.append(_classify_chunk(Span(p, crc_end), ctype, data, crc, colour_type, plte_entries))
+        if ctype in _ONCE_ONLY_TYPES:
+            if ctype == b"tRNS" and plte_ahead is None and not (seen_any_plte or seen_idat):
+                plte_ahead = _plte_before_first_idat(buf, crc_end)
+            if ctype in placed or not _in_legal_position(ctype, seen_any_plte, seen_idat, bool(plte_ahead)):
+                blocks.append(_misplaced_or_repeated(span, ctype, data, crc))
+            else:
+                placed.add(ctype)
+                blocks.append(_classify_chunk(span, ctype, data, crc, colour_type, plte_entries))
+        elif ctype == b"eXIf" and seen_exif:
+            blocks.append(_extra_exif(span, data, crc))
+        else:
+            blocks.append(_classify_chunk(span, ctype, data, crc, colour_type, plte_entries))
 
         if ctype == b"IHDR":
             bit_depth, colour_type = data[8], data[9]
-        elif ctype == b"PLTE" and colour_type == 3:
-            seen_plte = True
-            plte_entries = len(data) // 3
+        elif ctype == b"PLTE":
+            seen_any_plte = True
+            if colour_type == 3:
+                seen_plte = True
+                plte_entries = len(data) // 3
+        elif ctype == b"eXIf":
+            seen_exif = True
         elif ctype == b"acTL":
             seen_actl = True
         elif ctype == b"IDAT":
@@ -289,6 +340,75 @@ def _check_palette(
         raise CorruptFileError("invalid PLTE")
 
 
+def _in_legal_position(ctype: bytes, seen_plte: bool, seen_idat: bool, plte_ahead: bool) -> bool:
+    """Whether a once-only chunk sits where the PNG spec (3rd edition) puts it (rulings R25, R28).
+
+    Every one of them comes before the first `IDAT`. `gAMA`/`cHRM`/`sRGB`/
+    `iCCP`/`cICP`/`mDCV`/`cLLI`/`sBIT` must also come before `PLTE`, and
+    `tRNS` after it when the file has one before its first `IDAT`
+    (`plte_ahead`: one is still to come); `pHYs` may sit on either side of
+    `PLTE`. `seen_plte` counts any `PLTE`, even a non-palette image's
+    suggested palette that is itself dropped.
+    """
+    if seen_idat:
+        return False
+    if ctype == b"tRNS":
+        return seen_plte or not plte_ahead
+    if ctype == b"pHYs":
+        return True
+    return not seen_plte
+
+
+def _plte_before_first_idat(buf: bytes, p: int) -> bool:
+    """True if a `PLTE` chunk starts at or after offset `p` and before the first `IDAT`.
+
+    Reads chunk headers only, and stops at `IDAT`/`IEND` or at the first
+    header that doesn't fit (the main loop raises on that one when it gets
+    there). `_read_chunks` calls it at most once per file.
+    """
+    n = len(buf)
+    while p + 8 <= n:
+        ctype = buf[p + 4 : p + 8]
+        if ctype == b"PLTE":
+            return True
+        if ctype in (b"IDAT", b"IEND"):
+            return False
+        p += 12 + int.from_bytes(buf[p : p + 4], "big")
+    return False
+
+
+def _crc_ok(ctype: bytes, data: bytes, crc: int) -> bool:
+    return (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
+
+
+def _dropped_chunk(span: Span, ctype: bytes, data: bytes, crc: int, label: str) -> Block:
+    """A removable `UNKNOWN` block with one finding naming it: dropped in every mode, shown in reports.
+
+    Its CRC only marks it `corrupt`: a dropped chunk's bytes never reach
+    the output (ruling R10).
+    """
+    tag = ctype.decode("ascii", errors="replace")
+    return Block(
+        Kind.UNKNOWN, span, label, tag, findings=[Finding(Category.UNKNOWN, label, None, tag, len(data))],
+        removable=True, corrupt=not _crc_ok(ctype, data, crc),
+    )
+
+
+def _misplaced_or_repeated(span: Span, ctype: bytes, data: bytes, crc: int) -> Block:
+    """A once-only chunk after its first legal instance, or out of its legal position (rulings R25, R28).
+
+    Decoders ignore it (libpng: "duplicate" / "out of place"), so it is
+    dropped rather than trusted -- whatever its size or content, which are
+    only checked on the one instance that is kept.
+    """
+    return _dropped_chunk(span, ctype, data, crc, f"Misplaced or repeated {ctype.decode('ascii')}")
+
+
+def _extra_exif(span: Span, data: bytes, crc: int) -> Block:
+    """Any `eXIf` after the first: a file has at most one EXIF block (ruling R24)."""
+    return _dropped_chunk(span, b"eXIf", data, crc, "Extra EXIF block")
+
+
 def _classify_chunk(
     span: Span, ctype: bytes, data: bytes, crc: int, colour_type: int | None, plte_entries: int | None
 ) -> Block:
@@ -312,7 +432,7 @@ def _classify_chunk(
     `_read_chunks` records it before any later chunk is reached.
     """
     tag = ctype.decode("ascii", errors="replace")
-    valid_crc = (zlib.crc32(ctype + data) & 0xFFFFFFFF) == crc
+    valid_crc = _crc_ok(ctype, data, crc)
 
     if ctype == b"PLTE" and colour_type != 3:
         # Only a palette image decodes through PLTE (ruling R19); elsewhere

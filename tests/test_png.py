@@ -5,7 +5,7 @@ from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.png import PngHandler, AI_TEXT_KEYWORDS
 from siftool.errors import CorruptFileError, UnsafeFileError
-from fixtures.make_fixtures import make_png, png_chunk, decode_pixels, make_icc, write
+from fixtures.make_fixtures import make_png, png_chunk, decode_pixels, make_icc, tiff_header, tiff_ifd, write
 
 H = PngHandler()
 def by_tag(c, t): return [b for b in c.blocks if b.tag == t]
@@ -136,14 +136,19 @@ def test_fctl_without_actl_is_corrupt():
     with pytest.raises(CorruptFileError, match="invalid fcTL"): H.parse(bad)
 
 def test_oversize_trns_is_corrupt():
-    # default make_png() is colour type 2 (RGB): tRNS must be exactly 6 bytes.
-    bad = make_png(extra_chunks=[png_chunk(b"tRNS", b"\x00" * 35)])
-    with pytest.raises(CorruptFileError, match="invalid tRNS"): H.parse(bad)
+    # colour type 2 (RGB): tRNS must be exactly 6 bytes where a decoder reads it, before IDAT.
+    # After IDAT it is misplaced -- dropped whatever its size (ruling R28) -- and make_png's
+    # extra_chunks land after IDAT.
+    with pytest.raises(CorruptFileError, match="invalid tRNS"): H.parse(_png(2, 8, png_chunk(b"tRNS", b"\x00" * 35)))
+    [late] = [b for b in H.parse(make_png(extra_chunks=[png_chunk(b"tRNS", b"\x00" * 35)])).blocks if b.tag == "tRNS"]
+    assert (late.kind, late.removable, late.label) == (Kind.UNKNOWN, True, "Misplaced or repeated tRNS")
 
 def test_oversize_sbit_is_corrupt():
-    # default make_png() is colour type 2 (RGB): sBIT must be exactly 3 bytes.
-    bad = make_png(extra_chunks=[png_chunk(b"sBIT", b"\x00" * 35)])
-    with pytest.raises(CorruptFileError, match="invalid sBIT"): H.parse(bad)
+    # colour type 2 (RGB): sBIT must be exactly 3 bytes where a decoder reads it, before IDAT
+    # (and PLTE); after IDAT it is misplaced and dropped, as for tRNS (ruling R28).
+    with pytest.raises(CorruptFileError, match="invalid sBIT"): H.parse(_png(2, 8, png_chunk(b"sBIT", b"\x00" * 35)))
+    [late] = [b for b in H.parse(make_png(extra_chunks=[png_chunk(b"sBIT", b"\x00" * 35)])).blocks if b.tag == "sBIT"]
+    assert (late.kind, late.removable, late.label) == (Kind.UNKNOWN, True, "Misplaced or repeated sBIT")
 
 # ---------------------------------------------------------------------------
 # Final-review fix wave. Ruling R19 (C3, I2): a palette image needs exactly
@@ -251,3 +256,100 @@ def test_invalid_iccp_is_dropped(case):
     [iccp] = [b for b in H.parse(data).blocks if b.tag == "iCCP"]
     assert (iccp.kind, iccp.removable, iccp.label, iccp.findings) == (Kind.UNKNOWN, True, "Invalid ICC profile", [])
     assert clean_bytes(data) == _png(2, 8)
+
+# ---------------------------------------------------------------------------
+# Residual round. Rulings R25/R28 (I1 variant): the chunks the PNG spec (3rd
+# edition) allows once -- gAMA/cHRM/sRGB/iCCP/cICP/mDCV/cLLI/sBIT before PLTE
+# and IDAT, tRNS after PLTE and before IDAT, pHYs before IDAT -- keep only
+# their first instance in a legal position; every repeat and every misplaced
+# one is a removable UNKNOWN block. Ruling R24: one eXIf per file.
+# ---------------------------------------------------------------------------
+
+E, U = Kind.ESSENTIAL, Kind.UNKNOWN
+_TEXT = b"owner=Felipe Floriani; phone=+55 11 91234-5678 " * 2
+
+ONCE_ONLY = {  # type -> a payload valid in the 16x16 RGB8 image `_png(2, 8, ...)` builds
+    b"gAMA": struct.pack(">I", 45455),
+    b"cHRM": struct.pack(">8I", 31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000),
+    b"sRGB": b"\x00",
+    b"iCCP": b"icc\x00\x00" + zlib.compress(PROFILE),
+    b"cICP": bytes([1, 13, 0, 1]),
+    b"mDCV": bytes(24),
+    b"cLLI": bytes(8),
+    b"sBIT": b"\x08\x08\x08",
+    b"pHYs": struct.pack(">IIB", 2835, 2835, 1),
+    b"tRNS": bytes(6),
+}
+ESSENTIAL_ONCE_ONLY = (b"sBIT", b"tRNS")
+BEFORE_PLTE = sorted(set(ONCE_ONLY) - {b"pHYs", b"tRNS"})
+
+def _another(ctype):
+    """A second instance of `ctype` as valid as the first: text of the same size, or another valid profile."""
+    if ctype == b"iCCP":
+        return b"icc\x00\x00" + zlib.compress(make_icc("Felipe Floriani", 4))
+    return _TEXT[: len(ONCE_ONLY[ctype])]
+
+def _dropped(ctype, payload):
+    """What a repeated or misplaced chunk parses to: a removable UNKNOWN block naming it."""
+    label = f"Misplaced or repeated {ctype.decode()}"
+    return (Kind.UNKNOWN, True, label, [Finding(C.UNKNOWN, label, None, ctype.decode(), len(payload))])
+
+def _as_block(block):
+    return (block.kind, block.removable, block.label, block.findings)
+
+@pytest.mark.parametrize("ctype", sorted(ONCE_ONLY), ids=lambda t: t.decode())
+def test_repeated_once_only_chunk_keeps_its_first_instance(ctype):
+    first, repeat = png_chunk(ctype, ONCE_ONLY[ctype]), png_chunk(ctype, _another(ctype))
+    data = _png(2, 8, first, repeat)
+    kept, extra = [b for b in H.parse(data).blocks if b.tag == ctype.decode()]
+    assert kept.kind is (E if ctype in ESSENTIAL_ONCE_ONLY else Kind.METADATA)
+    assert _as_block(extra) == _dropped(ctype, _another(ctype))
+    rewritten = png_chunk(b"iCCP", b"ICC profile" + ONCE_ONLY[b"iCCP"][3:]) if ctype == b"iCCP" else first
+    assert clean_bytes(data, Mode.PRIVACY) == _png(2, 8, rewritten)
+    assert clean_bytes(data, Mode.MAXIMUM) == (_png(2, 8, first) if ctype in ESSENTIAL_ONCE_ONLY else _png(2, 8))
+
+@pytest.mark.parametrize("ctype", sorted(ONCE_ONLY), ids=lambda t: t.decode())
+def test_once_only_chunk_after_idat_is_dropped(ctype):
+    data = _png(2, 8, idat=IDAT_16 + png_chunk(ctype, ONCE_ONLY[ctype]))
+    [block] = [b for b in H.parse(data).blocks if b.tag == ctype.decode()]
+    assert _as_block(block) == _dropped(ctype, ONCE_ONLY[ctype])
+    assert clean_bytes(data, Mode.PRIVACY) == _png(2, 8)
+
+@pytest.mark.parametrize("ctype", BEFORE_PLTE, ids=lambda t: t.decode())
+def test_once_only_chunk_after_plte_is_dropped(ctype):
+    data = _png(3, 8, _palette(16), png_chunk(ctype, ONCE_ONLY[ctype]))  # sBIT is 3 bytes in a palette image too
+    [block] = [b for b in H.parse(data).blocks if b.tag == ctype.decode()]
+    assert _as_block(block) == _dropped(ctype, ONCE_ONLY[ctype])
+    assert clean_bytes(data, Mode.PRIVACY) == _png(3, 8, _palette(16))
+
+def test_phys_after_plte_is_in_place():
+    phys = png_chunk(b"pHYs", ONCE_ONLY[b"pHYs"])
+    data = _png(3, 8, _palette(16), phys)
+    assert layout(data) == [("IHDR", E, True), ("PLTE", E, True), ("pHYs", Kind.METADATA, True),
+                            ("IDAT", E, True), ("IEND", E, True)]
+    assert clean_bytes(data, Mode.PRIVACY) == data
+
+def test_trns_before_the_palette_is_dropped_and_the_next_one_kept():
+    early, late = png_chunk(b"tRNS", b"\x00"), png_chunk(b"tRNS", b"\x00\x80")
+    data = _png(3, 8, early, _palette(16), late)
+    assert layout(data) == [("IHDR", E, True), ("tRNS", U, True), ("PLTE", E, True), ("tRNS", E, True),
+                            ("IDAT", E, True), ("IEND", E, True)]
+    assert clean_bytes(data, Mode.MAXIMUM) == _png(3, 8, _palette(16), late)
+
+def test_a_suggested_palette_still_sets_the_chunk_order():
+    trns, gama = png_chunk(b"tRNS", ONCE_ONLY[b"tRNS"]), png_chunk(b"gAMA", ONCE_ONLY[b"gAMA"])
+    before = _png(2, 8, trns, _palette(16), gama)  # tRNS before PLTE, gAMA after it: both out of place
+    assert layout(before) == [("IHDR", E, True), ("tRNS", U, True), ("PLTE", U, True), ("gAMA", U, True),
+                              ("IDAT", E, True), ("IEND", E, True)]
+    assert clean_bytes(before, Mode.PRIVACY) == _png(2, 8)
+    after = _png(2, 8, gama, _palette(16), trns)  # both in place; the suggested palette itself is dropped
+    assert clean_bytes(after, Mode.PRIVACY) == _png(2, 8, gama, trns)
+
+def test_second_exif_chunk_is_dropped():  # ruling R24
+    tiffs = [tiff_header() + tiff_ifd([(0x0112, 3, 1, struct.pack(">HH", v, 0))]) for v in (6, 3)]
+    data = _png(2, 8, idat=IDAT_16 + png_chunk(b"eXIf", tiffs[0]) + png_chunk(b"eXIf", tiffs[1]))
+    first, extra = [b for b in H.parse(data).blocks if b.tag == "eXIf"]
+    assert (first.kind, first.rewritable, [f.detail for f in first.findings]) == (Kind.METADATA, True, ["6"])
+    label = "Extra EXIF block"
+    assert _as_block(extra) == (Kind.UNKNOWN, True, label, [Finding(C.UNKNOWN, label, None, "eXIf", len(tiffs[1]))])
+    assert clean_bytes(data, Mode.PRIVACY) == _png(2, 8, idat=IDAT_16 + png_chunk(b"eXIf", tiffs[0]))
