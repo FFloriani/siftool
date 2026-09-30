@@ -6,7 +6,7 @@ from siftool.model import Category as C, Kind, Mode
 from siftool.planner import plan_container
 from siftool.formats.webp import WebpHandler, VP8X_ICC, VP8X_EXIF, VP8X_XMP, VP8X_ANIM
 from siftool.errors import CorruptFileError
-from fixtures.make_fixtures import make_webp, riff_chunks, decode_pixels, make_icc, write
+from fixtures.make_fixtures import make_webp, riff_chunks, decode_pixels, make_icc, tiff_header, tiff_ifd, write
 
 H = WebpHandler()
 def clean_bytes(data, mode=Mode.PRIVACY):
@@ -268,3 +268,42 @@ def test_every_webp_finding_says_where_it_is():  # review M2 ("check PNG/WEBP to
     blocks = H.parse(make_webp("lossless", trailing=b"tail")).blocks
     assert {b.tag for b in blocks if b.findings} == {"ICCP", "EXIF", "XMP", "C2PA", "TRAILING"}
     assert all(f.where.startswith(b.tag) for b in blocks for f in b.findings)
+
+# ---------------------------------------------------------------------------
+# Residual round. Ruling R24: one EXIF block per file; ruling R26: one ICC
+# profile per file. The first EXIF/ICCP chunk keeps its classification;
+# every later one is a removable UNKNOWN block, dropped, and the VP8X flags
+# follow what is left.
+# ---------------------------------------------------------------------------
+
+def _still(*chunks, flags=0):
+    return _riff(_chunk(b"VP8X", _vp8x(flags)) + b"".join(chunks))
+
+def test_only_the_first_exif_chunk_is_the_exif_block():
+    tiffs = [tiff_header() + tiff_ifd([(0x0112, 3, 1, struct.pack(">HH", v, 0))]) for v in (6, 3)]
+    data = _still(_chunk(b"VP8L", VP8L), _chunk(b"EXIF", tiffs[0]), _chunk(b"EXIF", tiffs[1]), flags=VP8X_EXIF)
+    first, extra = [b for b in H.parse(data).blocks if b.tag == "EXIF"]
+    assert (first.kind, first.rewritable, [f.detail for f in first.findings]) == (Kind.METADATA, True, ["6"])
+    label = "Extra EXIF block"
+    assert (extra.kind, extra.removable, extra.label, extra.findings) == (
+        U, True, label, [Finding(C.UNKNOWN, label, None, "EXIF", len(tiffs[1]))])
+    assert clean_bytes(data, Mode.PRIVACY) == _still(_chunk(b"VP8L", VP8L), _chunk(b"EXIF", tiffs[0]), flags=VP8X_EXIF)
+    assert clean_bytes(data, Mode.MAXIMUM) == _still(_chunk(b"VP8L", VP8L))
+
+def test_only_the_first_iccp_chunk_is_kept():
+    first, other = make_icc("Display P3", 4), make_icc("Felipe Floriani", 4)
+    data = _still(_chunk(b"ICCP", first), _chunk(b"ICCP", other), _chunk(b"VP8L", VP8L), flags=VP8X_ICC)
+    kept, extra = [b for b in H.parse(data).blocks if b.tag == "ICCP"]
+    assert (kept.kind, kept.label) == (Kind.METADATA, "ICC color profile")
+    label = "Extra ICC profile"
+    assert (extra.kind, extra.removable, extra.label, extra.findings) == (
+        U, True, label, [Finding(C.UNKNOWN, label, None, "ICCP", len(other))])
+    assert clean_bytes(data, Mode.PRIVACY) == _still(_chunk(b"ICCP", first), _chunk(b"VP8L", VP8L), flags=VP8X_ICC)
+    assert clean_bytes(data, Mode.MAXIMUM) == _still(_chunk(b"VP8L", VP8L))
+
+def test_a_later_iccp_chunk_never_stands_in_for_an_invalid_first_one():
+    data = _still(_chunk(b"ICCP", b"not a profile"), _chunk(b"ICCP", make_icc("Display P3", 4)), _chunk(b"VP8L", VP8L),
+                  flags=VP8X_ICC)
+    assert [(b.kind, b.label) for b in H.parse(data).blocks if b.tag == "ICCP"] == [
+        (U, "Invalid ICC profile"), (U, "Extra ICC profile")]
+    assert clean_bytes(data, Mode.PRIVACY) == _still(_chunk(b"VP8L", VP8L))

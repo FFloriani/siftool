@@ -687,3 +687,32 @@ def test_second_jpeg_icc_profile_is_dropped(tmp_path):
     second = _segment(0xE2, b"ICC_PROFILE\x00\x01\x01" + _icc_desc("owner=Felipe Floriani"))
     res, out = _clean(tmp_path, _jpeg_after_soi(first + second), ".jpg", Mode.PRIVACY)
     assert res.verdict.status is Status.VERIFIED and out == _jpeg_after_soi(first)
+
+
+# ---------------------------------------------------------------------------
+# WEBP: only the first EXIF (R24) and the first ICCP (R26) chunk are kept,
+# and the VP8X flags follow.
+# ---------------------------------------------------------------------------
+
+
+def _with_size_field(profile: bytes) -> bytes:
+    """`profile` with its ICC header size field set to its real length."""
+    return struct.pack(">I", len(profile)) + profile[4:]
+
+
+def test_second_webp_iccp_is_dropped(tmp_path):  # rr_attack W5
+    good = _icc_desc("Display P3")
+    slack = _with_size_field(good + QUIET_SECRET)
+    data = _riff(_riff_chunk(b"VP8X", _vp8x(0x20)) + _riff_chunk(b"ICCP", good) + _riff_chunk(b"ICCP", slack)
+                 + _riff_chunk(b"VP8L", _vp8l()))
+    res, out = _clean(tmp_path, data, ".webp", Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED
+    assert out == _riff(_riff_chunk(b"VP8X", _vp8x(0x20)) + _riff_chunk(b"ICCP", good) + _riff_chunk(b"VP8L", _vp8l()))
+
+
+def test_second_webp_exif_chunk_is_dropped(tmp_path):
+    first, second = _single_tag_tiff(QUIET_SECRET[:8]), _single_tag_tiff(QUIET_SECRET[8:16])
+    head = _riff_chunk(b"VP8X", _vp8x(0x08)) + _riff_chunk(b"VP8L", _vp8l())
+    res, out = _clean(tmp_path, _riff(head + _riff_chunk(b"EXIF", first) + _riff_chunk(b"EXIF", second)), ".webp",
+                      Mode.PRIVACY)
+    assert res.verdict.status is Status.VERIFIED and out == _riff(head + _riff_chunk(b"EXIF", first))

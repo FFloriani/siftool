@@ -64,7 +64,11 @@ and R19):
 An `ICCP` is kept as `appearance` only if it is a structurally valid ICC
 profile (`icc_profile_valid`, ruling R20); otherwise it is a removable
 `UNKNOWN` block ("Invalid ICC profile"), dropped with the image's broken
-profile.
+profile. A file holds one EXIF block and one ICC profile: only the first
+`EXIF` and the first `ICCP` are classified as above, and every later one is
+a removable `UNKNOWN` block ("Extra EXIF block", ruling R24; "Extra ICC
+profile", ruling R26), dropped in every mode -- even when the first `ICCP`
+was itself invalid -- so the VP8X flags follow the one kept.
 
 Robustness is a hard requirement, same as every other handler: a
 truncated chunk header, a chunk whose declared size runs past the RIFF's
@@ -125,6 +129,10 @@ _ANMF_FRAME_LAYOUTS = frozenset({(b"VP8 ",), (b"ALPH", b"VP8 "), (b"VP8L",)})
 
 # tag (space-stripped) -> the VP8X bit it controls, for recomputing flags.
 _FLAG_BY_TAG: dict[str, int] = {"ICCP": VP8X_ICC, "EXIF": VP8X_EXIF, "XMP": VP8X_XMP}
+
+# Metadata chunks a file holds at most once (rulings R24, R26): every one
+# after the first is a removable UNKNOWN block under this label, dropped.
+_EXTRA_LABELS: dict[bytes, str] = {b"EXIF": "Extra EXIF block", b"ICCP": "Extra ICC profile"}
 
 
 class WebpHandler:
@@ -278,12 +286,17 @@ def _classify_chunks(chunks: list[tuple[Span, bytes, bytes]], animated: bool) ->
     its alpha plane only when it comes immediately before it and it is a
     `VP8 `; in an animation the image is the `ANMF` frames (`_anmf_valid`,
     else `_demoted_anmf`). Every other bitstream/`ALPH`/`ANMF` becomes a
-    removable "Unused" block (`_unused`). Raises `CorruptFileError("missing
-    image data")` when a still image has no bitstream or an animation no
-    `ANMF` at all.
+    removable "Unused" block (`_unused`). Only the first `EXIF` and the
+    first `ICCP` are classified as metadata; every later one is a
+    removable `UNKNOWN` block with a finding naming it (`_extra`: "Extra
+    EXIF block", ruling R24; "Extra ICC profile", ruling R26), dropped in
+    every mode -- so the VP8X flags `write` recomputes follow the one
+    kept. Raises `CorruptFileError("missing image data")` when a still
+    image has no bitstream or an animation no `ANMF` at all.
     """
     blocks: list[Block] = []
     have_bitstream = False
+    seen_once: set[bytes] = set()  # EXIF/ICCP already classified: a file has one of each
     for i, (span, fourcc, payload) in enumerate(chunks):
         if fourcc in _BITSTREAMS:
             trusted = not animated and not have_bitstream
@@ -302,7 +315,11 @@ def _classify_chunks(chunks: list[tuple[Span, bytes, bytes]], animated: bool) ->
                 blocks.append(_demoted_anmf(span, payload))
         elif fourcc in _ESSENTIAL_TYPES:  # VP8X, ANIM: checked by _read_raw_chunks
             blocks.append(_essential(span, fourcc))
+        elif fourcc in seen_once:
+            blocks.append(_extra(span, fourcc, payload))
         else:
+            if fourcc in _EXTRA_LABELS:
+                seen_once.add(fourcc)
             blocks.append(_classify_metadata(span, fourcc, payload))
 
     has_image = any(fourcc == b"ANMF" for _, fourcc, _ in chunks) if animated else have_bitstream
@@ -319,6 +336,20 @@ def _unused(span: Span, fourcc: bytes) -> Block:
     """A bitstream/`ALPH`/`ANMF` chunk no decoder uses where it sits: removable, so dropped."""
     tag = _tag(fourcc)
     return Block(Kind.UNKNOWN, span, f"Unused {tag} chunk", tag, removable=True)
+
+
+def _extra(span: Span, fourcc: bytes, payload: bytes) -> Block:
+    """An `EXIF`/`ICCP` after the file's first one (rulings R24, R26): removable, so dropped.
+
+    It keeps its tag and gets one finding naming it (`_EXTRA_LABELS`), so
+    reports show it; being dropped, it never sets a VP8X flag.
+    """
+    tag = _tag(fourcc)
+    label = _EXTRA_LABELS[fourcc]
+    return Block(
+        Kind.UNKNOWN, span, label, tag, findings=[Finding(Category.UNKNOWN, label, None, tag, len(payload))],
+        removable=True,
+    )
 
 
 def _anmf_valid(payload: bytes) -> bool:
