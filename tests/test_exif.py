@@ -263,6 +263,17 @@ def test_minimal_writer_keeps_standard_forms_and_is_a_fixed_point(order):
         assert build_minimal_exif(out, allowed) == out
 
 
+_STANDARD_BY_TAG = {t: (ty, n, v) for t, ty, n, v in STANDARD_ENTRIES}
+
+
+def _single_tag_tiff_in_home_ifd(tag, type_code, count, value):
+    """A TIFF with exactly one entry -- `(tag, type_code, count, value)` -- in `tag`'s real home IFD."""
+    entry = (tag, type_code, count, value)
+    if tag in _IFD0_TAG_SET:
+        return _ifd0_tiff([entry])
+    return _ifd0_and_exif_tiff([], [entry])
+
+
 NON_STANDARD = {
     "Orientation-ASCII": (0x0112, 2, 2, b"6\x00"),
     "Orientation-SHORTx2": (0x0112, 3, 2, struct.pack(">HH", 6, 6)),
@@ -287,10 +298,23 @@ NON_STANDARD = {
 
 @pytest.mark.parametrize("case", sorted(NON_STANDARD))
 def test_minimal_writer_drops_allowed_tag_in_non_standard_form(case):
-    tiff = _ifd0_tiff([NON_STANDARD[case]])
+    tag, type_code, count, value = NON_STANDARD[case]
+    tiff = _single_tag_tiff_in_home_ifd(tag, type_code, count, value)
     [finding] = parse_exif(tiff, "x")
     assert finding.category in PHOTOGRAPHER  # the reader does see an allowed tag...
     assert build_minimal_exif(tiff, PHOTOGRAPHER) is None  # ...that the writer never carries over
+
+    # Control: the same tag, in the same home IFD, in its real standard form,
+    # must be kept -- proving the "None" above is the form mismatch pinned by
+    # this case, not the tag's home IFD, its category, or some other
+    # unrelated reason (re-review: 7 of these 18 cases used to be vacuous,
+    # dropped by the home-IFD gate before the form check ever ran).
+    std_type, std_count, std_value = _STANDARD_BY_TAG[tag]
+    control_tiff = _single_tag_tiff_in_home_ifd(tag, std_type, std_count, std_value)
+    [control_finding] = parse_exif(control_tiff, "x")
+    control_out = build_minimal_exif(control_tiff, PHOTOGRAPHER)
+    assert control_out is not None
+    assert control_finding.label in {f.label for f in parse_exif(control_out, "x")}
 
 
 def test_minimal_writer_keeps_ascii_only_up_to_its_first_nul():
