@@ -18,6 +18,7 @@ from fixtures.make_fixtures import make_jpeg, make_png, write
 from siftool.errors import (
     CorruptFileError,
     DestinationExistsError,
+    UnsafeFileError,
     UnsupportedFormatError,
     VerificationFailedError,
 )
@@ -37,7 +38,7 @@ from siftool_gui.model import (
     RowKind,
     Summary,
 )
-from siftool_gui.presentation import CATEGORY_ORDER, Outcome, category_name, category_value
+from siftool_gui.presentation import CATEGORY_ORDER, Outcome, category_name, category_value, summary_text
 
 
 def _children(model: FileListModel, parent: QModelIndex) -> list[QModelIndex]:
@@ -406,18 +407,53 @@ def test_summary_counts_and_signal(model, qtbot, tmp_path):
     model.apply_result(c, _clean_result(paths[2], Status.VERIFIED, []))
 
     assert model.summary() == Summary(total=7, with_findings=3, unsupported=1, errors=1, cleanable=2,
-                                      verified=1, warnings=0, failed=0, busy=2)
+                                      verified=1, warnings=0, failed=0, busy=2, problems=1)
     assert model.cleanable_ids() == [a, b]
     assert summaries[-1] == model.summary()
 
     model.apply_clean_error(d, VerificationFailedError(Verdict(Status.FAILED, [C2PA], [])))
     model.apply_report(g, _report(paths[6], GPS))
     assert summaries[-1] == Summary(total=7, with_findings=4, unsupported=1, errors=1, cleanable=3,
-                                    verified=1, warnings=0, failed=1, busy=0)
+                                    verified=1, warnings=0, failed=1, busy=0, problems=1)
 
     count = len(summaries)
     model.set_mode(Mode.MAXIMUM)  # no count changes: no new emission
     assert len(summaries) == count
+
+
+def test_summary_counts_formats_that_are_coming_apart_from_problems(model, tmp_path):
+    # Final review: only HEIC and video are "ainda não suportada"; the other unsupported formats
+    # (txt, PDF, GIF...) and the files with an error are "com problema".
+    paths = [tmp_path / name for name in ("a.jpg", "b.heic", "c.mp4", "d.gif", "e.txt", "f.pdf", "g.png", "h.jpg")]
+    ids = model.add_paths(paths)
+    for entry_id in ids:
+        model.mark_analyzing(entry_id)
+    a, heic, mp4, gif, txt, pdf, corrupt, huge = ids
+    model.apply_report(a, _report(paths[0], GPS))
+    model.apply_analysis_error(heic, UnsupportedFormatError("HEIC"))
+    model.apply_analysis_error(mp4, UnsupportedFormatError("MP4/MOV"))
+    model.apply_analysis_error(gif, UnsupportedFormatError("GIF"))
+    model.apply_analysis_error(txt, UnsupportedFormatError(None))
+    model.apply_analysis_error(pdf, UnsupportedFormatError("PDF"))
+    model.apply_analysis_error(corrupt, CorruptFileError("bad"))
+    model.apply_analysis_error(huge, UnsafeFileError("file too large for an image"))
+
+    summary = model.summary()
+    assert summary.unsupported == 2  # HEIC and MP4/MOV
+    assert summary.errors == 2  # the corrupt file and the huge one
+    assert summary.problems == 5  # ... plus GIF, txt and PDF, which are "Formato não suportado"
+    assert summary.total == 8 and summary.with_findings == 1 and summary.cleanable == 1
+    assert summary_text(summary.total, summary.with_findings, summary.unsupported, summary.problems) == (
+        "8 fotos · 1 com informação escondida · 2 ainda não suportadas · 5 com problemas"
+    )
+
+    summaries: list[Summary] = []
+    model.summaryChanged.connect(summaries.append)
+    model.remove_entry(gif)  # a row that goes leaves the counts
+    model.remove_entry(mp4)
+    assert (summaries[-1].unsupported, summaries[-1].problems) == (1, 4)
+    model.clear_entries()
+    assert model.summary() == Summary(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 def test_revert_dropped(model, tmp_path):

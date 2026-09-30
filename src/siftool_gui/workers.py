@@ -29,9 +29,11 @@ Threading contract:
   dropped -- never both, never neither. `jobDropped` names the dropped
   `analyze`/`clean` jobs (their entries must go back to their previous
   state); a dropped thumbnail has nothing to revert and is dropped
-  silently. Scans are stopped too: a pending scan is dropped and a running
-  one delivers no further batch; either way, every `scan()` call ends with
-  exactly one `scanFinished`.
+  silently. Scans are ended too: a pending scan is dropped, and a running
+  walk -- which cannot be interrupted, and on a big folder takes minutes --
+  is told to stop and reported finished at once, its later batches and its
+  own finish ignored; either way, every `scan()` call ends with exactly one
+  `scanFinished`.
 
 The runner must be created, used and destroyed in the GUI thread.
 """
@@ -49,10 +51,12 @@ from PySide6.QtGui import QImage, QImageReader
 
 import siftool
 from siftool.batch import iter_inputs
+from siftool.detect import detect
 from siftool.model import Mode
 
 SCAN_BATCH_SIZE = 200
 THUMBNAIL_SIZE = 96
+HEAD_BYTES = 64  # how much of a file the analysis reads to tell its format apart (`detect` needs 12)
 
 # QThreadPool runs higher priorities first. Scans only walk folders and feed
 # the list, so they jump the queue; thumbnails wait for the real work.
@@ -168,6 +172,7 @@ class _Job(QRunnable):
 
 def _scan_work(paths: list[str]) -> Callable[[_Job], tuple[bool, object]]:
     def work(job: _Job) -> tuple[bool, object]:
+        total = 0  # how many files the walk found: what `JobRunner.scanEmpty` is about
         for raw in paths:
             if job.stop_requested:
                 break
@@ -175,18 +180,40 @@ def _scan_work(paths: list[str]) -> Callable[[_Job], tuple[bool, object]]:
                 found = [str(path) for path in iter_inputs([raw])]
             except Exception:  # an unreadable folder adds nothing; the other inputs still count
                 continue
+            total += len(found)
             for start in range(0, len(found), SCAN_BATCH_SIZE):
                 if job.stop_requested:
                     break
                 job.post("batch", found[start : start + SCAN_BATCH_SIZE])
-        return True, None
+        return True, total
 
     return work
+
+
+def _read_head(path: Path) -> bytes:
+    """The first `HEAD_BYTES` bytes of `path`; empty when the file is empty or cannot be opened.
+
+    An unreadable file is not reported here: `siftool.inspect` meets the
+    same error reading the file and reports it in its own words.
+    """
+    try:
+        with open(path, "rb") as file:
+            return file.read(HEAD_BYTES)
+    except OSError:
+        return b""
 
 
 def _analyze_work(path: Path) -> Callable[[_Job], tuple[bool, object]]:
     def work(job: _Job) -> tuple[bool, object]:
         try:
+            # The engine checks its 512 MB cap *before* it detects the format, and reads the whole
+            # file even to refuse it: a big video would say "too big" (spec 3, criterion 3) and every
+            # video would sit in memory first. So the format is named from the first bytes; a known
+            # one the engine cannot clean raises `UnsupportedFormatError` here, and the file is never
+            # read whole. Empty and unreadable files go through the engine, which has words for them.
+            head = _read_head(path)
+            if head:
+                detect(head)
             return True, siftool.inspect(path)  # looked up at call time: tests slow it down
         except Exception as exc:
             return False, _detached(exc)
@@ -222,6 +249,7 @@ class JobRunner(QObject):
     """
 
     pathsFound = Signal(list)  # list[str], batches of at most SCAN_BATCH_SIZE
+    scanEmpty = Signal()  # a walk that reached its end without finding a file; right before its `scanFinished`
     scanFinished = Signal()
     analyzed = Signal(int, object)  # entry_id, Report
     analysisFailed = Signal(int, object)  # entry_id, exception
@@ -229,7 +257,7 @@ class JobRunner(QObject):
     cleaned = Signal(int, object)  # entry_id, CleanResult
     cleanFailed = Signal(int, object)  # entry_id, exception
     jobDropped = Signal(int, str)  # entry_id, "analyze" | "clean" (cancelled before starting)
-    idle = Signal()  # nothing pending or running any more
+    idle = Signal()  # nothing pending or running any more (bar a cancelled walk still unwinding in its thread)
 
     def __init__(self, parent: QObject | None = None, max_workers: int | None = None) -> None:
         super().__init__(parent)
@@ -246,7 +274,11 @@ class JobRunner(QObject):
     # -- submitting ---------------------------------------------------------
 
     def scan(self, paths: list[str]) -> None:
-        """Walk `paths` (`siftool.batch.iter_inputs`); report files via `pathsFound`, then `scanFinished`."""
+        """Walk `paths` (`siftool.batch.iter_inputs`); report files via `pathsFound`, then `scanFinished`.
+
+        A walk that finds no file at all -- and was not cancelled -- also
+        reports `scanEmpty`, just before `scanFinished`.
+        """
         self._submit(_SCAN, None, _scan_work([str(path) for path in paths]), _PRIORITY_SCAN)
 
     def analyze(self, entry_id: int, path: Path) -> None:
@@ -269,27 +301,33 @@ class JobRunner(QObject):
     # -- control ------------------------------------------------------------
 
     def cancel(self) -> None:
-        """Drop every job not started yet; running jobs finish (and still report).
+        """Drop every job not started yet and end every scan; other running jobs finish (and still report).
 
         Emits `jobDropped(entry_id, kind)` for each dropped `analyze`/`clean`
-        job, in submission order, and `scanFinished` for each dropped scan;
-        a running scan delivers no further batch. Then `idle` if nothing is
-        left running.
+        job and `scanFinished` for each scan, in submission order -- a scan
+        that never started and a walk that is running alike. Then `idle` if
+        nothing else is left running.
+
+        A running walk cannot be interrupted (listing a big folder takes
+        minutes), so it is told to stop *and* reported finished right away,
+        and forgotten: its thread may keep going for a while, and what it
+        still posts -- batches, its own finish -- is ignored.
         """
-        dropped: list[_Job] = []
+        ended: list[_Job] = []  # dropped before they started, and the walks that are running
         with self._lock:
             for job in self._jobs.values():
                 if job.state == _PENDING:
                     job.state = _DROPPED
-                    dropped.append(job)
+                    ended.append(job)
                 elif job.kind == _SCAN:
                     job.stop_requested = True
+                    ended.append(job)
         self._pool.clear()  # frees the queue; a job a thread took meanwhile sees _DROPPED and returns
 
         was_busy = bool(self._jobs)
-        for job in dropped:
+        for job in ended:
             del self._jobs[job.serial]
-        for job in dropped:
+        for job in ended:
             if job.kind in (_ANALYZE, _CLEAN):
                 self.jobDropped.emit(job.entry_id, job.kind)
             elif job.kind == _SCAN:
@@ -298,7 +336,10 @@ class JobRunner(QObject):
             self.idle.emit()
 
     def busy(self) -> bool:
-        """Whether any job is pending or running (as last reported to the GUI thread)."""
+        """Whether any job is pending or running (as last reported to the GUI thread).
+
+        A walk that `cancel()` ended no longer counts; `wait_for_done` still waits for its thread.
+        """
         return bool(self._jobs)
 
     def max_workers(self) -> int:
@@ -319,17 +360,18 @@ class JobRunner(QObject):
     def _on_event(self, event: tuple[int, str, object]) -> None:
         serial, name, payload = event
         job = self._jobs.get(serial)
-        if job is None:  # pragma: no cover -- a job only posts while it is still registered
+        if job is None:  # a walk `cancel()` already reported finished: what it still posts goes nowhere
             return
 
         if name == "batch":
-            if not job.stop_requested:
-                self.pathsFound.emit(payload)
+            self.pathsFound.emit(payload)
             return
 
         del self._jobs[serial]
         ok, value = payload
         if job.kind == _SCAN:
+            if ok and value == 0:  # walked to the end and found nothing (a cancelled walk never gets here)
+                self.scanEmpty.emit()
             self.scanFinished.emit()
         elif job.kind == _ANALYZE:
             (self.analyzed if ok else self.analysisFailed).emit(job.entry_id, value)

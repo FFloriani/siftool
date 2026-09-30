@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 from qfluentwidgets import FluentIcon, InfoBar, InfoBarIcon, InfoBarPosition, PushButton
 
 import siftool
@@ -33,6 +33,7 @@ from siftool_gui.workers import JobRunner
 
 TIMEOUT = 10_000  # ms
 FOLDER_MESSAGE = "A pasta escolhida para salvar as cópias não está disponível. Escolha outra em Configurações."
+NO_PHOTOS_MESSAGE = "Nenhuma foto encontrada nesta pasta."
 
 
 class _SlowClean:
@@ -286,7 +287,8 @@ def test_accented_names_clean_and_reveal(page, qtbot, settle, photos, monkeypatc
     assert copy.exists()
     page.reveal(_id_of(page, src.name))
     assert revealed == [copy]
-    assert shell.explorer_select_command(copy) == f'explorer /select,"{copy}"'
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    assert shell.explorer_select_command(copy) == f'"C:\\Windows\\explorer.exe" /select,"{copy}"'
 
 
 # -- progress and cancel ------------------------------------------------------------
@@ -443,6 +445,36 @@ def test_batch_finished_counts_and_one_message(page, qtbot, settle, photos, monk
     assert bar.icon == InfoBarIcon.WARNING
     assert bar.content == done_text(0, 0, 1) + " — clique na linha para ver o motivo."
     assert _open_folder_buttons(bar) == []
+
+
+def _failing_jpeg() -> bytes:
+    """A photo whose copy cannot be verified: a C2PA-looking payload in a reserved segment."""
+    return make_jpeg(reserved_marker=True, reserved_payload=b"has c2pa inside")
+
+
+def test_two_photos_that_did_not_clean_read_in_the_plural(page, qtbot, settle, photos):
+    # Final review: the message after the batch said "... · 2 não limpou".
+    sources = [write(photos, "a.jpg", make_jpeg()), write(photos, "c2pa1.jpg", _failing_jpeg()),
+               write(photos, "c2pa2.jpg", _failing_jpeg())]
+    _analyze(page, settle, sources)
+
+    assert _clean(qtbot, page) == (1, 0, 2)
+
+    (bar,) = _bars(page)
+    assert bar.icon == InfoBarIcon.WARNING
+    assert bar.content == "1 foto limpa e verificada · 2 não limparam — clique em cada linha para ver o motivo."
+
+
+def test_a_batch_where_nothing_cleaned_leaves_out_the_zero_parts(page, qtbot, settle, photos):
+    # ... and with no verified photo there is no "0 fotos limpas e verificadas" part either.
+    sources = [write(photos, f"c2pa{number}.jpg", _failing_jpeg()) for number in (1, 2)]
+    _analyze(page, settle, sources)
+
+    assert _clean(qtbot, page) == (0, 0, 2)
+
+    (bar,) = _bars(page)
+    assert bar.content == "2 não limparam — clique em cada linha para ver o motivo."
+    assert _open_folder_buttons(bar) == []  # nothing was saved: no folder to open
 
 
 # -- the row menu and keyboard ----------------------------------------------------------
@@ -657,3 +689,90 @@ def test_open_folder_that_vanished_says_so(page, qtbot, settle, photos, monkeypa
     (message,) = _bars(page)
     assert (message.icon, message.title, message.content) == (
         InfoBarIcon.ERROR, "Pasta indisponível", "A pasta foi movida ou apagada.")
+
+
+# -- a dropped folder without photos --------------------------------------------------------
+
+
+def _folder_without_photos(tmp_path, name: str = "vazia") -> Path:
+    folder = tmp_path / name
+    folder.mkdir()
+    write(folder, "notas.txt", b"not a photo")  # walked past: not a supported file
+    return folder
+
+
+def _messages(page) -> list[str]:
+    return [bar.content for bar in _bars(page)]
+
+
+def test_a_folder_without_photos_says_so(page, qtbot, settle, tmp_path):
+    # Final review: a dropped folder without a single supported file added nothing, in silence.
+    page.add_paths([str(_folder_without_photos(tmp_path))])
+    settle(page, 0)
+
+    (bar,) = _bars(page)
+    assert bar.icon == InfoBarIcon.INFORMATION  # info style: nothing went wrong
+    assert bar.content == NO_PHOTOS_MESSAGE
+    assert page.model.entry_ids() == []
+    assert not page.progress_bar.isVisibleTo(page)  # the walk is over
+
+
+def test_folders_without_photos_keep_one_message(page, qtbot, settle, tmp_path):
+    first, second = _folder_without_photos(tmp_path, "um"), _folder_without_photos(tmp_path, "dois")
+
+    page.add_paths([str(first), str(second)])  # one walk over two empty folders
+    settle(page, 0)
+    assert _messages(page) == [NO_PHOTOS_MESSAGE]
+
+    page.add_paths([str(first)])  # the next drop finds nothing either: the message is replaced, not stacked
+    settle(page, 0)
+    qtbot.waitUntil(lambda: len(_bars(page)) == 1, timeout=TIMEOUT)
+    assert _messages(page) == [NO_PHOTOS_MESSAGE]
+
+
+def test_the_no_photos_message_goes_with_the_next_action(page, qtbot, settle, photos, tmp_path):
+    empty = _folder_without_photos(tmp_path)
+    jpg = write(photos, "a.jpg", make_jpeg())
+
+    def dropped_the_empty_folder() -> None:
+        page.add_paths([str(empty)])
+        settle(page, len(page.model.entry_ids()))
+        qtbot.waitUntil(lambda: _messages(page) == [NO_PHOTOS_MESSAGE], timeout=TIMEOUT)
+
+    dropped_the_empty_folder()
+    page.add_paths([str(jpg)])  # adding photos: the message was about the last drop
+    settle(page, 1)
+    qtbot.waitUntil(lambda: _bars(page) == [], timeout=TIMEOUT)
+
+    dropped_the_empty_folder()
+    assert _clean(qtbot, page) == (1, 0, 0)  # cleaning: replaced by the batch's own message
+    qtbot.waitUntil(lambda: [bar.title for bar in _bars(page)] == ["Pronto"], timeout=TIMEOUT)
+
+    dropped_the_empty_folder()
+    page.clear_list()  # emptying the list
+    qtbot.waitUntil(lambda: _bars(page) == [], timeout=TIMEOUT)
+
+
+def test_a_folder_whose_photos_are_all_listed_already_is_not_empty(page, qtbot, settle, photos):
+    write(photos, "a.jpg", make_jpeg())
+    page.add_paths([str(photos)])
+    settle(page, 1)
+
+    page.add_paths([str(photos)])  # the same folder again: what it holds is in the list already
+    settle(page, 1)
+
+    assert _bars(page) == []
+
+
+def test_cancelling_the_walk_of_a_folder_does_not_say_it_has_no_photos(make_page, slow_walk, qtbot, tmp_path):
+    page = make_page()
+    page.add_paths([str(_folder_without_photos(tmp_path))])
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+
+    page.cancel()  # stopped, not "found nothing"
+    slow_walk.release.set()
+    assert page.runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+    qtbot.waitUntil(lambda: not page.busy(), timeout=TIMEOUT)
+
+    assert _bars(page) == []

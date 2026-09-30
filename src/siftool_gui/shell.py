@@ -9,6 +9,11 @@ unless the path is quoted -- and real photo names carry commas
 ("26 de set. de 2026, 03_30_37.png") -- so the whole path goes between
 double quotes. A Windows path cannot contain a double quote, so the
 quoting cannot be broken out of.
+
+Explorer itself is started by its full path, from `%SystemRoot%`: a bare
+`explorer` makes Windows search the current folder before the system
+ones, and a program that opens the folders of other people's photos is
+just where a planted `explorer.exe` would sit.
 """
 
 from __future__ import annotations
@@ -19,9 +24,14 @@ import subprocess
 from pathlib import Path
 
 
+def explorer_executable() -> str:
+    """The full path of Explorer, `%SystemRoot%\\explorer.exe` (`C:\\Windows` when the variable is missing)."""
+    return ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+
+
 def explorer_select_command(path: Path) -> str:
-    """`explorer /select,"<absolute path>"`, the whole path quoted (commas and spaces included)."""
-    return f'explorer /select,"{ntpath.abspath(str(path))}"'
+    """`"<Explorer's full path>" /select,"<absolute path>"`: both quoted (commas and spaces included)."""
+    return f'"{explorer_executable()}" /select,"{ntpath.abspath(str(path))}"'
 
 
 def reveal_in_explorer(path: Path) -> None:

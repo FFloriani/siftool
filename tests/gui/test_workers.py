@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -80,6 +81,64 @@ def test_scan_emits_batches_of_at_most_200(make_runner, qtbot, tmp_path):
     assert [len(batch) for batch in batches] == [200, 200, 50]
 
 
+def test_scan_reports_a_walk_that_found_no_file(make_runner, monkeypatch, qtbot, tmp_path):
+    # Final review: a dropped folder without a single supported file added nothing, in silence.
+    def folder(name: str, files: dict[str, bytes] | None = None) -> str:
+        path = tmp_path / name
+        path.mkdir()
+        for file_name, data in (files or {}).items():
+            write(path, file_name, data)
+        return str(path)
+
+    nothing = folder("vazia")
+    only_text = folder("textos", {"note.txt": b"not an image"})
+    only_outputs = folder("saidas", {"a_clean.jpg": make_jpeg()})  # a previous run's own copies are skipped
+    photos = folder("fotos", {"a.jpg": make_jpeg()})
+    runner = make_runner()
+    log: list = []
+    _record(runner.scanEmpty, log, "empty")
+    _record(runner.pathsFound, log, "paths")
+    _record(runner.scanFinished, log, "finished")
+
+    def walk(*paths: str) -> list:
+        log.clear()
+        with qtbot.waitSignal(runner.scanFinished, timeout=TIMEOUT):
+            runner.scan(list(paths))
+        return [entry[0] for entry in log]
+
+    assert walk(nothing) == ["empty", "finished"]
+    assert walk(only_text) == ["empty", "finished"]
+    assert walk(only_outputs) == ["empty", "finished"]
+    assert walk(nothing, only_text) == ["empty", "finished"]  # one walk, one report
+    assert walk(photos) == ["paths", "finished"]  # found something: not empty
+    assert walk(nothing, photos) == ["paths", "finished"]  # ... in any of its folders
+
+    import siftool_gui.workers as workers
+
+    def cannot_be_read(paths):
+        raise PermissionError(13, "Permission denied", str(paths[0]))
+
+    monkeypatch.setattr(workers, "iter_inputs", cannot_be_read)
+    assert walk(photos) == ["empty", "finished"]  # a folder that cannot be read adds nothing either
+
+
+def test_a_cancelled_walk_is_not_reported_empty(make_runner, slow_walk, qtbot, tmp_path):
+    # It did not find nothing: it was stopped. "Nenhuma foto encontrada" would be a lie.
+    runner = make_runner()
+    log: list = []
+    _record(runner.scanEmpty, log, "empty")
+    _record(runner.scanFinished, log, "finished")
+    runner.scan([str(tmp_path)])
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+
+    runner.cancel()
+    slow_walk.release.set()
+    assert runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+
+    assert log == [("finished",)]
+
+
 def test_analyze_success_unsupported_and_corrupt(make_runner, qtbot, tmp_path):
     png = write(tmp_path, "a.png", make_png())
     heic = write(tmp_path, "b.heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64)
@@ -101,6 +160,67 @@ def test_analyze_success_unsupported_and_corrupt(make_runner, qtbot, tmp_path):
     assert isinstance(failures[2], UnsupportedFormatError)
     assert failures[2].format_name == "HEIC"
     assert isinstance(failures[3], CorruptFileError)
+
+
+def _recording_inspect(monkeypatch) -> list[str]:
+    """Patch `siftool.inspect` with a wrapper that logs the name of every file handed to the engine."""
+    handed_over: list[str] = []
+    real_inspect = siftool.inspect
+
+    def recording_inspect(path):
+        handed_over.append(Path(path).name)
+        return real_inspect(path)
+
+    monkeypatch.setattr(siftool, "inspect", recording_inspect)
+    return handed_over
+
+
+def test_analyze_refuses_a_known_unsupported_format_from_its_first_bytes(make_runner, monkeypatch, qtbot, tmp_path):
+    # Final review: the engine checks its 512 MB cap before it detects the format, so a big video said
+    # "Grande demais" -- and every small one was read whole into memory just to be refused.
+    handed_over = _recording_inspect(monkeypatch)
+    files = {
+        1: write(tmp_path, "clip.mp4", b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64),
+        2: write(tmp_path, "photo.heic", b"\x00\x00\x00\x18ftypheic" + b"\x00" * 64),
+        3: write(tmp_path, "anim.gif", b"GIF89a" + b"\x00" * 64),
+        4: write(tmp_path, "note.txt", b"just some text, not a photo"),
+    }
+    runner = make_runner()
+    failures: dict = {}
+    runner.analysisFailed.connect(failures.__setitem__)
+
+    with qtbot.waitSignal(runner.idle, timeout=TIMEOUT):
+        for entry_id, path in files.items():
+            runner.analyze(entry_id, path)
+
+    assert handed_over == []  # none of them was read whole by `siftool.inspect`
+    assert all(isinstance(exc, UnsupportedFormatError) for exc in failures.values()), failures
+    assert {entry_id: exc.format_name for entry_id, exc in failures.items()} == {
+        1: "MP4/MOV", 2: "HEIC", 3: "GIF", 4: None,
+    }
+    assert all(exc.__traceback__ is None for exc in failures.values())
+
+
+def test_analyze_still_hands_supported_empty_and_unreadable_files_to_the_engine(make_runner, monkeypatch, qtbot,
+                                                                                tmp_path):
+    handed_over = _recording_inspect(monkeypatch)
+    png = write(tmp_path, "a.png", make_png())
+    empty = write(tmp_path, "empty.jpg", b"")
+    runner = make_runner()
+    reports: dict = {}
+    failures: dict = {}
+    runner.analyzed.connect(reports.__setitem__)
+    runner.analysisFailed.connect(failures.__setitem__)
+
+    with qtbot.waitSignal(runner.idle, timeout=TIMEOUT):
+        runner.analyze(1, png)
+        runner.analyze(2, empty)  # nothing to recognize: the engine says "danificado", as before
+        runner.analyze(3, tmp_path / "gone.jpg")  # cannot be opened: the engine's own OSError, as before
+
+    assert sorted(handed_over) == ["a.png", "empty.jpg", "gone.jpg"]
+    assert reports[1].format == "png"
+    assert isinstance(failures[2], CorruptFileError)
+    assert isinstance(failures[3], FileNotFoundError)
 
 
 def test_unexpected_exceptions_become_failures_without_tracebacks(make_runner, monkeypatch, qtbot, tmp_path):
@@ -313,34 +433,106 @@ def test_cancel_drops_pending_clean_and_thumbnail_jobs(make_runner, monkeypatch,
     assert not (tmp_path / "a_clean.jpg").exists()
 
 
-def test_cancel_stops_a_running_scan(make_runner, monkeypatch, qtbot, tmp_path):
-    import siftool_gui.workers as workers
-
-    started = threading.Event()
-    release = threading.Event()
-    real_iter_inputs = workers.iter_inputs
-
-    def blocking_iter_inputs(paths):
-        started.set()
-        release.wait(TIMEOUT / 1000)
-        return real_iter_inputs(paths)
-
-    monkeypatch.setattr(workers, "iter_inputs", blocking_iter_inputs)
+def test_cancel_ends_a_running_scan_at_once(make_runner, slow_walk, qtbot, tmp_path):
+    # Final review: "Cancelar" during a long folder walk seemed to do nothing -- the walk was
+    # reported finished only when it ended (96.8 s for a whole user profile).
     write(tmp_path, "a.jpg", make_jpeg())
-
     runner = make_runner()
-    batches: list = []
-    runner.pathsFound.connect(batches.append)
-    try:
-        runner.scan([str(tmp_path)])
-        assert started.wait(TIMEOUT / 1000)
-        runner.cancel()
-    finally:
-        release.set()
+    log: list = []
+    _record(runner.pathsFound, log, "paths")
+    _record(runner.scanFinished, log, "finished")
+    _record(runner.idle, log, "idle")
 
-    with qtbot.waitSignal(runner.scanFinished, timeout=TIMEOUT):
+    runner.scan([str(tmp_path)])
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+    assert runner.busy()
+
+    runner.cancel()
+
+    # In this very call, with the walk still blocked in its thread: finished, then idle.
+    assert log == [("finished",), ("idle",)]
+    assert not runner.busy()
+
+    slow_walk.release.set()  # the walk now unwinds and posts what it found...
+    assert runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()  # ... which is delivered, and ignored: no batch, no second finish
+    assert log == [("finished",), ("idle",)]
+
+
+def test_a_scan_that_ended_but_was_not_delivered_yet_is_reported_once(make_runner, qtbot, tmp_path):
+    # The walk finished in its thread and its events wait for the event loop when "Cancelar" comes:
+    # every scan() still ends with exactly one scanFinished, and its late batch is discarded.
+    write(tmp_path, "a.jpg", make_jpeg())
+    runner = make_runner()
+    log: list = []
+    _record(runner.pathsFound, log, "paths")
+    _record(runner.scanFinished, log, "finished")
+    _record(runner.idle, log, "idle")
+    runner.scan([str(tmp_path)])
+    assert runner.wait_for_done(TIMEOUT)  # over in its thread; nothing delivered yet
+
+    runner.cancel()
+
+    assert log == [("finished",), ("idle",)]
+    QApplication.processEvents()  # the batch it posted and its own finish event
+    assert log == [("finished",), ("idle",)]
+
+
+def test_cancel_reports_a_walk_but_idle_waits_for_the_running_analysis(make_runner, slow_walk, monkeypatch, qtbot,
+                                                                      tmp_path):
+    real_inspect = siftool.inspect
+    analysis_started = threading.Event()
+    analysis_release = threading.Event()
+
+    def blocking_inspect(path):
+        analysis_started.set()
+        analysis_release.wait(TIMEOUT / 1000)
+        return real_inspect(path)
+
+    monkeypatch.setattr(siftool, "inspect", blocking_inspect)
+    png = write(tmp_path, "a.png", make_png())
+    runner = make_runner(max_workers=2)  # the analysis and the walk run side by side
+    log: list = []
+    _record(runner.scanFinished, log, "finished")
+    _record(runner.analyzed, log, "analyzed")
+    _record(runner.idle, log, "idle")
+
+    try:
+        runner.analyze(1, png)
+        runner.scan([str(tmp_path)])
+        assert analysis_started.wait(TIMEOUT / 1000) and slow_walk.started.wait(TIMEOUT / 1000)
+
+        runner.cancel()
+
+        assert log == [("finished",)]  # the walk is over; the analysis still runs: not idle yet
+        assert runner.busy()
+    finally:
+        slow_walk.release.set()
+        analysis_release.set()
+
+    with qtbot.waitSignal(runner.idle, timeout=TIMEOUT):
         pass
-    assert batches == []
+    assert runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+    assert [entry[0] for entry in log] == ["finished", "analyzed", "idle"]  # the walk said nothing more
+
+
+def test_cancel_reports_each_scan_once_whether_it_ran_or_not(make_runner, slow_walk, qtbot, tmp_path):
+    write(tmp_path, "a.jpg", make_jpeg())
+    runner = make_runner(max_workers=1)
+    finished: list = []
+    runner.scanFinished.connect(lambda: finished.append(1))
+
+    runner.scan([str(tmp_path)])  # runs, blocked in the only worker
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+    runner.scan([str(tmp_path)])  # waits in the pool's queue behind it
+    runner.cancel()
+
+    assert finished == [1, 1]  # the one that never started and the one that was running
+    slow_walk.release.set()
+    assert runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+    assert finished == [1, 1]
 
 
 def test_busy_and_wait_for_done(make_runner, qtbot, tmp_path):

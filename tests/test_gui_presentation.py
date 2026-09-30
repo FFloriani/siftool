@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import subprocess
 import sys
 
@@ -30,6 +32,7 @@ from siftool_gui.presentation import (
     done_text,
     error_explanation,
     error_title,
+    is_coming_soon,
     mode_description,
     mode_title,
     result_explanation,
@@ -214,7 +217,8 @@ def test_error_texts_for_each_exception():
 
     generic = OSError(5, "input/output error")
     assert error_title(generic) == "Erro ao ler ou gravar"
-    assert error_explanation(generic) == str(generic)
+    # The system's own message (spec 5.5) -- without the "[Errno 5]" str() puts in front of it.
+    assert error_explanation(generic) == "input/output error"
 
     verdict = Verdict(
         Status.FAILED,
@@ -255,6 +259,57 @@ def test_error_texts_for_each_exception():
         assert error_explanation(unexpected) == "O Siftool encontrou um problema com este arquivo.", unexpected
 
 
+def test_other_os_errors_show_the_systems_message_without_its_decoration():
+    # Final review: str(exc) reads "[Errno 22] Invalid argument: 'C:\\fotos\\a.jpg'" -- the number in
+    # brackets and the path, its backslashes doubled, are noise for the person reading the row.
+    invalid = OSError(errno.EINVAL, "Invalid argument", r"C:\fotos\a.jpg")
+    assert str(invalid).startswith("[Errno 22]") and r"C:\\fotos" in str(invalid)  # what used to reach the screen
+    assert error_title(invalid) == "Erro ao ler ou gravar"
+    assert error_explanation(invalid) == "Invalid argument"
+
+    assert error_explanation(OSError(errno.EIO, "Input/output error")) == "Input/output error"
+    # No system message (an OSError built from text alone): the text is all there is.
+    assert error_explanation(OSError("the drive went away")) == "the drive went away"
+    # The two that have a text of their own keep it.
+    assert error_explanation(FileNotFoundError(errno.ENOENT, "No such file", "a.jpg")) == (
+        "O arquivo foi movido ou apagado."
+    )
+    assert error_explanation(PermissionError(errno.EACCES, "Permission denied", "a.jpg")) == (
+        "O Windows não deixou ler o arquivo ou gravar a cópia nesta pasta."
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinError codes only exist on Windows")
+def test_a_windows_error_shows_its_message_alone():
+    message = "The filename, directory name, or volume label syntax is incorrect"
+    exc = OSError(0, message, r"C:\fotos\a?.jpg", 123)  # ERROR_INVALID_NAME
+    assert str(exc).startswith("[WinError 123]")  # what used to reach the screen
+    assert error_explanation(exc) == message
+
+
+def test_a_full_disk_says_so_in_portuguese():
+    # Final review: "No space left on device" is the likeliest thing to go wrong writing copies.
+    full = "O disco está cheio."
+    assert error_explanation(OSError(errno.ENOSPC, "No space left on device")) == full
+    assert error_explanation(OSError(errno.ENOSPC, "No space left on device", r"C:\out\a_clean.jpg")) == full
+    assert error_title(OSError(errno.ENOSPC, "No space left on device")) == "Erro ao ler ou gravar"
+
+    # Windows reports it as ERROR_DISK_FULL (112), whatever errno it comes with.
+    by_winerror = OSError(errno.EIO, "There is not enough space on the disk")
+    by_winerror.winerror = 112
+    assert error_explanation(by_winerror) == full
+    other_winerror = OSError(errno.EIO, "The device is not ready")
+    other_winerror.winerror = 21  # ERROR_NOT_READY
+    assert error_explanation(other_winerror) == "The device is not ready"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinError codes only exist on Windows")
+def test_a_real_windows_disk_full_error_says_so():
+    exc = OSError(0, "There is not enough space on the disk", r"C:\out\a_clean.jpg", 112)
+    assert exc.winerror == 112
+    assert error_explanation(exc) == "O disco está cheio."
+
+
 def test_result_title_and_explanation(tmp_path):
     verified = CleanResult(
         src="a.jpg",
@@ -293,6 +348,29 @@ def test_summary_and_button_plurals():
     assert summary_text(2, 1, 0) == "2 fotos · 1 com informação escondida"
     assert summary_text(0, 0, 0) == ""
 
+
+def test_summary_counts_problems_apart_from_formats_that_are_coming():
+    # Final review: "Formato não suportado" rows (txt, PDF, GIF...) and error rows are no "ainda não
+    # suportada" -- a next version will not open them -- so they get a count of their own.
+    assert summary_text(6, 2, 1, 3) == (
+        "6 fotos · 2 com informações escondidas · 1 ainda não suportada · 3 com problemas"
+    )
+    assert summary_text(4, 0, 2, 1) == "4 fotos · 2 ainda não suportadas · 1 com problema"
+    assert summary_text(3, 0, 0, 3) == "3 fotos · 3 com problemas"
+    assert summary_text(1, 0, 0, 1) == "1 foto · 1 com problema"
+    # Without problems the line is what it always was.
+    assert summary_text(12, 9, 1, 0) == "12 fotos · 9 com informações escondidas · 1 ainda não suportada"
+    assert summary_text(0, 0, 0, 0) == ""
+
+
+def test_only_heic_and_video_are_coming_soon():
+    for format_name in ("HEIC", "HEIF", "MP4/MOV"):
+        assert is_coming_soon(UnsupportedFormatError(format_name)), format_name
+    for format_name in ("AVIF", "GIF", "TIFF", "BMP", "MKV/WebM", "AVI", "PDF", None):
+        assert not is_coming_soon(UnsupportedFormatError(format_name)), format_name
+    assert not is_coming_soon(CorruptFileError("bad structure"))
+    assert not is_coming_soon(OSError(5, "input/output error"))
+
     assert clean_button_text(0) == "Limpar"
     assert clean_button_text(1) == "Limpar 1 foto"
     assert clean_button_text(3) == "Limpar 3 fotos"
@@ -302,7 +380,19 @@ def test_done_text_combinations():
     assert done_text(3, 0, 0) == "3 fotos limpas e verificadas"
     assert done_text(1, 0, 0) == "1 foto limpa e verificada"
     assert done_text(3, 1, 1) == "3 fotos limpas e verificadas · 1 com ressalvas · 1 não limpou"
-    assert done_text(0, 2, 0) == "0 fotos limpas e verificadas · 2 com ressalvas"
+    # Final review: a part that is zero is left out, the verified one included ("0 fotos limpas e verificadas").
+    assert done_text(0, 2, 0) == "2 com ressalvas"
+
+
+def test_done_text_failed_part_agrees_in_number():
+    # Final review: the probe read "... · 2 não limpou" -- two photos say "não limparam".
+    assert done_text(0, 0, 1) == "1 não limpou"
+    assert done_text(0, 0, 2) == "2 não limparam"
+    assert done_text(0, 0, 12) == "12 não limparam"
+    assert done_text(3, 1, 2) == "3 fotos limpas e verificadas · 1 com ressalvas · 2 não limparam"
+    assert done_text(1, 0, 2) == "1 foto limpa e verificada · 2 não limparam"
+    assert done_text(0, 1, 2) == "1 com ressalvas · 2 não limparam"
+    assert done_text(0, 0, 0) == ""  # every part is zero: nothing to say
 
 
 def test_batch_message_after_a_batch():
@@ -313,6 +403,11 @@ def test_batch_message_after_a_batch():
         "2 fotos limpas e verificadas · 1 com ressalvas · 1 não limpou — clique na linha para ver o motivo."
     )
     assert batch_message(0, 0, 3) == done_text(0, 0, 3) + " — clique em cada linha para ver o motivo."
+    # The hint and the count agree: one photo -> "a linha", more -> "cada linha"; and "não limparam" from two up.
+    assert batch_message(0, 0, 2) == "2 não limparam — clique em cada linha para ver o motivo."
+    assert batch_message(2, 1, 2) == (
+        "2 fotos limpas e verificadas · 1 com ressalvas · 2 não limparam — clique em cada linha para ver o motivo."
+    )
 
 
 def test_presentation_imports_no_qt(tmp_path):

@@ -8,7 +8,7 @@ installed -- so the pure-logic suite (`tests/test_gui_*.py`,
 Also holds the fixtures shared by the "Limpar" page tests: every page gets
 a config file under `tmp_path` (never `%APPDATA%`), and `make_page`
 cancels and drains each page's `JobRunner` at teardown, so no pool thread
-outlives its test.
+outlives its test. `slow_walk` stands in for a folder walk that takes long.
 """
 
 from __future__ import annotations
@@ -59,6 +59,34 @@ def make_page(qtbot, config):
 @pytest.fixture
 def page(make_page):
     return make_page()
+
+
+@pytest.fixture
+def slow_walk(monkeypatch):
+    """A folder walk that blocks, in its pool thread, until `slow_walk.release` is set -- then walks for real.
+
+    `slow_walk.started` is set once the walk is running. Released at teardown
+    too, so no pool thread is ever left waiting: request it *after* `page` /
+    `make_page` / `make_runner`, so it is torn down first.
+    """
+    import threading
+
+    import siftool_gui.workers as workers
+
+    class SlowWalk:
+        started = threading.Event()
+        release = threading.Event()
+
+    real_iter_inputs = workers.iter_inputs
+
+    def blocking_iter_inputs(paths):
+        SlowWalk.started.set()
+        SlowWalk.release.wait(PAGE_TIMEOUT / 1000)
+        return real_iter_inputs(paths)
+
+    monkeypatch.setattr(workers, "iter_inputs", blocking_iter_inputs)
+    yield SlowWalk
+    SlowWalk.release.set()
 
 
 @pytest.fixture

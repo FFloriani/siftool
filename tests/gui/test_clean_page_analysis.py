@@ -13,12 +13,14 @@ import os
 import threading
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 import siftool
-from fixtures.make_fixtures import make_jpeg, make_png, make_webp, write
+from fixtures.make_fixtures import PNG_SIGNATURE, make_jpeg, make_png, make_webp, write
+from siftool.errors import UnsupportedFormatError
 from siftool.model import Category, Mode
 
 from siftool_gui.drop_area import FILE_FILTER
@@ -42,6 +44,11 @@ def _names(page: CleanPage) -> list[str]:
 
 def _states(page: CleanPage) -> dict[str, EntryState]:
     return {page.model.entry(i).path.name: page.model.entry(i).state for i in page.model.entry_ids()}
+
+
+def _id_named(page: CleanPage, name: str) -> int:
+    (entry_id,) = [i for i in page.model.entry_ids() if page.model.entry(i).path.name == name]
+    return entry_id
 
 
 def _child_rows(page: CleanPage, entry_id: int, kind: RowKind):
@@ -205,6 +212,93 @@ def test_heic_row_shows_not_supported_yet(page, qtbot, tmp_path, settle):
             "Fotos HEIC e vídeos chegam numa próxima versão."
         ]
     assert page.summary_label.text() == summary_text(3, 1, 2)
+
+
+def test_summary_line_tells_formats_that_are_coming_from_files_with_a_problem(page, photos, settle):
+    # Final review: a .txt or a .gif is not "ainda não suportada" -- no next version opens it -- and a
+    # damaged file is a problem too; only HEIC and video are "coming".
+    page.add_paths([
+        str(write(photos, "a.jpg", make_jpeg())),
+        str(write(photos, "b.heic", HEIC_BYTES)),
+        str(write(photos, "c.mp4", MP4_BYTES)),
+        str(write(photos, "d.gif", b"GIF89a" + b"\x00" * 32)),
+        str(write(photos, "notas.txt", b"not a photo")),
+        str(write(photos, "e.png", PNG_SIGNATURE + b"garbage" * 20)),
+    ])
+    settle(page, 6)
+
+    assert _states(page) == {
+        "a.jpg": EntryState.ANALYZED,
+        "b.heic": EntryState.UNSUPPORTED,
+        "c.mp4": EntryState.UNSUPPORTED,
+        "d.gif": EntryState.UNSUPPORTED,
+        "notas.txt": EntryState.UNSUPPORTED,
+        "e.png": EntryState.ERROR,
+    }
+    assert page.summary_label.text() == (
+        "6 fotos · 1 com informação escondida · 2 ainda não suportadas · 3 com problemas"
+    )
+    # ... and the rows say the same thing one by one.
+    statuses = {
+        page.model.entry(i).path.name: page.model.index_for(i).data(VALUE_ROLE) for i in page.model.entry_ids()
+    }
+    assert statuses["b.heic"] == statuses["c.mp4"] == "Ainda não suportado"
+    assert statuses["d.gif"] == statuses["notas.txt"] == "Formato não suportado"
+    assert statuses["e.png"] == "Arquivo danificado"
+
+    for name in ("d.gif", "notas.txt", "e.png"):  # rows that go leave the counts
+        page.model.remove_entry(_id_named(page, name))
+    assert page.summary_label.text() == "3 fotos · 1 com informação escondida · 2 ainda não suportadas"
+
+
+def test_a_video_says_not_supported_yet_without_being_read_whole(page, monkeypatch, photos, settle):
+    # Spec 3, criterion 3; final review: `siftool.inspect` is what reads a file whole, and a video
+    # (recognized from its first bytes) must be refused without it.
+    handed_over: list[str] = []
+
+    def inspect_must_not_run(path):
+        handed_over.append(str(path))
+        raise AssertionError(f"{path} was handed to the engine")
+
+    monkeypatch.setattr(siftool, "inspect", inspect_must_not_run)
+    clip = write(photos, "VID_0001.mp4", MP4_BYTES)
+
+    page.add_paths([str(clip)])
+    settle(page, 1)
+
+    assert handed_over == []
+    (entry_id,) = page.model.entry_ids()
+    entry = page.model.entry(entry_id)
+    assert entry.state is EntryState.UNSUPPORTED
+    assert isinstance(entry.error, UnsupportedFormatError)
+    assert page.model.index_for(entry_id).data(VALUE_ROLE) == "Ainda não suportado"
+    assert page.summary_label.text() == "1 foto · 1 ainda não suportada"
+
+
+def test_a_huge_video_says_not_supported_yet_not_too_big(page, photos, settle):
+    # Final review: the engine checks its 512 MB cap before it detects the format, so a 600 MB MP4
+    # ended as "Grande demais" (an error), and was left out of the "ainda não suportadas" count.
+    video = photos / "filme.mp4"
+    try:
+        with open(video, "wb") as f:
+            f.write(MP4_BYTES)
+            f.seek(600 * 1024 * 1024)
+            f.write(b"\0")
+    except OSError as exc:
+        video.unlink(missing_ok=True)
+        pytest.skip(f"the file system refuses a 600 MB file: {exc}")
+    try:
+        assert video.stat().st_size > 512 * 1024 * 1024
+
+        page.add_paths([str(video)])
+        settle(page, 1)
+
+        (entry_id,) = page.model.entry_ids()
+        assert page.model.entry(entry_id).state is EntryState.UNSUPPORTED
+        assert page.model.index_for(entry_id).data(VALUE_ROLE) == "Ainda não suportado"
+        assert page.summary_label.text() == "1 foto · 1 ainda não suportada"
+    finally:
+        video.unlink(missing_ok=True)  # 600 MB must not linger in pytest's temp folders
 
 
 # -- mode ---------------------------------------------------------------------------
@@ -520,6 +614,74 @@ def test_cancel_during_a_scan_stops_the_files_it_found(make_page, qtbot, tmp_pat
     states = {page.model.entry(i).state for i in page.model.entry_ids()}
     assert EntryState.ANALYZING not in states
     assert not page.progress_bar.isVisibleTo(page)
+
+
+def test_cancel_during_a_slow_folder_walk_ends_the_walk_at_once(make_page, slow_walk, qtbot, tmp_path, photos,
+                                                                settle):
+    # Final review: a walk over a whole user profile took 96.8 s, and "Cancelar" only flagged it to
+    # stop: "Procurando fotos…" and "Cancelar" stayed on screen and "Limpar lista" stayed off until
+    # the walk ended -- so the button seemed to do nothing.
+    page = make_page()
+    page.add_paths([str(write(photos, "a.jpg", make_jpeg()))])  # one row, so "Limpar lista" has a job
+    settle(page, 1)
+    folder = tmp_path / "perfil inteiro"
+    folder.mkdir()
+    write(folder, "b.jpg", make_jpeg())  # what the walk would find, if its result leaked through
+    scan_finished: list[int] = []
+    page.runner.scanFinished.connect(lambda: scan_finished.append(1))
+
+    page.add_paths([str(folder)])
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+    assert page.progress_label.text() == "Procurando fotos…"
+    assert page.progress_bar.isVisibleTo(page) and page.cancel_button.isVisibleTo(page)
+    assert not page.clear_button.isEnabled()
+
+    page.cancel()  # "Cancelar" -- the walk is still blocked in its thread
+
+    assert not page.progress_bar.isVisibleTo(page)
+    assert not page.progress_label.isVisibleTo(page)
+    assert not page.cancel_button.isVisibleTo(page)
+    assert page.clear_button.isEnabled()
+    assert scan_finished == [1]
+    assert not page.busy()
+    page.clear_button.click()
+    assert page.model.entry_ids() == []
+
+    slow_walk.release.set()  # the walk unwinds and finds b.jpg: nobody listens any more
+    assert page.runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+    qtbot.waitUntil(lambda: not page.busy(), timeout=TIMEOUT)
+
+    assert page.model.entry_ids() == []  # no row was added
+    assert scan_finished == [1]  # and no second "scanFinished"
+    assert not page.progress_bar.isVisibleTo(page)
+
+
+def test_a_slow_folder_walk_cancelled_on_the_runner_ends_for_the_page_too(make_page, slow_walk, qtbot, tmp_path,
+                                                                          photos, settle):
+    # The window's runner is shared: a cancel that does not come through the page ends the walk for
+    # it as well, one turn of the event loop later (the page applies what the runner reports in turns).
+    page = make_page()
+    page.add_paths([str(write(photos, "a.jpg", make_jpeg()))])
+    settle(page, 1)
+    folder = tmp_path / "perfil inteiro"
+    folder.mkdir()
+    write(folder, "b.jpg", make_jpeg())
+    page.add_paths([str(folder)])
+    assert slow_walk.started.wait(TIMEOUT / 1000)
+    assert page.progress_bar.isVisibleTo(page) and not page.clear_button.isEnabled()
+
+    page.runner.cancel()
+
+    # A turn of the event loop -- not the seconds the blocked walk would take to give up by itself.
+    qtbot.waitUntil(lambda: not page.progress_bar.isVisibleTo(page), timeout=2_000)
+    assert not page.cancel_button.isVisibleTo(page)
+    assert page.clear_button.isEnabled()
+    slow_walk.release.set()
+    assert page.runner.wait_for_done(TIMEOUT)
+    QApplication.processEvents()
+    qtbot.waitUntil(lambda: not page.busy(), timeout=TIMEOUT)
+    assert len(page.model.entry_ids()) == 1  # a.jpg only: b.jpg, found late, was not listed
 
 
 def test_a_failing_result_does_not_stall_the_queue(make_page, qtbot, photos, monkeypatch):

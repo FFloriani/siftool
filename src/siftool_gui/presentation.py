@@ -32,11 +32,14 @@ result with reservations explains itself in one sentence, and an engine
 error or unexpected exception gets a Portuguese text of its own. The list
 shows the engine's words only under "Detalhes técnicos" (`model.py`).
 The one exception is the spec's own: an `OSError` other than "not found"
-or "no permission" shows the system's message (spec 5.5).
+or "no permission" shows the system's message (spec 5.5) -- its `strerror`
+alone, without the error number and the path `str()` adds, and a full disk
+in Portuguese.
 """
 
 from __future__ import annotations
 
+import errno
 from collections.abc import Sequence
 from datetime import datetime
 from enum import Enum
@@ -118,6 +121,11 @@ _DEVICE_LABELS: tuple[str, ...] = ("Make", "Model", "LensMake", "LensModel")
 
 # Ruling P1 overrides the task-4 brief, which also listed AVIF here.
 _COMING_SOON_FORMATS = frozenset({"HEIC", "HEIF", "MP4/MOV"})
+
+
+def is_coming_soon(exc: BaseException) -> bool:
+    """Whether `exc` is an `UnsupportedFormatError` for a format a next version will clean (HEIC, video)."""
+    return isinstance(exc, UnsupportedFormatError) and exc.format_name in _COMING_SOON_FORMATS
 
 
 def _truncate(value: str, limit: int = _VALUE_LIMIT) -> str:
@@ -263,7 +271,7 @@ def _violation_lines(violations: Sequence[Finding]) -> list[str]:
 def error_title(exc: BaseException) -> str:
     """The line-level text for `exc` (spec 5.5, "Texto na linha"); any exception gets one."""
     if isinstance(exc, UnsupportedFormatError):
-        return "Ainda não suportado" if exc.format_name in _COMING_SOON_FORMATS else "Formato não suportado"
+        return "Ainda não suportado" if is_coming_soon(exc) else "Formato não suportado"
     if isinstance(exc, CorruptFileError):
         return "Arquivo danificado"
     if isinstance(exc, UnsafeFileError):
@@ -283,6 +291,21 @@ def error_title(exc: BaseException) -> str:
     return _UNEXPECTED_TITLE  # any other engine error, or a bug: never the English message
 
 
+_ERROR_DISK_FULL = 112  # the Windows error code for a full disk
+
+
+def _os_error_text(exc: OSError) -> str:
+    """What to say about an `OSError` that has no text of its own: the system's message, or a full disk.
+
+    `str(exc)` puts an error number in brackets in front of the message and
+    the file's path, repr'd (so every backslash doubled), after it: only the
+    message (`strerror`) is shown, or the whole text when the error has none.
+    """
+    if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) == _ERROR_DISK_FULL:
+        return "O disco está cheio."
+    return str(exc.strerror) if exc.strerror else str(exc)
+
+
 def error_explanation(exc: BaseException) -> str:
     """The expanded text for `exc` (spec 5.5, "Texto ao expandir"), in Portuguese.
 
@@ -290,7 +313,7 @@ def error_explanation(exc: BaseException) -> str:
     copy (ruling P11(a)); its labels are for "Detalhes técnicos" only.
     """
     if isinstance(exc, UnsupportedFormatError):
-        if exc.format_name in _COMING_SOON_FORMATS:
+        if is_coming_soon(exc):
             return "Fotos HEIC e vídeos chegam numa próxima versão."
         return "O Siftool limpa fotos JPG, PNG e WEBP."
     if isinstance(exc, CorruptFileError):
@@ -309,7 +332,7 @@ def error_explanation(exc: BaseException) -> str:
     if isinstance(exc, PermissionError):
         return "O Windows não deixou ler o arquivo ou gravar a cópia nesta pasta."
     if isinstance(exc, OSError):
-        return str(exc)  # spec 5.5: the system's own message
+        return _os_error_text(exc)  # spec 5.5: the system's own message
     return _UNEXPECTED_EXPLANATION
 
 
@@ -346,8 +369,14 @@ def clean_button_text(n: int) -> str:
     return f"Limpar {n} fotos"
 
 
-def summary_text(total: int, with_findings: int, unsupported: int) -> str:
-    """The list summary line (spec 5.2, item 3). Zero-valued parts are omitted."""
+def summary_text(total: int, with_findings: int, unsupported: int, problems: int = 0) -> str:
+    """The list summary line (spec 5.2, item 3). Zero-valued parts are omitted.
+
+    `unsupported` counts only the formats that are coming ("ainda não
+    suportada": HEIC, video); `problems` counts the files that cannot be
+    cleaned and will not be by a next version either -- another unsupported
+    format (txt, PDF, GIF...) or a file with an error.
+    """
     parts: list[str] = []
     if total:
         parts.append("1 foto" if total == 1 else f"{total} fotos")
@@ -359,17 +388,23 @@ def summary_text(total: int, with_findings: int, unsupported: int) -> str:
         )
     if unsupported:
         parts.append("1 ainda não suportada" if unsupported == 1 else f"{unsupported} ainda não suportadas")
+    if problems:
+        parts.append("1 com problema" if problems == 1 else f"{problems} com problemas")
     return " · ".join(parts)
 
 
 def done_text(verified: int, warnings: int, failed: int) -> str:
-    """The end-of-batch summary (spec 4.4, item 5)."""
-    base = "1 foto limpa e verificada" if verified == 1 else f"{verified} fotos limpas e verificadas"
-    parts = [base]
+    """The end-of-batch summary (spec 4.4, item 5). Zero-valued parts are omitted.
+
+    "não limpou" for one photo, "não limparam" from two up.
+    """
+    parts: list[str] = []
+    if verified:
+        parts.append("1 foto limpa e verificada" if verified == 1 else f"{verified} fotos limpas e verificadas")
     if warnings:
         parts.append(f"{warnings} com ressalvas")
     if failed:
-        parts.append(f"{failed} não limpou")
+        parts.append("1 não limpou" if failed == 1 else f"{failed} não limparam")
     return " · ".join(parts)
 
 

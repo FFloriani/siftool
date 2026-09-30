@@ -109,6 +109,7 @@ FOLDER_UNAVAILABLE_TEXT = (
     "A pasta escolhida para salvar as cópias não está disponível. Escolha outra em Configurações."
 )
 FOLDER_GONE_TEXT = "A pasta foi movida ou apagada."
+NO_PHOTOS_TEXT = "Nenhuma foto encontrada nesta pasta."
 CLEANING_BUTTON_TEXT = "Limpando…"
 SHOW_IN_EXPLORER_TEXT = "Mostrar no Explorer"
 CLEAN_AGAIN_TEXT = "Limpar de novo"
@@ -265,6 +266,7 @@ class CleanPage(QWidget):
         self._batch: _Batch | None = None
         self._taken: set[str] = set()  # every output name handed out this session (`path_key`s)
         self._bars: list[InfoBar] = []  # the messages about the last batch
+        self._notice: InfoBar | None = None  # the "no photos found" message, while it is up
 
         self._inbox: deque[tuple[Callable[..., None], tuple]] = deque()  # what the runner reported, not applied yet
         self._summary_deferred = False  # while many rows change in one go, the summary waits
@@ -453,6 +455,7 @@ class CleanPage(QWidget):
         # Bound methods (not lambdas): Qt drops these connections when the page is destroyed.
         runner = self.runner
         runner.pathsFound.connect(self._on_paths_found)
+        runner.scanEmpty.connect(self._on_scan_empty)
         runner.scanFinished.connect(self._on_scan_finished)
         runner.analyzed.connect(self._on_analyzed)
         runner.analysisFailed.connect(self._on_analysis_failed)
@@ -465,6 +468,9 @@ class CleanPage(QWidget):
 
     def _on_paths_found(self, paths: list) -> None:
         self._receive(self._add_files, paths)
+
+    def _on_scan_empty(self) -> None:
+        self._receive(self._scan_empty)
 
     def _on_scan_finished(self) -> None:
         self._receive(self._scan_finished)
@@ -537,6 +543,7 @@ class CleanPage(QWidget):
 
     def add_paths(self, paths: Iterable[str | Path]) -> None:
         """Add dropped or chosen paths: folders are walked in the background, files analyzed."""
+        self._close_notice()  # a new drop: "no photos found" was about the last one
         files: list[str] = []
         folders: list[str] = []
         for raw in paths:
@@ -557,6 +564,14 @@ class CleanPage(QWidget):
             if self.model.index_for(entry_id).data(THUMBNAIL_ROLE) is None:
                 # Previews go to the runner at once: they have a lower priority there.
                 self.runner.thumbnail(entry_id, self.model.entry(entry_id).path)
+
+    def _scan_empty(self) -> None:
+        """A dropped folder held no supported file: say so, where the user just acted (info style, not an error).
+
+        The next action replaces the message: another drop, "Limpar", "Limpar lista".
+        """
+        self._close_bars()
+        self._notice = self._post(InfoBarIcon.INFORMATION, "", NO_PHOTOS_TEXT)
 
     def _scan_finished(self) -> None:
         self._pending_scans = max(0, self._pending_scans - 1)
@@ -663,9 +678,11 @@ class CleanPage(QWidget):
         already found and the page has not listed yet: they are dropped with
         the walk. The page is up to date when this returns: what the runner
         dropped (and any result already waiting) is applied at once, without
-        handing out new work.
+        handing out new work. A folder walk still running is over for the
+        page at once too -- "Procurando fotos…" and "Cancelar" go away -- even
+        if its thread takes a while to notice.
         """
-        self.runner.cancel()  # nothing more starts in the pool; a running walk reports no further batch
+        self.runner.cancel()  # nothing more starts; a running walk is reported finished and posts nothing more
         self._inbox = deque(item for item in self._inbox if item[0] != self._add_files)
         try:
             self._apply_inbox(everything=True)
@@ -763,7 +780,7 @@ class CleanPage(QWidget):
             self._post(InfoBarIcon.ERROR, FOLDER_UNAVAILABLE_TITLE, FOLDER_GONE_TEXT)
 
     def _post(self, icon: InfoBarIcon, title: str, content: str) -> InfoBar:
-        """Show one message about the last batch, inline in the action bar, until closed or replaced."""
+        """Show one message inline in the action bar (about the last batch, or an empty folder), until replaced."""
         bar = _MessageBar(icon, title, content, orient=Qt.Orientation.Horizontal, isClosable=True,
                           duration=-1, position=InfoBarPosition.NONE, parent=self._message_host)
         bar.closeButton.setToolTip(CLOSE_MESSAGE_TOOLTIP)  # only an icon: it says what it does (spec 6)
@@ -776,12 +793,25 @@ class CleanPage(QWidget):
 
     def _close_bars(self) -> None:
         for bar in self._bars:
-            try:
-                bar.hide()
-                bar.close()  # QFluentWidgets deletes it and slides the others into place
-            except RuntimeError:  # already closed by the user
-                pass
+            self._close_bar(bar)
         self._bars.clear()
+        self._notice = None
+
+    @staticmethod
+    def _close_bar(bar: InfoBar) -> None:
+        try:
+            bar.hide()
+            bar.close()  # QFluentWidgets deletes it and slides the others into place
+        except RuntimeError:  # already closed by the user
+            pass
+
+    def _close_notice(self) -> None:
+        """Take down the "no photos found" message, if it is still up: the user has moved on."""
+        notice, self._notice = self._notice, None
+        if notice is not None:
+            self._close_bar(notice)
+            if notice in self._bars:
+                self._bars.remove(notice)
 
     # -- the row menu ------------------------------------------------------------------------
 
@@ -897,7 +927,9 @@ class CleanPage(QWidget):
 
     def _show_summary(self, summary: Summary) -> None:
         has_rows = summary.total > 0
-        self.summary_label.setText(summary_text(summary.total, summary.with_findings, summary.unsupported))
+        self.summary_label.setText(
+            summary_text(summary.total, summary.with_findings, summary.unsupported, summary.problems)
+        )
         self._summary_row.setVisible(has_rows)
         self.view.setVisible(has_rows)
         self.drop_area.set_compact(has_rows)

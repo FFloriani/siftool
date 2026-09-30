@@ -80,6 +80,7 @@ from siftool_gui.presentation import (
     category_value,
     error_explanation,
     error_title,
+    is_coming_soon,
     result_explanation,
     result_title,
 )
@@ -126,7 +127,13 @@ _ITEM_FLAGS = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
 
 
 class Summary(NamedTuple):
-    """Counts behind the summary line and the clean button (spec 5.2)."""
+    """Counts behind the summary line and the clean button (spec 5.2).
+
+    `unsupported` is only the UNSUPPORTED rows of a format that is coming
+    (HEIC, video: "ainda não suportada"). `problems` is every other file
+    that cannot be cleaned: the ERROR rows (`errors`) plus the UNSUPPORTED
+    rows of any other format (txt, PDF, GIF...), "Formato não suportado".
+    """
 
     total: int
     with_findings: int
@@ -137,9 +144,10 @@ class Summary(NamedTuple):
     warnings: int
     failed: int
     busy: int
+    problems: int = 0
 
 
-_EMPTY_SUMMARY = Summary(0, 0, 0, 0, 0, 0, 0, 0, 0)
+_EMPTY_SUMMARY = Summary(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 def status_text(entry: FileEntry) -> str:
@@ -192,8 +200,11 @@ def _engine_notes(*note_lists: list[str]) -> list[str]:
     return notes
 
 
-def _summary_key(entry: FileEntry) -> tuple[EntryState, bool]:
-    return entry.state, bool(entry.report is not None and entry.report.findings)
+def _summary_key(entry: FileEntry) -> tuple[EntryState, bool, bool]:
+    """What the summary counts an entry by: its state, whether it has findings, whether its format is coming."""
+    has_findings = bool(entry.report is not None and entry.report.findings)
+    coming_soon = entry.error is not None and is_coming_soon(entry.error)
+    return entry.state, has_findings, coming_soon
 
 
 def _set(item: QStandardItem, role: int, value: Any) -> None:
@@ -219,7 +230,7 @@ class FileListModel(QStandardItemModel):
         self._entries: dict[int, FileEntry] = {}  # in row order
         self._items: dict[int, QStandardItem] = {}
         self._keys: dict[str, int] = {}  # path_key -> entry id
-        self._counts: Counter[tuple[EntryState, bool]] = Counter()
+        self._counts: Counter[tuple[EntryState, bool, bool]] = Counter()
         self._last_summary = _EMPTY_SUMMARY
 
     # -- entries --------------------------------------------------------------
@@ -379,18 +390,21 @@ class FileListModel(QStandardItemModel):
         counts = self._counts
 
         def count(*states: EntryState) -> int:
-            return sum(n for (state, _), n in counts.items() if state in states)
+            return sum(n for (state, _, _), n in counts.items() if state in states)
 
+        coming = sum(n for (state, _, soon), n in counts.items() if state is EntryState.UNSUPPORTED and soon)
+        errors = count(EntryState.ERROR)
         return Summary(
             total=len(self._entries),
-            with_findings=sum(n for (_, has_findings), n in counts.items() if has_findings),
-            unsupported=count(EntryState.UNSUPPORTED),
-            errors=count(EntryState.ERROR),
+            with_findings=sum(n for (_, has_findings, _), n in counts.items() if has_findings),
+            unsupported=coming,
+            errors=errors,
             cleanable=count(EntryState.ANALYZED),
             verified=count(EntryState.VERIFIED),
             warnings=count(EntryState.WARNINGS),
             failed=count(EntryState.FAILED),
             busy=count(EntryState.ANALYZING, EntryState.CLEANING),
+            problems=errors + count(EntryState.UNSUPPORTED) - coming,
         )
 
     def _emit_summary(self) -> None:
