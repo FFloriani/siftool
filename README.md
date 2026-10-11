@@ -1,176 +1,221 @@
 <div align="center">
-  <img src="./siftool_logo.png" width="96" height="96" alt="Siftool">
 
-  <h1>Siftool</h1>
+**English** · [Português (Brasil)](README.pt-BR.md)
 
-  <p><b>Tire localização, dados pessoais e marcas de IA das suas fotos, sem perder qualidade.</b><br>
-  100% offline · o original nunca é alterado · selo só quando a limpeza é verificada</p>
+<img src="./siftool_logo.png" width="96" height="96" alt="Siftool logo">
 
-  [![Versão](https://img.shields.io/github/v/release/FFloriani/siftool?include_prereleases&style=flat-square&label=vers%C3%A3o)](https://github.com/FFloriani/siftool/releases)
-  [![Downloads](https://img.shields.io/github/downloads/FFloriani/siftool/total?style=flat-square&label=downloads)](https://github.com/FFloriani/siftool/releases)
-  [![Windows 10 e 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows)](https://github.com/FFloriani/siftool/releases)
-  [![Licença GPLv3](https://img.shields.io/badge/licen%C3%A7a-GPLv3-blue?style=flat-square)](LICENSE)
-  [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-apoiar-ffdd00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/1b9hbqniv1)
+# Siftool — Remove EXIF, GPS & AI (C2PA) Metadata from Photos
 
-  <p>
-    <a href="https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-setup.exe"><b>⬇ Baixar o instalador</b></a> (22 MB)
-    &nbsp;·&nbsp;
-    <a href="https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-portable.zip"><b>⬇ Baixar a versão portátil</b></a> (27 MB)
-    &nbsp;·&nbsp;
-    <a href="https://github.com/FFloriani/siftool/releases">Todas as versões</a>
-  </p>
+**Free, offline Windows app that strips location, personal data and AI provenance marks from your photos — without losing quality.**<br>
+The original is never modified · nothing is re-encoded · a copy is marked *Verified* only after it is re-checked
 
-  <img src="docs/images/janela-clara.png" width="820" alt="Janela do Siftool mostrando o que cada foto esconde">
+[![Latest release](https://img.shields.io/github/v/release/FFloriani/siftool?style=flat-square&label=release)](https://github.com/FFloriani/siftool/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/FFloriani/siftool/total?style=flat-square)](https://github.com/FFloriani/siftool/releases)
+[![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows)](https://github.com/FFloriani/siftool/releases/latest)
+[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue?style=flat-square)](LICENSE)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?style=flat-square&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/1b9hbqniv1)
+
+**[⬇ Download the installer](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-setup.exe)** (22 MB)
+&nbsp;·&nbsp;
+**[⬇ Download the portable ZIP](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-portable.zip)** (27 MB)
+&nbsp;·&nbsp;
+[All releases](https://github.com/FFloriani/siftool/releases)
+
+<img src="docs/images/janela-clara.png" width="820" alt="Siftool metadata remover for Windows listing the hidden data found in each photo: GPS location, personal data, date, camera and AI marks">
+
 </div>
-
----
-
-## O que é
-
-Toda foto carrega informações escondidas além da imagem: **onde** foi tirada (GPS), **quando**, com **qual celular ou câmera**, o **seu nome**, o **programa** que a editou e, nas imagens feitas por IA, uma **marca de procedência** (C2PA / Content Credentials) que diz que foi o ChatGPT, o Gemini ou outro gerador.
-
-O Siftool mostra o que cada foto esconde, em português claro, e grava uma **cópia limpa** ao lado do original:
-
-- **Sem perder qualidade.** Ele não recomprime a imagem: copia os bytes da foto exatamente como estão e tira só os blocos de metadados. Os pixels saem idênticos.
-- **O original nunca é alterado.** A cópia sai como `foto_clean.jpg`. Nada é sobrescrito.
-- **Selo só quando é verdade.** Depois de gravar, o Siftool relê a cópia do zero e confere que nada do que o modo proíbe ficou lá. Se sobrou alguma coisa, a cópia não é salva e ele diz o motivo.
-- **100% offline.** Sem internet, sem telemetria, sem conta. As fotos nunca saem do seu computador.
-
-## Baixar e instalar
-
-Precisa de **Windows 10 ou 11 (64 bits)**. Não precisa instalar Python nem nada mais.
-
-| | Como funciona |
-|---|---|
-| **Instalador** · [`Siftool-2.0.0-beta.1-setup.exe`](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-setup.exe) | Instala só para o seu usuário, **sem pedir senha de administrador**. Cria o atalho no menu Iniciar e, se você deixar marcado, põe **Limpar com Siftool** no clique direito das fotos e das pastas. Para remover: Configurações → Aplicativos → Siftool → Desinstalar. |
-| **Portátil** · [`Siftool-2.0.0-beta.1-portable.zip`](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-portable.zip) | Não instala nada. Extraia a pasta `Siftool` num caminho **curto** (como `C:\Siftool` ou um pendrive) e abra o `Siftool.exe`. As configurações ficam dentro da própria pasta. Para remover, apague a pasta. |
 
 > [!NOTE]
-> **"O Windows protegeu o computador"**: o Siftool ainda não tem assinatura digital, então na primeira vez o Windows mostra esse aviso. Clique em **Mais informações** → **Executar assim mesmo**. Com o *Controle inteligente de aplicativos* do Windows 11 ligado, o Windows pode bloquear programas sem assinatura sem oferecer essa opção.
+> The interface is currently in **Brazilian Portuguese**. An English interface is on the [roadmap](#roadmap). The program is simple to use without reading the labels: drop photos, click the big button.
+
+## Why remove metadata from photos?
+
+Every photo carries hidden data besides the picture itself — the **EXIF**, **XMP** and **IPTC** metadata. A photo shared as a file can reveal:
+
+- **where** it was taken: GPS coordinates, often precise to a few meters;
+- **when**: the exact date and time;
+- **who** took it and **with what**: your name, the phone or camera model, its serial number;
+- the **software** that edited it;
+- for AI images, a **C2PA / Content Credentials** manifest — the provenance record that ChatGPT (OpenAI), Adobe Firefly and other tools embed to say the image was AI-generated — plus the generation prompts some tools write into PNG files.
+
+Siftool shows exactly what each photo hides, in plain language, and writes a **clean copy** next to the original.
+
+## Features
+
+- **Lossless metadata removal** — Siftool never decodes or re-compresses the image. It copies the image bytes exactly as they are and removes only the metadata blocks, so pixels come out identical and there is no JPEG quality loss.
+- **Removes GPS location, EXIF, XMP, IPTC, comments and hidden thumbnails** in one click, for single photos or whole folders.
+- **Removes AI provenance**: C2PA / Content Credentials manifests (such as ChatGPT's) and AI generation parameters stored in PNG text chunks.
+- **A "Verified" seal you can trust**: after writing the copy, Siftool re-reads it from scratch and checks that nothing the chosen mode forbids is left. If anything remains, the copy is not saved and the reason is shown.
+- **Your original is never touched** — the clean copy is saved as `photo_clean.jpg`; nothing is overwritten.
+- **100% offline and private** — no internet, no telemetry, no account. Your photos never leave your computer.
+- **Three cleaning modes**: Privacy, Photographer (keeps camera and lens settings) and Maximum.
+- **Windows integration**: *Clean with Siftool* in the right-click menu, drag and drop, light and dark themes, installer with no admin rights, or a portable version.
+- **Command-line interface** for scripts and automation, with JSON output.
+- **Free and open source** (GPLv3).
+
+## Download and install
+
+Requires **Windows 10 or 11 (64-bit)**. No Python or other software needed.
+
+| | |
+|---|---|
+| **Installer** · [`Siftool-2.0.0-beta.1-setup.exe`](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-setup.exe) | Installs for your user only, **no administrator password**. Adds a Start menu shortcut and, optionally, **Limpar com Siftool** (Clean with Siftool) to the right-click menu of photos and folders. Uninstall from Settings → Apps. |
+| **Portable** · [`Siftool-2.0.0-beta.1-portable.zip`](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-portable.zip) | Nothing is installed. Extract the `Siftool` folder to a **short** path (such as `C:\Siftool` or a USB drive) and open `Siftool.exe`. Settings stay inside the folder. |
+
+> [!NOTE]
+> **"Windows protected your PC"**: Siftool is not code-signed yet, so Windows SmartScreen warns on first launch. Click **More info** → **Run anyway**. With Windows 11 *Smart App Control* turned on, unsigned programs may be blocked without that option.
 
 <details>
-<summary>Mais detalhes sobre a instalação</summary>
+<summary>Installation details</summary>
 
-- O instalador grava em `%LOCALAPPDATA%\Programs\Siftool`. As configurações ficam em `%APPDATA%\Siftool` e continuam lá depois de desinstalar.
-- No Windows 11, **Limpar com Siftool** aparece em **Mostrar mais opções** no clique direito. O Windows esconde esse item quando mais de 15 arquivos estão selecionados: para muitas fotos, use o item da pasta ou arraste as fotos para a janela.
-- Na versão portátil, o caminho completo da pasta precisa ser curto: com cerca de 200 caracteres ou mais (pastas muito fundas, como as do OneDrive), o programa não abre. Num pendrive protegido contra gravação ele funciona, mas avisa que não consegue salvar as configurações.
-- Abrir várias fotos pelo clique direito manda todas para a mesma janela; o Siftool não abre uma janela por foto.
-- Os códigos SHA-256 dos arquivos estão na [página da versão](https://github.com/FFloriani/siftool/releases/tag/v2.0.0-beta.1).
+- The installer writes to `%LOCALAPPDATA%\Programs\Siftool`; settings live in `%APPDATA%\Siftool` and are kept on uninstall.
+- On Windows 11, *Limpar com Siftool* is under **Show more options**. Windows hides it when more than 15 files are selected — for many photos, use the folder entry or drag them into the window.
+- The portable folder's full path must be short: with about 200 characters or more (deep OneDrive folders), the program does not start.
+- Opening several photos from the right-click menu sends them all to the same window.
+- SHA-256 checksums are on the [release page](https://github.com/FFloriani/siftool/releases/tag/v2.0.0-beta.1).
 
 </details>
 
-## Como usar
+## How to use
 
-1. **Arraste** fotos ou pastas para a janela (ou use **Adicionar fotos** / **Adicionar pasta**, ou o clique direito do Windows).
-2. **Veja** o que cada foto esconde. Clique numa foto para ver os detalhes: o que **sai** e o que **fica** no modo escolhido.
-3. Escolha o **modo** e clique em **Limpar**. Cada foto ganha o selo **Verificado** e a cópia limpa aparece ao lado do original. **Abrir pasta** leva direto até ela.
+1. **Drop** photos or folders into the window (or use *Adicionar fotos* / *Adicionar pasta*, or the Windows right-click menu).
+2. **See** what each photo hides. Click a photo to see what will be **removed** and what will be **kept** in the chosen mode.
+3. Pick a **mode** and click **Limpar** (Clean). Each photo gets the **Verificado** (Verified) seal and the clean copy appears next to the original; *Abrir pasta* opens the folder.
 
 <div align="center">
-  <img src="docs/images/limpeza-concluida.png" width="820" alt="Fotos limpas e verificadas">
+<img src="docs/images/limpeza-concluida.png" width="820" alt="Photos cleaned and verified by Siftool, with the AI (C2PA) mark removed from a ChatGPT image">
 </div>
 
-### Os três modos
+### Cleaning modes
 
-| Modo | Tira | Mantém |
+| Mode | Removes | Keeps |
 |---|---|---|
-| **Privacidade** (padrão) | Localização, dados pessoais, datas, aparelho, configurações da câmera, programas usados, textos e comentários, miniaturas escondidas, marcas de IA e qualquer dado desconhecido | Só o necessário para a foto aparecer certa: orientação e perfil de cor |
-| **Fotógrafo** | O mesmo que Privacidade, menos o aparelho e as configurações da câmera | Orientação, cores, câmera, lente, ISO, abertura e velocidade |
-| **Máximo** | Tudo, inclusive orientação e perfil de cor | Nada (a foto pode aparecer girada ou com as cores um pouco diferentes) |
+| **Privacy** (default) | Location, personal data, dates, device, camera settings, software, text and comments, hidden thumbnails, AI marks and any unknown data | Only what the photo needs to display correctly: orientation and color profile |
+| **Photographer** | Same as Privacy, except device and camera settings | Orientation, color, camera, lens, ISO, aperture and shutter speed |
+| **Maximum** | Everything, including orientation and color profile | Nothing (the photo may appear rotated or with slightly different colors) |
 
-### Formatos
+### Supported formats
 
-| Formato | Situação |
+| Format | Status |
 |---|---|
-| JPG / JPEG | ✅ Limpa |
-| PNG (inclusive PNG animado) | ✅ Limpa — incluindo a marca C2PA e os prompts que geradores de IA gravam no arquivo |
-| WEBP (com perda, sem perda e animado) | ✅ Limpa, sem recomprimir |
-| HEIC (fotos do iPhone) e vídeos MP4 / MOV | ⏳ Aparecem como "Ainda não suportado". Chegam numa próxima versão |
+| JPEG / JPG | ✅ Supported |
+| PNG (including animated PNG) | ✅ Supported — including C2PA manifests and AI prompts |
+| WEBP (lossy, lossless and animated) | ✅ Supported, without re-encoding |
+| HEIC (iPhone photos), MP4 and MOV videos | ⏳ Shown as "not supported yet" — coming in a future release |
 
 <details>
-<summary>Tema escuro</summary>
+<summary>Dark theme</summary>
 
-O Siftool segue o tema do Windows (claro ou escuro), ou o que você escolher em Configurações.
+Siftool follows the Windows theme (light or dark), or the one you choose in Settings.
 
-<img src="docs/images/janela-escura.png" width="820" alt="Siftool no tema escuro">
+<img src="docs/images/janela-escura.png" width="820" alt="Siftool metadata remover in dark theme">
 </details>
 
-## Por que dá para confiar no selo
+## How the "Verified" seal works
 
-- **Leitura em nível de bytes.** O Siftool entende a estrutura de cada formato (segmentos JPEG, chunks PNG, chunks RIFF do WEBP) e classifica cada bloco como imagem ou metadado. O que é imagem é copiado byte a byte; o que é metadado é removido ou reescrito do zero, só com os campos permitidos.
-- **Verificação que falha fechada.** Depois de gravar, a cópia é lida de novo como se fosse um arquivo desconhecido, varrida em busca de assinaturas de metadados (EXIF, XMP, C2PA, coordenadas) e comparada com o original para garantir que a imagem em si não mudou. Qualquer dúvida vira "Não limpou", nunca "Verificado".
-- **Estruturas conferidas.** Blocos que contam como imagem precisam ter o tamanho, a ordem e a quantidade que o formato manda; senão não são confiáveis. Isso fecha os truques de esconder dados dentro de estruturas válidas.
-- **Testado.** 909 testes automáticos, incluindo arquivos corrompidos gerados aleatoriamente, arquivos montados de propósito para tentar enganar a verificação e uma imagem real gerada pelo ChatGPT com marca C2PA.
+- **Byte-level parsing.** Siftool understands each format's structure (JPEG segments, PNG chunks, WEBP RIFF chunks) and classifies every block as image data or metadata. Image data is copied byte for byte; metadata is removed or rewritten from scratch with only the allowed fields.
+- **Fail-closed verification.** The copy is re-read as an unknown file, scanned for metadata signatures (EXIF, XMP, C2PA, coordinates) and compared with the original to prove the image itself did not change. Any doubt becomes "not cleaned", never "Verified".
+- **Validated structures.** Blocks treated as image data must have the size, order and count the format requires, which closes the tricks used to hide data inside valid-looking structures.
+- **Tested.** 909 automated tests, including randomly corrupted files, files crafted to fool the verification, and a real ChatGPT image with a C2PA manifest.
 
-Limite conhecido: dados escondidos **dentro dos próprios pixels** (esteganografia) não são detectados. O Siftool remove metadados, não altera a imagem.
+Known limit: data hidden **inside the pixels themselves** (steganography or invisible watermarks such as SynthID) is not detected. Siftool removes metadata; it does not alter the image.
 
-## Linha de comando
+## Command line
 
-O mesmo motor também roda no terminal, para scripts e automação (precisa de Python 3.11 ou mais novo):
+The same engine runs in the terminal for scripts and automation (Python 3.11+):
 
 ```bash
 pip install git+https://github.com/FFloriani/siftool.git
 
-siftool scan foto.jpg                       # mostra o que a foto contém, por categoria
-siftool clean fotos/ --mode photographer    # limpa uma pasta inteira (modos: privacy, photographer, maximum)
-siftool clean foto.jpg --out limpas/        # grava as cópias em outra pasta
-siftool verify foto_clean.jpg --original foto.jpg
+siftool scan photo.jpg                        # show what the photo contains, by category
+siftool clean photos/ --mode photographer     # clean a whole folder (modes: privacy, photographer, maximum)
+siftool clean photo.jpg --out cleaned/        # write the copies to another folder
+siftool verify photo_clean.jpg --original photo.jpg
 ```
 
-Use `--json` em qualquer comando para uma saída legível por máquina (schema 2). O código de saída é `0` quando tudo foi verificado, `1` com ressalvas e `2` em caso de falha.
+Add `--json` to any command for machine-readable output (schema 2). Exit code is `0` when everything is verified, `1` with warnings and `2` on failure.
 
-## Para desenvolvedores
+## FAQ
+
+<details>
+<summary><b>How do I remove the GPS location from a photo on Windows?</b></summary>
+
+Open Siftool, drop the photo into the window and click **Limpar** (Clean) in *Privacidade* (Privacy) mode. The clean copy (`photo_clean.jpg`) has no GPS coordinates, date, device or name. You can also right-click the photo in File Explorer and choose *Limpar com Siftool* (Clean with Siftool).
+</details>
+
+<details>
+<summary><b>How do I remove the AI / C2PA metadata from a ChatGPT image?</b></summary>
+
+Images generated by ChatGPT carry a C2PA (Content Credentials) manifest that identifies them as AI-generated. Siftool detects it — the row shows a *Marca de IA* (AI mark) tag — and removes it in any mode, without re-encoding the image.
+</details>
+
+<details>
+<summary><b>Does removing metadata reduce image quality?</b></summary>
+
+No. Siftool does not decode or re-compress the image: the image bytes are copied unchanged, so a JPEG keeps exactly the same quality. Re-saving a photo in an image editor, by contrast, re-compresses it every time.
+</details>
+
+<details>
+<summary><b>Does it change or delete my original photo?</b></summary>
+
+Never. Siftool writes a new file next to the original (`_clean` suffix) and never overwrites anything.
+</details>
+
+<details>
+<summary><b>Is it safe? Does it upload my photos?</b></summary>
+
+Siftool works fully offline: no internet connection, no telemetry, no account. The source code is public under the GPLv3.
+</details>
+
+<details>
+<summary><b>Does it remove invisible AI watermarks (like SynthID)?</b></summary>
+
+No. Invisible watermarks live in the pixels, not in the metadata. Siftool removes metadata only and never alters the image.
+</details>
+
+## Building from source
 
 ```bash
 git clone https://github.com/FFloriani/siftool.git
 cd siftool
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[gui,test]"
-.venv\Scripts\python.exe -m pytest           # 909 testes, ~30 s
-.venv\Scripts\siftool-gui.exe                # abre o programa
+.venv\Scripts\python.exe -m pytest           # 909 tests, ~30 s
+.venv\Scripts\siftool-gui.exe                # launch the app
 ```
 
-- `src/siftool/` — o motor: só biblioteca padrão do Python, sem dependências.
-- `src/siftool_gui/` — a janela, em PySide6 + [QFluentWidgets](https://qfluentwidgets.com).
-- `packaging/` — o instalador e a versão portátil. Para gerar os dois, instale o [Inno Setup 6](https://jrsoftware.org/isinfo.php), rode `pip install -e ".[gui,build]"` e depois `.venv\Scripts\python.exe packaging\build.py`. O resultado fica em `dist\`.
-- `docs/superpowers/` — os documentos de design e os planos de cada etapa.
+- `src/siftool/` — the engine: Python standard library only, no dependencies.
+- `src/siftool_gui/` — the desktop app, built with PySide6 and [QFluentWidgets](https://qfluentwidgets.com).
+- `packaging/` — installer and portable build. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), run `pip install -e ".[gui,build]"`, then `.venv\Scripts\python.exe packaging\build.py`. Output goes to `dist\`.
+- `docs/superpowers/` — design documents and implementation plans.
 
 > [!WARNING]
-> Não rode `python -m siftool_gui` dentro da pasta raiz do repositório: lá, o `siftool.py` antigo faz sombra ao pacote novo.
+> Do not run `python -m siftool_gui` from the repository root: the legacy `siftool.py` there shadows the new package.
 
 <details>
-<summary>O programa antigo (Tkinter)</summary>
+<summary>The legacy program (Tkinter)</summary>
 
-O Siftool 1.x era um único arquivo, `siftool.py`, com interface em Tkinter. Ele continua no repositório por enquanto, porque ainda tem recursos que o programa novo não tem (limpeza de vídeo com ffmpeg e editor de metadados), e será aposentado quando HEIC e vídeo chegarem ao programa novo. Para gerá-lo, use o `build.bat`, que grava em `dist\legacy\siftool`.
-
+Siftool 1.x was a single file, `siftool.py`, with a Tkinter interface. It stays in the repository for now because it still has features the new program lacks (video cleaning with ffmpeg, a metadata editor), and it will be retired once HEIC and video reach the new program. Build it with `build.bat` (output in `dist\legacy\siftool`).
 </details>
 
-## Próximos passos
+## Roadmap
 
-- [ ] Fotos HEIC do iPhone e vídeos MP4 / MOV
-- [ ] Assinatura digital do instalador (sem o aviso do Windows)
-- [ ] Interface em inglês
+- [ ] HEIC (iPhone) photos and MP4 / MOV videos
+- [ ] Code signing (no Windows warning on first launch)
+- [ ] English interface
 
-## Apoie
+## Support
 
-Se o Siftool foi útil para você, considere apoiar o desenvolvimento:
+If Siftool helped you, consider supporting its development:
 
-<a href="https://buymeacoffee.com/1b9hbqniv1"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-apoiar-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
+<a href="https://buymeacoffee.com/1b9hbqniv1"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee"></a>
 
-## Licença
+## License
 
-O Siftool é software livre, sob a **GNU General Public License versão 3 (GPLv3)** — veja [LICENSE](LICENSE). A interface usa o [QFluentWidgets](https://qfluentwidgets.com) (edição Community), que é GPLv3, e por isso o programa todo também é. As licenças dos outros componentes (Qt for Python, PyInstaller e outros) estão em [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt).
+Siftool is free software under the **GNU General Public License v3 (GPLv3)** — see [LICENSE](LICENSE). The interface uses [QFluentWidgets](https://qfluentwidgets.com) (Community edition), which is GPLv3, so the whole program is too. Licenses of the other bundled components (Qt for Python, PyInstaller and others) are in [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt).
 
 ---
 
-<details>
-<summary><b>English</b></summary>
+### 🇧🇷 Em português
 
-**Siftool** removes location, personal data and AI provenance marks (C2PA / Content Credentials) from your photos, offline and without re-encoding: it copies the image bytes untouched and strips only the metadata blocks. The original file is never modified; a verified copy (`photo_clean.jpg`) is written next to it, and the "Verified" seal is only given after the copy is re-read and checked.
-
-- Windows 10/11 (64-bit): download the [installer](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-setup.exe) (no admin rights needed) or the [portable ZIP](https://github.com/FFloriani/siftool/releases/download/v2.0.0-beta.1/Siftool-2.0.0-beta.1-portable.zip).
-- The interface is in Brazilian Portuguese for now. Three modes: Privacy (default), Photographer (keeps camera and lens settings) and Maximum.
-- Formats: JPEG, PNG and WEBP. HEIC and MP4/MOV are planned.
-- Command line: `pip install git+https://github.com/FFloriani/siftool.git`, then `siftool scan|clean|verify` (`--json` for machine-readable output).
-- License: GPLv3.
-
-</details>
+O **Siftool** é um programa gratuito para Windows que **remove metadados de fotos**: tira a **localização (GPS)**, os dados pessoais, a data, o modelo do celular e as **marcas de IA (C2PA) do ChatGPT**, sem recomprimir a imagem e sem alterar o original. Funciona offline e só marca a cópia como *Verificado* depois de conferir. **[Leia a documentação completa em português →](README.pt-BR.md)**
